@@ -170,7 +170,13 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
 
         if ('refpha' in caltype) or ('refamp' in caltype) or ('refcal' in caltype):
             refcal = sql2refcalX(btime)
-            pha = refcal['pha']  # shape is 15 (nant) x 2 (npol) x 34 (nband)
+            # shape is 15 (nant) x 2 (npol) x 34 (nband)
+            # EOVSA15 upgrade-related Note:
+            # the number of antennas in refcal['pha'] is changed to 16 after EOVSA15 upgrade
+            # The last 15-ant record is  2025-05-23 and the first 16-ant record is on 2025-06-07.
+            # But because the pha is added to para_pha in a loop of nant-1, it should be fine.
+            # No change is needed in the code below.
+            pha = refcal['pha']
             pha[np.where(refcal['flag'] == 1)] = 0.
             amp = refcal['amp']
             amp[np.where(refcal['flag'] == 1)] = 1.
@@ -265,7 +271,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 tb.open(caltb_pha, nomodify=False)
                 phaflag_ = refcal['flag'][:, :, np.array(bd)]
                 phaflag_new = np.full((nant, 2, nspw), True, dtype=np.bool_)
-                phaflag_new[:-1, ...] = phaflag_
+                if t_mid.mjd >= EOVSA15_UPGRADE_DATE.mjd:
+                    phaflag_new[...] = phaflag_
+                else:
+                    phaflag_new[:-1, ...] = phaflag_
                 phaflag_new = np.moveaxis(phaflag_new, 0, 2).reshape(2, 1, nant * nspw)
                 tb.putcol('FLAG', phaflag_new)
                 tb.close()
@@ -290,7 +299,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 tb.open(caltb_amp, nomodify=False)
                 ampflag_ = refcal['flag'][:, :, np.array(bd)]
                 ampflag_new = np.full((nant, 2, nspw), True, dtype=np.bool_)
-                ampflag_new[:-1, ...] = ampflag_
+                if t_mid.mjd >= EOVSA15_UPGRADE_DATE.mjd:
+                    ampflag_new[...] = ampflag_
+                else:
+                    ampflag_new[:-1, ...] = ampflag_
                 ampflag_new = np.moveaxis(ampflag_new, 0, 2).reshape(2, 1, nant * nspw)
                 tb.putcol('FLAG', ampflag_new)
                 tb.close()
@@ -361,7 +373,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                             os.system('rm -rf ' + caltb_phambd)
                         # if not os.path.exists(caltb_phambd):
                         gencal(vis=msfile, caltable=caltb_phambd, caltype='mbd', pol='X,Y', antenna=antennas,
-                               parameter=phambd_ns.flatten().tolist())
+                               parameter=phambd_ns[:nant-1,:].flatten().tolist())
                         if flagspw != '':
                             flag_phambd_by_spw(caltb_phambd, flagspw=flagspw)
 
@@ -374,7 +386,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                             os.system('rm -rf ' + caltb_phambd_pha0)
                         # if not os.path.exists(caltb_phambd_pha0):
                         gencal(vis=msfile, caltable=caltb_phambd_pha0, caltype='ph', pol='X,Y', antenna=antennas,
-                               parameter=pha0.flatten().tolist())
+                               parameter=pha0[:nant-1,:].flatten().tolist())
                         if flagspw != '':
                             flag_phambd_by_spw(caltb_phambd_pha0, flagspw=flagspw)
 

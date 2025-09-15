@@ -1391,6 +1391,8 @@ class Dspec:
                     if percentile[0] > 0 and percentile[1] < 100 and percentile[0] < percentile[1]:
                         norm.vmax = np.nanpercentile(spec_plt_1, percentile[1])
                         norm.vmin = np.nanpercentile(spec_plt_1, percentile[0])
+                        print('For {0:s}, vmax/vmin are set to {1:.2f}/{2:.2f} according to {3:d}/{4:d} percentiles'.format(
+                            polstr[0], norm.vmax, norm.vmin, percentile[1], percentile[0]))
 
                 if plot_fast:
                     # compress in time (idx1)

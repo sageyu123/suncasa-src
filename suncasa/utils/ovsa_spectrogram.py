@@ -57,7 +57,7 @@ def setup_time_axis(ax, start, end, minticks=5, maxticks=10):
 
 
 def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', figname=None, combine=True,
-         clip=[10, 99.995], add_logo=False, fast_plot=True, interactive=False, overwrite=False, fix_tlim=False):
+         clip=[10, 99.995], add_logo=False, fast_plot=True, interactive=False, overwrite=False, fix_tlim=False, fix_vrange=False):
     """
     Plot the OVRO-LWA and EOVSA spectrograms along with STIX and GOES light curves for a given timestamp or time range.
 
@@ -207,9 +207,18 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
         vmax = np.nanpercentile(d_ovrolwa.data, 99.995)
         vmin = np.nanpercentile(d_ovrolwa.data, 5)
         norm_I_ovrolwa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+        if fix_vrange:
+            ## Set the dynamic range to at least a decade.
+            vmin = 0.7
+            vmax = max(vmin*50, np.nanpercentile(d_ovrolwa.data, clip[1]))
+            norm_I_ovrolwa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+            print(f'Fix OVRO-LWA vrange to [{vmin}, {vmax}] SFU')
+            minmaxpercentile = False
+        else:
+            minmaxpercentile = True
         d_ovrolwa.plot(pol='I', timerange=timerange_ovrolwa, bkgtim=ovrolwa_bkgtim, plot_fast=fast_plot,
                        norm=norm_I_ovrolwa,
-                       percentile=clip, minmaxpercentile=True, freq_unit='MHz', cmap=cmap, axes=ax_ovrolwa)
+                       percentile=clip, minmaxpercentile=minmaxpercentile, freq_unit='MHz', cmap=cmap, axes=ax_ovrolwa)
         ovrolwa_tim = d_ovrolwa.time_axis
         ovro_lwa_start, ovro_lwa_end = ovrolwa_tim[0], ovrolwa_tim[-1]
     else:
@@ -253,8 +262,16 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
         vmax = np.nanpercentile(d_eovsa.data, 99.995)
         vmin = np.nanpercentile(d_eovsa.data, 5)
         norm_I_eovsa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+        if fix_vrange:
+            vmin = 5
+            vmax = max(vmin*10, np.nanpercentile(d_eovsa.data, clip[1]))
+            norm_I_eovsa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+            minmaxpercentile = False
+            print(f'Fix EOVSA vrange to [{vmin}, {vmax}] SFU')
+        else:
+            minmaxpercentile = True
         d_eovsa.plot(pol='I', timerange=timerange_eovsa, bkgtim=eovsa_bkgtim, plot_fast=False, norm=norm_I_eovsa,
-                     percentile=clip, minmaxpercentile=True, freq_unit='GHz', cmap=cmap, axes=ax_eovsa)
+                     percentile=clip, minmaxpercentile=minmaxpercentile, freq_unit='GHz', cmap=cmap, axes=ax_eovsa)
         eovsa_tim = d_eovsa.time_axis
         eovsa_start, eovsa_end = eovsa_tim[0], eovsa_tim[-1]
     else:
@@ -467,9 +484,19 @@ if __name__ == '__main__':
     from datetime import datetime, timedelta
     from suncasa.utils import ovsa_spectrogram as ovsp
 
+    start_date = datetime(2023, 7, 26)
+    end_date = datetime(2025, 8, 30)
+    # start_date = datetime(2024, 5, 9)
+    # end_date = datetime(2024, 5, 12)
+    start_date = datetime(2025, 8, 30)
+    end_date = datetime(2025, 9, 14)
 
-    current_date = datetime.now()
-    previous_day = (current_date - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
-    print(f'plotting OVSA spectrogram for {previous_day.strftime("%Y-%m-%d")}')
-    ovsp.plot(previous_day, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{previous_day.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True)
+    current_date = start_date
+    while current_date <= end_date:
+        try:
+            print(f'plotting OVSA spectrogram for {current_date.strftime("%Y-%m-%d")}')
+            ovsp.plot(current_date, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{current_date.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=True)
+        except Exception as e:
+            print(f"Error processing date {current_date}: {e}")
+        current_date += timedelta(days=1)
 
