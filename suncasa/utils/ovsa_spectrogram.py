@@ -495,7 +495,7 @@ if __name__ == '__main__':
     while current_date <= end_date:
         try:
             print(f'plotting OVSA spectrogram for {current_date.strftime("%Y-%m-%d")}')
-            ovsp.plot(current_date, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{current_date.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=True)
+            ovsp.plot(current_date, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{current_date.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=False)
         except Exception as e:
             print(f"Error processing date {current_date}: {e}")
         current_date += timedelta(days=1)
