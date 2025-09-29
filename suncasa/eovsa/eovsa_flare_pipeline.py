@@ -1954,7 +1954,7 @@ class FlareSelfCalib():
                                 ncpu=1, imsize=[self.final_imsize], cell=cell_size1, restoringbeam=[self.beam_1GHz],
                                 robust=0.5, opencontour=opencontour, clevels=clevels, clevelsfix=clevelsfix, plotaia=plotaia,
                                 aiawave=aiawave, mkmovie=mkmovie, twidth=int(self.final_image_int),
-                                docompress=docompress,dnorm=None,
+                                docompress=docompress,dnorm='log',
                                 stokes=stokes, movieformat=movieformat, uvrange='',
                                 niter=300, overwrite=overwrite, xycen=xycen, fov=[256, 256], calpha=1.0)
             final_clean_timer = timeit.default_timer()
