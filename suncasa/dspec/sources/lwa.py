@@ -75,16 +75,17 @@ def read_data(filename, stokes='I', timerange=[], freqrange=[], timebin=1, freqb
             print('Processing {0:d} of {1:d} files'.format(n+1, len(filelist)))
         try:
             data = h5py.File(file, 'r',swmr=True)
+            freqs = data['Observation1']['Tuning1']['freq'][:]
+            ts = data['Observation1']['time'][:]
+            # The following line works the same way as timestamp_to_mjd(), but a bit too slow
+            # times_mjd = np.array([(Time(t[0], format='unix') + TimeDelta(t[1], format='sec')).mjd for t in ts])
+            times_mjd = timestamp_to_mjd(ts)
+            idx0, = np.where(times_mjd > 50000.) # filter out those prior to 1995 (obviously wrong for OVRO-LWA)
+
         except:
             print('Cannot read {0:s}. Skip this file.'.format(file))
             continue
-        freqs = data['Observation1']['Tuning1']['freq'][:]
-        ts = data['Observation1']['time'][:]
-        # The following line works the same way as timestamp_to_mjd(), but a bit too slow
-        # times_mjd = np.array([(Time(t[0], format='unix') + TimeDelta(t[1], format='sec')).mjd for t in ts])
-        times_mjd = timestamp_to_mjd(ts)
-        idx0, = np.where(times_mjd > 50000.) # filter out those prior to 1995 (obviously wrong for OVRO-LWA)
-
+        
         # read the flux factors file if provided
         if not (flux_factor_file is None): 
             try:
