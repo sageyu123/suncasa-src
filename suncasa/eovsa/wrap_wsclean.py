@@ -1,8 +1,11 @@
 '''
 Originally written by Dr. Peijin Zhang @peijin94
+Major revision by Dr. Sijie Yu @sageyu123
 '''
 
 import subprocess
+import os
+import shutil
 from typing import List, Optional, Union
 import time
 from datetime import datetime
@@ -39,6 +42,24 @@ def runtime_report(func):
         )
         return result
     return wrapper
+
+
+def _resolve_wsclean_bin():
+    """Return the preferred WSClean executable path for EOVSA.
+
+    Prefer the EOVSA compatibility wrapper, which depends on casacore2 and
+    the legacy runtime libraries required by the current server build.
+    """
+    for candidate in ['/usr/local/bin/wsclean-eovsa', '/usr/bin/wsclean']:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    resolved = shutil.which('wsclean-eovsa') or shutil.which('wsclean')
+    if resolved:
+        return resolved
+    return 'wsclean-eovsa'
+
+
+WSCLEAN_BIN = _resolve_wsclean_bin()
 
 class WSClean:
     def __init__(self, vis: str):
@@ -144,7 +165,7 @@ class WSClean:
 
     def build_command(self) -> str:
         """Build wsclean command"""
-        cmd = ['wsclean']
+        cmd = [WSCLEAN_BIN]
 
         # Add basic parameters
         cmd.extend(['-size', str(self.params['size'][0]), str(self.params['size'][1])])

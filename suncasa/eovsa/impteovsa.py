@@ -214,8 +214,9 @@ def creatms(idbfile, outpath, timebin=None, width=None):
                        nchannels=nchannels,
                        stokes=stokes)
 
+    nbands = len(chan_band)
+    print('Processing {} bands...'.format(nbands))
     for l, cband in enumerate(chan_band):
-        print('sm-band{}'.format(cband['band']))
         sm.observe(source_id, 'band{:02d}'.format(cband['band']),
                    starttime=start_time, stoptime=end_time,
                    project=project,

@@ -2,6 +2,22 @@
 Loop over SPWs once: run slfcal, disk insertion/subtraction, and imaging per SPW
 
 This version combines all operations into a single loop over SPWs. For each SPW, it performs slfcal, inserts and subtracts the disk, and then proceeds directly to imaging before moving to the next SPW. Tasks are handled sequentially within each SPW iteration.
+
+EOVSA/WSClean compatibility note:
+Use the legacy WSClean wrapper instead of a bare system `wsclean` path.
+The working stack on the pipeline server is the compatibility wrapper
+`/usr/local/bin/wsclean-eovsa`, which calls the legacy
+`/usr/local/bin/wsclean-eovsa-bin` binary with the older runtime libraries it
+needs and depends on `casacore2`:
+`libcfitsio.so.5`, `libmpi.so.20`, and `libhwloc.so.5`.
+
+This matters because newer WSClean builds can fail on EOVSA MS files
+with uneven SPWs, typically with:
+
+    ArrayColumn::get: Table array conformance error
+
+That error is the reason this pipeline should stay pinned to the known-
+working wrapper unless the full runtime stack has been revalidated.
 '''
 import argparse
 import inspect
@@ -9,7 +25,10 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
+import traceback
 from datetime import datetime, time, timedelta
+from contextlib import contextmanager
 from glob import glob
 from functools import wraps
 import matplotlib.pyplot as plt
@@ -72,6 +91,102 @@ ms = mstool()
 tb = tbtool()
 
 
+def _resolve_wsclean_bin():
+    """Return the preferred WSClean executable path for EOVSA.
+
+    Prefer the EOVSA compatibility wrapper so the pipeline stays on the
+    casacore2-backed binary that works with the legacy runtime stack.
+    """
+    preferred_wrapper = '/usr/local/bin/wsclean-eovsa'
+    if os.path.isfile(preferred_wrapper) and os.access(preferred_wrapper, os.X_OK):
+        return preferred_wrapper
+
+    resolved = shutil.which('wsclean-eovsa')
+    if resolved:
+        return resolved
+
+    resolved = shutil.which('wsclean')
+    if resolved:
+        return resolved
+    return 'wsclean'
+
+
+WSCLEAN_BIN = _resolve_wsclean_bin()
+logging.info("Using wsclean executable: %s", WSCLEAN_BIN)
+
+# ============================================================
+# Pipeline Configuration Constants
+# ============================================================
+
+PIPELINE_CONFIG = {
+    'bright_thresh': [350, 900, 2000, 2800, 800, 150, 100],
+    'tb_ratio_thresh': [1.5, 5.0, 5.0, 3.0, 1.5, 1.5, 1.5],
+    'briggs': [-1.0, -1.0, -1.0, -1.0, -1.0, -0.5, -0.5],
+    'spwidx2proc': [0, 1, 2, 3, 4, 5, 6],
+}
+
+# Self-calibration round definitions (drives the loop in pipeline_run)
+SELFCAL_ROUNDS = [
+    {
+        'name': 'init',
+        'interval_multipliers': {0: 20, 1: 20, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3},
+        'niter': 100,
+        'auto_mask': 6,
+        'auto_threshold': 3,
+        'briggs': 0.0,
+        'data_column': 'DATA',
+        'circular_beam': False,
+        'gaincal_steps': [
+            {'solint': 'inf', 'calmode': 'p', 'suffix': 'inf', 'refantmode': 'flex'},
+            {'solint': 'auto_minor', 'calmode': 'p', 'suffix': 'int', 'refantmode': 'flex'},
+        ],
+        'interp': 'nearest',
+    },
+    {
+        'name': 'round1',
+        'interval_multipliers': {0: 6, 1: 3, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1},
+        'niter': 200,
+        'auto_mask': 4,
+        'auto_threshold': 2,
+        'briggs': 0.0,
+        'data_column': None,  # determined at runtime (CORRECTED_DATA or DATA)
+        'circular_beam': False,
+        'gaincal_steps': [
+            {'solint': 'auto_minor', 'calmode': 'p', 'suffix': 'int', 'refantmode': 'flex'},
+        ],
+        'interp': 'linear',
+    },
+    {
+        'name': 'round2',
+        'interval_multipliers': {0: 4, 1: 2, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1},
+        'niter': 500,
+        'auto_mask': 3,
+        'auto_threshold': 1,
+        'briggs': 0.0,
+        'data_column': 'CORRECTED_DATA',
+        'circular_beam': False,
+        'gaincal_steps': [
+            {'solint': 'auto_minor', 'calmode': 'p', 'suffix': 'int', 'refantmode': 'flex'},
+            {'solint': 'inf', 'calmode': 'a', 'suffix': 'inf', 'refantmode': 'flex',
+             'uvrange_key': 'uvmin'},
+        ],
+        'interp': 'linear',
+    },
+]
+
+FINAL_IMAGING_CONFIG = {
+    'interval_multipliers': {0: 2.4, 1: 1.2, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1},
+}
+
+UV_CONFIG = {
+    'uvmax_baseline_m': 15,
+    'uvmin_baseline_m': 110,
+    'uvmin_baseline_m_band0': 55,
+    'uvmax_l_clamp': (100, 1200),
+    'uvmin_l_clamp_max': 1800,
+}
+
+
 def log_print(level, message):
     # Get the caller's stack frame and extract information
     frame = inspect.stack()[1]
@@ -100,6 +215,39 @@ def log_print(level, message):
         logger.critical(full_message)
     else:
         logger.info(full_message)  # Default to INFO if an unsupported level is given
+
+
+def _format_log_state(**state):
+    """Format a stable key=value summary for diagnostic logging."""
+    parts = []
+    for key in sorted(state):
+        value = state[key]
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    return ", ".join(parts) if parts else "no-state"
+
+
+def log_step(level, step, message, **state):
+    """Emit a log line with an explicit pipeline step and state summary."""
+    log_print(level, f"[{step}] {message} | {_format_log_state(**state)}")
+
+
+@contextmanager
+def pipeline_stage(step, **state):
+    """Log start/end/failure for a pipeline stage with traceback on error."""
+    start = datetime.now()
+    log_step('INFO', step, "start", **state)
+    try:
+        yield
+    except Exception:
+        elapsed = (datetime.now() - start).total_seconds()
+        tb = traceback.format_exc()
+        log_print('ERROR', f"[{step}] failed after {elapsed:.1f}s | {_format_log_state(**state)}\n{tb}")
+        raise
+    else:
+        elapsed = (datetime.now() - start).total_seconds()
+        log_step('INFO', step, f"done in {elapsed:.1f}s", **state)
 
 
 def get_solar_radius_mask(rsun_pix, crpix1, crpix2, ny, nx, rsun_ratio=(1.2, 1.3)):
@@ -180,7 +328,6 @@ def detect_noisy_images(data_stack,
     disk_rms_values = np.array(disk_rms_values)
 
     # --- Automatic RMS threshold (knee detection) ---
-    # if rms_threshold is None:
     sorted_rms = np.sort(ring_rms_values)
     N = len(sorted_rms)
 
@@ -1267,7 +1414,7 @@ def calc_diskmodel(tim, nbands, freq):
     try:
         from sunpy.coordinates.sun import earth_distance
         fac = earth_distance('2019/09/01') / earth_distance(tim)
-    except:
+    except Exception:
         import sunpy.coordinates.ephemeris as eph
         fac = eph.get_sunearth_distance('2019/09/01') / eph.get_sunearth_distance(tim)
 
@@ -1695,7 +1842,8 @@ class MSselfcal:
         imname = '-'.join(imname_strlist)
         imname_minor = imname.replace('major', 'minor')
 
-        os.system(f'rm -rf {os.path.join(self.workdir, imname)}*.fits')
+        for f in glob(os.path.join(self.workdir, f"{imname}*.fits")):
+            os.remove(f)
         clean_obj = ww.WSClean(self.msfile)
         clean_obj.setup(size=1024, scale="2.5asec", weight_briggs=self.briggs, pol=self.pols,
                         niter=self.niter,
@@ -1742,7 +1890,8 @@ class MSselfcal:
         if not os.path.exists(model_dir): os.makedirs(model_dir)
 
         self.model_minor_name_str = os.path.join(model_dir, imname_minor)
-        os.system(f'rm -rf {self.model_minor_name_str}*.fits')
+        for f in glob(f"{self.model_minor_name_str}*.fits"):
+            os.remove(f)
         if self.reftime_daily is not None:
             self.model_ref_name_str = os.path.join(model_dir, f"{imname}-ref_daily")
         for idx_major, fitsname in enumerate(modelfitsfiles):
@@ -1781,15 +1930,13 @@ class MSselfcal:
 
         if predict:
             # Step 3: Predict visibilities for each model image
-            cmd = f"wsclean -predict -reorder -spws {self.sp_index} -name {self.model_minor_name_str} -quiet -intervals-out {self.N1 * self.N2} {self.msfile}"
+            cmd = f"{WSCLEAN_BIN} -predict -reorder -spws {self.sp_index} -name {self.model_minor_name_str} -quiet -intervals-out {self.N1 * self.N2} {self.msfile}"
             log_print('INFO', f"Running wsclean predict: {cmd}")
-            os.system(cmd)
-            # os.system(f'rm -rf {self.workdir}/{imname}*model.helio.fits')
-            # os.system(f'rm -rf {model_dir}/{imname}*model.helio.rot.fits')
+            subprocess.run(cmd, shell=True, check=True)
         return
 
 
-def clearn_junk(imname, junks=['dirty', 'model', 'psf', 'residual']):
+def clean_junk(imname, junks=['dirty', 'model', 'psf', 'residual']):
     """Clears junk files generated during the imaging process.
     :param imname: The base name of the image files to clean.
     :type imname: str
@@ -1806,969 +1953,282 @@ def clearn_junk(imname, junks=['dirty', 'model', 'psf', 'residual']):
                     os.remove(f)
 
 
-def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=None,
-                 pols='XX', verbose=True, hanning=False, do_sbdcal=False, overwrite=False,
-                 overwrite_caltb=True):
+def _compute_round_intervals(wsclean_intervals, multiplier, base_interval=50, nintervals_minor=3):
+    """Compute time intervals for one self-cal round."""
+    wsclean_intervals.interval_length = base_interval * multiplier
+    wsclean_intervals.compute_intervals(nintervals_minor=nintervals_minor)
+    res = wsclean_intervals.results()
+    timeranges = []
+    for trange in res['time_intervals']:
+        timeranges.append(
+            trange[0].datetime.strftime('%Y/%m/%d/%H:%M:%S') + '~' +
+            trange[-1].datetime.strftime('%Y/%m/%d/%H:%M:%S'))
+    return {
+        'N1': res['nintervals_major'],
+        'N2': res['nintervals_minor'],
+        'time_intervals': res['time_intervals'],
+        'time_intervals_major_avg': res['time_intervals_major_avg'],
+        'time_intervals_minor_avg': res['time_intervals_minor_avg'],
+        'timeranges': timeranges,
+    }
+
+
+def _run_gaincal_step(msfile, workdir, spw, spwstr, antenna, caltbs, tdur, N1, N2,
+                      step_name, solint, calmode, refantmode='flex',
+                      uvrange='', gaintype='G', minsnr=1.0,
+                      overwrite_caltb=True):
+    """Run a single gaincal step with standard boilerplate."""
+    ext = 'pha' if calmode == 'p' else ('amp' if calmode == 'a' else 'sbd')
+    caltb = os.path.join(workdir, f"caltb_{step_name}_sp{spwstr}.{ext}")
+    if os.path.exists(caltb) and overwrite_caltb:
+        shutil.rmtree(caltb, ignore_errors=True)
+    if not os.path.exists(caltb):
+        if solint == 'auto_minor':
+            solint = f'{tdur * 60 / N1 / N2:.0f}s'
+        gaincal(vis=msfile, caltable=caltb, selectdata=True,
+                uvrange=uvrange, spw=spw,
+                combine="scan", antenna=f'{antenna}&{antenna}',
+                refant='0', solint=solint, refantmode=refantmode,
+                gaintype=gaintype, gaintable=caltbs,
+                minsnr=minsnr, calmode=calmode, append=False)
+    if os.path.exists(caltb):
+        caltbs.append(caltb)
+    return caltbs
+
+
+def _run_slfcal_round(round_def, msfile, ri, spw, spwstr,
+                      workdir, antenna, caltbs, tdur, pols, bmsize, fits_mask_sidx,
+                      datacolumn, overwrite_caltb, uvmin_l_str_sidx, do_sbdcal=False,
+                      clearcache=True):
+    """Execute one round of feature self-calibration: image, gaincal, applycal.
+
+    :param round_def: Configuration dict from SELFCAL_ROUNDS.
+    :param ri: Interval dict from _compute_round_intervals().
+    :param datacolumn: Data column to use (may be overridden by round_def).
+    :returns: (slfcal_obj, caltbs, datacolumn) tuple.
     """
-    Executes the EOVSA data processing pipeline for solar observation data.
+    dc = round_def['data_column'] or datacolumn
+    with pipeline_stage(
+        f"selfcal:{round_def['name']}",
+        spw=spw,
+        spwstr=spwstr,
+        datacolumn=dc,
+        n_major=ri['N1'],
+        n_minor=ri['N2'],
+        do_sbdcal=do_sbdcal and round_def['name'] == 'round1',
+    ):
+        slfcal_obj = MSselfcal(
+            msfile, ri['time_intervals'], ri['time_intervals_major_avg'],
+            ri['time_intervals_minor_avg'], spw, ri['N1'], ri['N2'], workdir,
+            image_marker=round_def['name'], niter=round_def['niter'],
+            briggs=round_def['briggs'], auto_mask=round_def['auto_mask'],
+            auto_threshold=round_def['auto_threshold'],
+            fits_mask=fits_mask_sidx, pols=pols, beam_size=bmsize,
+            circular_beam=round_def['circular_beam'], data_column=dc)
+        slfcal_obj.run(clearcache=clearcache)
 
-    :param vis: Path to the input measurement set (MS) data.
-    :type vis: str
-    :param outputvis: Output path for the processed MS, defaults to an empty string.
-    :type outputvis: str, optional
-    :param workdir: Working directory for intermediate data, defaults to None which sets it to '/data1/workdir'.
-    :type workdir: str, optional
-    :param slfcaltbdir: Directory for storing calibration tables, defaults to None.
-    :type slfcaltbdir: str, optional
-    :param imgoutdir: Output directory for image files, defaults to None.
-    :type imgoutdir: str, optional
-    :param figoutdir: Output directory for figures, defaults to None.
-    :type figoutdir: str, optional
-    :param clearcache: If True, clears all cache files after processing, defaults to False.
-    :type clearcache: bool, optional
-    :param clearlargecache: If True, clears the large cache after processing, defaults to False. If True, clearcache is ignored.
-    :type clearlargecache: bool, optional
-    :param pols: Polarization types to process, defaults to 'XX'.
-    :type pols: str, optional
-    :param mergeFITSonly: If True, skips processing and only merges FITS files, defaults to False.
-    :type mergeFITSonly: bool, optional
-    :param verbose: Enables verbose output during processing, defaults to True.
-    :type verbose: bool, optional
-    :param do_diskslfcal: If True, performs disk self-calibration, defaults to True.
-    :type do_diskslfcal: bool, optional
-    :param overwrite: If True, overwrites existing files, defaults to False.
-    :type overwrite: bool, optional
-    :param niter_init: Initial number of iterations for imaging, defaults to 200.
-    :type niter_init: int, optional
-    :param ncpu: Specifies the number of CPUs for parallel processing, defaults to 'auto'.
-    :type ncpu: str or int, optional
-    :param tr_series_imaging: Time ranges for imaging, defaults to None.
-    :type tr_series_imaging: list of tuple, optional
-    :param spws_imaging: Spectral windows selected for imaging, defaults to None.
-    :type spws_imaging: list of str, optional
-    :param hanning: If True, applies Hanning smoothing to the data, defaults to False.
-    :type hanning: bool, optional
-    :param do_sbdcal: Boolean flag to perform single-band delay calibration, defaults to False.
-    :type do_sbdcal: bool
-    :param skip_slfcal: If True, skips self-calibration and directly images the data, defaults to False.
-    :param segmented_imaging: Determines whether to segment the all-day data into chunks for imaging,
-                          defaults to True.
-    :type segmented_imaging: bool (optional)
-    :return: Path to the processed visibility data.
-    :rtype: str
+        if not slfcal_obj.succeeded:
+            log_step('WARNING', f"selfcal:{round_def['name']}", "MSselfcal reported failure", spw=spw, spwstr=spwstr)
+            return None, caltbs, datacolumn
 
-    :example:
-    ## if you want to specify the spectral windows for imaging
-    >>> spws_imaging = ['5~10', '11~20', '21~30']
-    ## if you want to specify the time range for imaging
-    >>> from datetime import datetime, timedelta
-    >>> from suncasa.eovsa import eovsa_synoptic_imaging_pipeline as esip
-    >>> tbg_imaging = datetime(2024, 4, 8, 16, 58, 0)
-    >>> ted_imaging = datetime(2024, 4, 8, 19, 00, 0)
-    >>> tdt_imaging = timedelta(minutes=2)
-    >>> tr_series_imaging = esip.generate_trange_series(tbg_imaging, ted_imaging, tdt_imaging)
-    """
-    if os.path.exists(outputvis) and not overwrite:
-        log_print('INFO', f"Output MS file {outputvis} already exists. Skipping processing.")
-        return outputvis
+        ncaltbs_before = len(caltbs)
+        for step in round_def['gaincal_steps']:
+            uvrange = uvmin_l_str_sidx if step.get('uvrange_key') == 'uvmin' else ''
+            with pipeline_stage(
+                f"gaincal:{round_def['name']}_{step['suffix']}",
+                spw=spw,
+                spwstr=spwstr,
+                solint=step['solint'],
+                calmode=step['calmode'],
+                uvrange=uvrange or 'none',
+            ):
+                caltbs = _run_gaincal_step(
+                    msfile, workdir, spw, spwstr, antenna, caltbs, tdur,
+                    ri['N1'], ri['N2'],
+                    f"{round_def['name']}_{step['suffix']}", step['solint'],
+                    step['calmode'], step['refantmode'], uvrange=uvrange,
+                    overwrite_caltb=overwrite_caltb)
 
-    if not workdir.endswith('/'):
-        workdir += '/'
-    debug_mode = False
-    spwidx2proc = [0, 1, 2, 3, 4, 5, 6]  ## band window index to process
-    # alldaymode_spidx = [0]  ## band window index to process for all-day mode
-    bright_thresh_ = np.array([350, 900, 2000, 2800, 800, 150, 100])
-    tb_ratio_thresh_ = np.array([1.5, 5.0, 5.0, 3.0, 1.5, 1.5, 1.5])
-# bright_thresh = [3, 3, 3, 2, 2, 2, 2]
-    # bright = [False, False, False, False, False, False, False]
-    # segmented_imaging = [True, True, True, False, False, False, False]
-    # segmented_imaging = [True, True, True, True, True, True, True]
-    # segmented_imaging = [False, False, False, False, False, False, False]
-    briggs_ = [-1.0, -1.0, -1.0, -1.0, -1.0, -0.5, -0.5]
+        # Single-band delay calibration (only in round1)
+        if do_sbdcal and round_def['name'] == 'round1':
+            with pipeline_stage("gaincal:round1_sbd", spw=spw, spwstr=spwstr):
+                caltb_k = os.path.join(workdir, f"caltb_inf_sp{spwstr}.sbd")
+                if os.path.isdir(caltb_k):
+                    shutil.rmtree(caltb_k, ignore_errors=True)
+                gaincal(vis=msfile, caltable=caltb_k, solint='inf', combine='scan',
+                        uvrange='', refant='0', gaintype='K', spw=spw,
+                        gaintable=caltbs, calmode='p', refantmode='flex',
+                        minsnr=2.0, minblperant=4, append=False)
+                if os.path.isdir(caltb_k):
+                    caltbs.append(caltb_k)
 
-    if debug_mode:
-        workdir = './'
-        slfcaltbdir = None
-        imgoutdir = './'
-        pols = 'XX'
-        verbose = True
-        do_diskslfcal = True
-        overwrite = True
-        overwrite_caltb = True
-        hanning = False
-        do_sbdcal = False
-
-        udbdir = '/data1/eovsa/fits/UDB/'
-        from suncasa.suncasatasks import calibeovsa
-        from suncasa.suncasatasks import importeovsa
-        from eovsapy.dump_tsys import findfiles
-
-        spwidx2proc = [0, 1, 2, 3, 4, 5]  ## band window index to process
-        spwidx2proc = [0]  ## band window index to process
-        # spwidx2proc = [0, 1]  ## band window index to process
-        # alldaymode_spidx = [0, 1]
-        # alldaymode_spidx = []
-        # bright_thresh = [3, 3, 3, 3, 2, 2, 2]
-        # bright_thresh = [6, 5, 4, 3, 2, 2, 2]
-        # bright_thresh = [12, 10, 10, 10, 10, 10, 10]
-        # bright_thresh = [100, 100, 100, 100, 100, 100, 100]
-        # bright_thresh = np.array([432.5, 1313.0, 5535.4, 6378.7, 1408.1, 215.6, 200])/2.0
-        # bright_thresh = np.array([350, 1000, 3000, 3200, 800, 150, 100])
-        bright_thresh_ = np.array([350, 900, 2000, 2800, 800, 300, 150])
-        tb_ratio_thresh_ = np.array([1.5, 5.0, 5.0, 3.0, 1.5, 1.5, 1.5])
-        # bright = [False, False, False, False, False, False, False]
-        # segmented_imaging = [True, True, True, False, False, False, False]
-        # segmented_imaging = [False, False, False, False, False, False, False]
-        briggs_ = [-1.0, -1.0, -1.0, -1.0, -1.0, -0.5, -0.5]
-
-        # datein = datetime(2024, 12, 15, 20, 0, 0)
-        # datein = datetime(2025, 2, 6, 20, 0, 0)
-        # pols = 'YY'
-        # datein = datetime(2022, 6, 15, 20, 0, 0)
-        # datein = datetime(2022, 6, 14, 20, 0, 0)
-        # datein = datetime(2021, 11, 25, 20, 0, 0)
-        # datein = datetime(2021, 11, 24, 20, 0, 0)
-        # datein = datetime(2020, 11, 29, 20, 0, 0)
-        # datein = datetime(2024, 4, 8, 20, 0, 0)
-        # datein = datetime(2019, 9, 25, 20, 0, 0)
-        # datein = datetime(2019, 9, 23, 20, 0, 0)
-        # datein = datetime(2019, 9, 20, 20, 0, 0)
-        # datein = datetime(2019, 9, 18, 20, 0, 0)
-        # datein = datetime(2021, 9, 20, 20, 0, 0)
-        # datein = datetime(2023, 12, 24, 20, 0, 0)
-        datein = datetime(2025, 2, 14, 20, 0, 0)
-
-        trange = Time(datein)
-        if trange.mjd == np.fix(trange.mjd):
-            # if only date is given, move the time from 00 to 12 UT
-            trange = Time(trange.mjd + 0.5, format='mjd')
-
-        tdatetime = trange.to_datetime()
-        dhr = trange.LocalTime.utcoffset().total_seconds() / 60 / 60 / 24
-        btime = Time(np.fix(trange.mjd + dhr) - dhr, format='mjd')
-        etime = Time(btime.mjd + 1, format='mjd')
-        trange = Time([btime, etime])
-        print('Selected timerange in UTC: ', trange.iso)
-        inpath = '{}{}/'.format(udbdir, tdatetime.strftime("%Y"))
-        outpath = './'
-        vis = os.path.join(outpath, 'UDB' + tdatetime.strftime("%Y%m%d") + '.ms')
-        if not os.path.exists(vis):
-            msfile_synoptic = os.path.join(outpath, 'UDB' + tdatetime.strftime("%Y%m%d") + '.ms')
-            # sclist = ra.findfiles(trange, projid='NormalObserving', srcid='Sun')
-            sclist = findfiles(trange, projid='NormalObserving', srcid='Sun')
-            udbfilelist = sclist['scanlist']
-            udbfilelist = [os.path.basename(ll) for ll in udbfilelist]
-            udbfilelist_set = set(udbfilelist)
-            msfiles = []
-            msfiles = udbfilelist_set.intersection(msfiles)
-            filelist = udbfilelist_set - msfiles
-            filelist = sorted(list(filelist))
-            ncpu = 1
-            importeovsa(idbfiles=[inpath + ll for ll in filelist], ncpu=ncpu, timebin="0s", width=1,
-                        visprefix=outpath, nocreatms=False,
-                        doconcat=False, modelms="", doscaling=False, keep_nsclms=False, udb_corr=True)
-
-            msfiles = [os.path.basename(ll).split('.')[0] for ll in glob('{}UDB*.ms'.format(outpath)) if
-                       ll.endswith('.ms') or ll.endswith('.ms.tar.gz')]
-            udbfilelist_set = set(udbfilelist)
-            msfiles = udbfilelist_set.intersection(msfiles)
-            filelist = udbfilelist_set - msfiles
-            filelist = sorted(list(filelist))
-
-            invis = [outpath + ll + '.ms' for ll in sorted(list(msfiles))]
-            vis_out = os.path.join(os.path.dirname(invis[0]), os.path.basename(invis[0])[:11] + '.ms')
-            interp = 'auto'
-            # interp = 'nearest'
-            # vis = calibeovsa(invis, caltype=['refpha', 'phacal'], caltbdir='./', interp='auto',
-            flagant = '13~15' if btime.mjd >= EOVSA15_UPGRADE_DATE.mjd else '15'
-            vis = calibeovsa(invis, caltype=['refpha', 'phacal'], caltbdir='./', interp=interp,
-                             doflag=True,
-                             flagant=flagant,
-                             # flagspw='0~1',
-                             doimage=False, doconcat=True,
-                             # doimage=False, doconcat=False,
-                             concatvis=vis_out, keep_orig_ms=True)
+        if len(caltbs) > ncaltbs_before:
+            with pipeline_stage("applycal:feature", spw=spw, spwstr=spwstr, interp=round_def['interp']):
+                applycal(vis=msfile, selectdata=True, antenna=antenna,
+                         spw=spw, gaintable=caltbs, interp=round_def['interp'],
+                         calwt=False, applymode="calonly")
+            datacolumn = "CORRECTED_DATA"
+            log_print('INFO', f"{round_def['name']} Feature Selfcal for SPW {spw}: solution applied")
         else:
-            log_print('INFO', f'Input MS file {vis} already exists. Skipping import from UDB.')
+            log_print('WARNING',
+                      f"{round_def['name']} Feature Selfcal for SPW {spw}: no new solutions, skipping applycal")
 
-        # vis = vis_out
+    return slfcal_obj, caltbs, datacolumn
 
-        # if not os.path.exists(vis.replace('.ms','.pols.ms')):
-        #     mstl.sort_polarization_order(vis, vis.replace('.ms','.pols.ms'))
-        # vis=vis.replace('.ms','.pols.ms')
 
-    if workdir is None:
-        workdir = './'
-    os.chdir(workdir)
-    if slfcaltbdir is None:
-        slfcaltbdir = workdir + '/'
-    if imgoutdir is None:
-        imgoutdir = workdir + '/'
-
-    msfile = os.path.normpath(vis)
-
-    # Get the base name without any of the known extensions
-    basename = os.path.basename(msfile)
-    if basename.lower().endswith('.ms.tar.gz'):
-        msname = basename[:-len('.ms.tar.gz')]
-    elif basename.lower().endswith('.ms'):
-        msname = basename[:-len('.ms')]
-    else:
-        raise ValueError(f"Unsupported file format: {basename}")
-
-    msfile_copy = os.path.join(workdir, f'{msname}.ms')
-    if not os.path.exists(msfile_copy):
-        if msfile.lower().endswith('.ms'):
-            shutil.copytree(msfile, msfile_copy)
-        elif msfile.lower().endswith('.ms.tar.gz'):
-            os.system(f'tar -zxf {msfile} -C {workdir}')
-        else:
-            raise ValueError(f"Unsupported file format: {msfile}")
-    msfile = msfile_copy
-
-    viz_timerange = ant_trange(msfile)
-    (tstart, tend) = viz_timerange.split('~')
-    tbg_msfile = Time(qa.quantity(tstart, 's')['value'], format='mjd').to_datetime()
-    ted_msfile = Time(qa.quantity(tend, 's')['value'], format='mjd').to_datetime()
-    tmid_msfile = tbg_msfile + (ted_msfile - tbg_msfile) / 2
-
-    antenna = '0~12'
-    if tbg_msfile >= EOVSA15_UPGRADE_DATE.to_datetime():
-        antenna = '0~14'
-    ## date_str is set to the day 1 if the time is between 08:00 UT on day 1 to 08:00 UT(+1) on day 2
-    if tbg_msfile.time() < time(8, 0):
-        date_local = tbg_msfile.date() - timedelta(days=1)
-    else:
-        date_local = tbg_msfile.date()
-    date_str = date_local.strftime('%Y%m%d')
-    reftime_daily = Time(datetime.combine(date_local, time(20, 0)))
-    freq_setup = FrequencySetup(Time(tbg_msfile))
-    spws_indices = freq_setup.spws_indices
-    tb_models = {}
-    outfits_all = {}
-    bright = {}
-    bright_thresh = {}  ## Threshold of brightness for each band window
-    tb_ratio_thresh = {}  ## Threshold of Tb ratio between tb_image and tb_model for each band window
-    segmented_imaging = {}
-    briggs = {}
-    fits_mask = {}
-    imaging_objs = {}
-    spws = freq_setup.spws
-    spws_imaging = spws
-    defaultfreq = freq_setup.defaultfreq
-    freq = defaultfreq
-    nbands = freq_setup.nbands
-    # bandinfo = mstl.get_bandinfo(msfile, returnbdinfo=True)
-
-    for sidx, sp_index in enumerate(spws_indices):
-        tb_models[sidx] = None
-        outfits_all[sidx] = None
-        bright[sidx] = False
-        imaging_objs[sidx] = None
-        bright_thresh[sidx] = bright_thresh_[sidx]
-        tb_ratio_thresh[sidx] = tb_ratio_thresh_[sidx]
-        segmented_imaging[sidx] = True if sidx in [0, 1, 2, 3] else False
-        briggs[sidx] = briggs_[sidx]
-
-    dsize, fdens = calc_diskmodel(tmid_msfile, nbands, freq)
-    fdens = fdens / 2.0  ## convert from I to XX
-
-    ## set a maxmium uv range for disk self-calibration. 30 meters is a good choice for EOVSA. A minumum of 200 lambda.
+def _compute_uv_ranges(spws_indices, spws, freq, spwidx2proc):
+    """Compute per-band UV range strings for disk and feature self-calibration."""
     uvmax_l_list = []
-    ## set a minimum uv range for feature self-calibration. 225 meters is a good choice for EOVSA. A minumum of 1500 lambda.
     uvmin_l_list = []
+    uvmax_d = UV_CONFIG['uvmax_baseline_m']
+    uvmin_d_default = UV_CONFIG['uvmin_baseline_m']
+    uvmin_d_band0 = UV_CONFIG['uvmin_baseline_m_band0']
+
     for sidx, sp_index in enumerate(spws_indices):
         if sidx not in spwidx2proc:
             uvmax_l_list.append(0)
             uvmin_l_list.append(0)
         else:
-            uvmax_d = 15
-            uvmin_d = 110
-            if sidx in [0]:
-                uvmin_d = 55
-            sp_st, sp_ed = (int(s) for s in spws[sidx].split('~'))
-            uvmax_l_list.append(uvmax_d / ((3e8 / (np.nanmean(freq[sp_st:sp_st + 1]) * 1e9))))
-            uvmin_l_list.append(uvmin_d / ((3e8 / (np.nanmean(freq[sp_st:sp_st + 1]) * 1e9))))
-    uvmax_l_list = np.array(uvmax_l_list).astype(float)
-    uvmin_l_list = np.array(uvmin_l_list).astype(float)
-    # uvmax_l_list[uvmax_l_list<200] = 200
-    uvmax_l_list[uvmax_l_list < 100] = 100
-    uvmax_l_list[uvmax_l_list > 1200] = 1200
-    uvmin_l_list[uvmin_l_list > 1800] = 1800
-    uvmax_l_str = [f'<{l:.0f}lambda' for l in uvmax_l_list]
-    uvmin_l_list = np.array(uvmin_l_list).astype(float)
+            uvmin_d = uvmin_d_band0 if sidx == 0 else uvmin_d_default
+            sp_st = int(spws[sidx].split('~')[0])
+            wavelength = 3e8 / (np.nanmean(freq[sp_st:sp_st + 1]) * 1e9)
+            uvmax_l_list.append(uvmax_d / wavelength)
+            uvmin_l_list.append(uvmin_d / wavelength)
+
+    uvmax_l_list = np.array(uvmax_l_list, dtype=float)
+    uvmin_l_list = np.array(uvmin_l_list, dtype=float)
+    lo, hi = UV_CONFIG['uvmax_l_clamp']
+    uvmax_l_list = np.clip(uvmax_l_list, lo, hi)
+    uvmin_l_list[uvmin_l_list > UV_CONFIG['uvmin_l_clamp_max']] = UV_CONFIG['uvmin_l_clamp_max']
     uvmin_l_str = [f'>{l:.0f}lambda' for l in uvmin_l_list]
-
-    run_start_time = datetime.now()
-    ### --------------------------------------------------------------###
-    ## pre-processing block. flagging, hanning smoothing...
-    ### --------------------------------------------------------------###
-    run_start_time_pre_proc = datetime.now()
-    # if not mergeFITSonly:
-    if os.path.isdir(msfile + '.flagversions') == True:
-        if verbose:
-            log_print('INFO', f'Flagversion of {msfile} already exists. Skipped...')
-    else:
-        if verbose:
-            log_print('INFO', f'Flagging any high amplitudes viz from flares or RFIs in {msfile}')
-        flagmanager(msfile, mode='save', versionname='pipeline_init')
-        flagdata(vis=msfile, mode="tfcrop", spw='', action='apply', display='',
-                 timecutoff=3.0, freqcutoff=2.0, maxnpieces=2, flagbackup=False)
-        flagmanager(msfile, mode='save', versionname='pipeline_remove_RFI-and-BURSTS')
-
-    if hanning:
-        msfile_hanning = msfile + '.hanning'
-        if not os.path.exists(msfile_hanning):
-            if verbose:
-                log_print('INFO', f'Perform hanningsmooth for {msfile}...')
-            hanningsmooth(vis=msfile, datacolumn='data', outputvis=msfile_hanning)
-        else:
-            if verbose:
-                log_print('INFO', f'The hanningsmoothed {msfile} already exists. Skipped...')
-        msfile = msfile_hanning
-
-    delmod(msfile)
-
-    wsclean_intervals = WSCleanTimeIntervals(msfile, combine_scans=True)
-    ## for calibration, we want to use longer time intervals for the first round
-    # Mapping: spectral index → (multiplier of 50 min intervals)
-    interval_multipliers_init = {
-        0: 20,  # 20× longer for band 0 -- all day mode
-        1: 20,  # 20× longer for band 1 -- all day mode
-    }
-    interval_multipliers_init.update({idx: 3 for idx in range(2, 7)})
-
-    interval_multipliers_rnd1 = {
-        0: 6,  # 20× longer for band 0 -- 5× longer for band 0
-        1: 3,  # 20× longer for band 1 -- 3× longer for band 1
-    }
-
-    ## for imaging, we want to use shorter time intervals for the first two bands
-    # bands 2–6 use the base length (50 min)
-    interval_multipliers_rnd1.update({idx: 1 for idx in range(2, 7)})
-
-    interval_multipliers_rnd2 = {
-        0: 4,  # 20× longer for band 0 -- 5× longer for band 0
-        1: 2,  # 20× longer for band 1 -- 3× longer for band 1
-    }
-
-    ## for imaging, we want to use shorter time intervals for the first two bands
-    # bands 2–6 use the base length (50 min)
-    interval_multipliers_rnd2.update({idx: 1 for idx in range(2, 7)})
-
-    # Mapping: spectral index → (multiplier of 50 min intervals)
-    interval_multipliers_final = {
-        0: 2.4,  # 2.4× longer for band 0
-        1: 1.2,  # 1.2× longer for band 1
-    }
-    # bands 2–6 use the base length (50 min)
-    interval_multipliers_final.update({idx: 1 for idx in range(2, 7)})
-
-    N1_init = {}
-    N2_init = {}
-    time_intervals_init = {}
-    time_intervals_major_avg_init = {}
-    time_intervals_minor_avg_init = {}
-    timeranges_init = {}
-
-    N1_rnd1 = {}
-    N2_rnd1 = {}
-    time_intervals_rnd1 = {}
-    time_intervals_major_avg_rnd1 = {}
-    time_intervals_minor_avg_rnd1 = {}
-    timeranges_rnd1 = {}
-
-    N1_rnd2 = {}
-    N2_rnd2 = {}
-    time_intervals_rnd2 = {}
-    time_intervals_major_avg_rnd2 = {}
-    time_intervals_minor_avg_rnd2 = {}
-    timeranges_rnd2 = {}
-
-    N1_final = {}
-    N2_final = {}
-    time_intervals_final = {}
-    time_intervals_major_avg_final = {}
-    time_intervals_minor_avg_final = {}
-    timeranges_final = {}
-
-    wsclean_intervals.interval_length = 50  # 50 minutes long intervals
-    wsclean_intervals.compute_intervals(nintervals_minor=3)
-    res = wsclean_intervals.results()
-    tdur = res['tdur']
-
-    caltbs_all = []
-    slfcal_init_objs = []
-    slfcal_rnd1_objs = []
-    slfcal_rnd2_objs = []
+    return uvmin_l_str
 
 
-    imname_init_disk_strlist = ["eovsa", "disk", "init", f"{msname}"]
-
-    for sidx, sp_index in enumerate(spws_indices):
-        spwstr = format_spw(spws[sidx])
-        msfile_sp = f'{msname}.sp{spwstr}.slfcaled.ms'
-        caltbs = []
-        ncaltbs = len(caltbs)
-
-        if os.path.exists(msfile_sp):
-            if overwrite:
-                os.system('rm -rf ' + msfile_sp)
-            else:
-                log_print('INFO', f"MS file {msfile_sp} already exists. Skipping processing.")
-                slfcal_init_objs.append(None)
-                slfcal_rnd1_objs.append(None)
-                slfcal_rnd2_objs.append(None)
-                caltbs_all.append(caltbs)
-                continue
-        if sidx not in spwidx2proc:
-            slfcal_init_objs.append(None)
-            slfcal_rnd1_objs.append(None)
-            slfcal_rnd2_objs.append(None)
-            caltbs_all.append(caltbs)
-            continue
-        # clearcal(msfile, spw=spws[sidx])
-        reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
-        log_print('INFO', f"Processing SPW {spws[sidx]} for msfile {msname} ...")
-        # if sidx in [0]:
-        #     auto_mask = 3
-        #     auto_threshold = 2
-        # else:
-        auto_mask = 6
-        auto_threshold = 3
-
-        '''
-        Step 1: brightness check
-        '''
-
-        run_start_time_disk_slfcal = datetime.now()
+def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
+                      caltbs, slfcal_init_obj, imname_init_disk_strlist,
+                      freq_setup, dsize, fdens, ri_init,
+                      ri_final, tdur, uvmin_l_str_sidx,
+                      overwrite_caltb, pols):
+    """Run disk self-calibration: predict disk model, gaincal, applycal, flag, uvsub."""
+    with pipeline_stage("disk_selfcal", spw=spw, spwstr=spwstr, has_feature_model=slfcal_init_obj is not None):
         delmod(vis=msfile)
-        imname = '-'.join(imname_init_disk_strlist + [f"sp{spwstr}"])
-        clean_obj = ww.WSClean(msfile)
-        clean_obj.setup(size=1024, scale="2.5asec",
-                        pol=pols,
-                        weight_briggs=0.0,
-                        niter=500,
-                        mgain=0.85,
-                        # interval=[0, 10],
-                        data_column='DATA',
-                        name=os.path.join(workdir, imname),
-                        multiscale=True,
-                        multiscale_gain=0.3,
-                        multiscale_scale_bias=0.6,
-                        auto_mask=6, auto_threshold=3,
-                        intervals_out=1,
-                        no_negative=True, quiet=True,
-                        circular_beam=True,
-                        beam_size=bmsize,
-                        # theoretic_beam=True,  ## to avoid bad beam fitting and very small beam size
-                        spws=sp_index)
-        clean_obj.run(dryrun=False)
+        run_start = datetime.now()
+        log_print('INFO', f"Starting Disk self-calibration for SPW {spw} ...")
 
-        clearn_junk(imname)
-
-        in_fits = os.path.join(workdir, f"{imname}-image.fits")
-        diskstatss = []
-        for i, sp in enumerate(sp_index.split(',')):
-            # run_start_time_disk_slfcal_sp = datetime.now()
-            reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(f'{sp}~{sp}', return_bmsize=True)
-            sp = int(sp)
-            out_fits = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk-model.fits'])
-            dsz = float(dsize[sp].rstrip('arcsec'))
-            fdn = fdens[sp]
-            if i == 0:
-                create_mask = True
-            else:
-                create_mask = False
-            diskstats = add_convolved_disk_to_fits(in_fits, out_fits, dsz, fdn, ignore_data=True,
-                                                   bmaj=bmsize / 3600., rfreq=reffreq, create_mask=create_mask)
-
-            diskstatss.append(diskstats)
-
-        fits_mask[sidx] = os.path.join(workdir, f"{imname}-mask.fits")
-        tb_image = np.nanmean([ds[7] for ds in diskstatss])
-        if np.isnan(tb_image):
-            log_print('ERROR', f"TB image for SPW {spws[sidx]} is NaN. Skipping this SPW.")
-            slfcal_init_objs.append(None)
-            slfcal_rnd1_objs.append(None)
-            slfcal_rnd2_objs.append(None)
-            caltbs_all.append(caltbs)
-            continue
-        tb_model = np.nanmean([ds[8] for ds in diskstatss])
-        tb_models[sidx] = tb_model * 1e3
-        snr = np.nanmean([ds[10] for ds in diskstatss])
-        bright_ratio = tb_image / tb_model
-        bright[sidx] = bright_ratio * snr > bright_thresh[sidx]
-        log_print('INFO',
-                  f"SPW {spws[sidx]}: tb_image = {tb_image:.1f} kK, tb_model = {tb_model:.1f} kK, Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]}, SNR = {snr:.1f}")
-
-        if sidx == 0:
-            if snr >= 5:
-                bright[sidx] = True
-                log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
-                # interval_multipliers[sidx] = 3
-
-        if sidx == 1:
-            if snr >= 30:
-                bright[sidx] = True
-                log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
-                # interval_multipliers_rnd1[sidx] = 2
-
-        if bright[sidx]:
-            log_print('INFO', f"SPW {spws[sidx]} is bright. Proceeding with segmented imaging.")
-            segmented_imaging[sidx] = True
-
-        if bright_ratio < tb_ratio_thresh[sidx]:
-            segmented_imaging[sidx] = False
-
-        ## set the multipliers for the time intervals based init, rnd1, and final imaging
-        mult = interval_multipliers_init.get(sidx, 1)
-        wsclean_intervals.interval_length = 50 * mult
-        wsclean_intervals.compute_intervals(nintervals_minor=3)
-        res = wsclean_intervals.results()
-
-        N1_init[sidx] = res['nintervals_major']
-        N2_init[sidx] = res['nintervals_minor']
-        time_intervals_init[sidx] = res['time_intervals']
-        time_intervals_major_avg_init[sidx] = res['time_intervals_major_avg']
-        time_intervals_minor_avg_init[sidx] = res['time_intervals_minor_avg']
-        tr = []
-        for tidx, trange in enumerate(res['time_intervals']):
-            tr.append(
-                trange[0].datetime.strftime('%Y/%m/%d/%H:%M:%S') + '~' + trange[-1].datetime.strftime(
-                    '%Y/%m/%d/%H:%M:%S'))
-        timeranges_init[sidx] = tr
-
-        mult = interval_multipliers_rnd1.get(sidx, 1)
-        wsclean_intervals.interval_length = 50 * mult
-        wsclean_intervals.compute_intervals(nintervals_minor=3)
-        res = wsclean_intervals.results()
-
-        N1_rnd1[sidx] = res['nintervals_major']
-        N2_rnd1[sidx] = res['nintervals_minor']
-        time_intervals_rnd1[sidx] = res['time_intervals']
-        time_intervals_major_avg_rnd1[sidx] = res['time_intervals_major_avg']
-        time_intervals_minor_avg_rnd1[sidx] = res['time_intervals_minor_avg']
-        tr = []
-        for tidx, trange in enumerate(res['time_intervals']):
-            tr.append(
-                trange[0].datetime.strftime('%Y/%m/%d/%H:%M:%S') + '~' + trange[-1].datetime.strftime(
-                    '%Y/%m/%d/%H:%M:%S'))
-        timeranges_rnd1[sidx] = tr
-
-        mult = interval_multipliers_rnd2.get(sidx, 1)
-        wsclean_intervals.interval_length = 50 * mult
-        wsclean_intervals.compute_intervals(nintervals_minor=3)
-        res = wsclean_intervals.results()
-
-        N1_rnd2[sidx] = res['nintervals_major']
-        N2_rnd2[sidx] = res['nintervals_minor']
-        time_intervals_rnd2[sidx] = res['time_intervals']
-        time_intervals_major_avg_rnd2[sidx] = res['time_intervals_major_avg']
-        time_intervals_minor_avg_rnd2[sidx] = res['time_intervals_minor_avg']
-        tr = []
-        for tidx, trange in enumerate(res['time_intervals']):
-            tr.append(
-                trange[0].datetime.strftime('%Y/%m/%d/%H:%M:%S') + '~' + trange[-1].datetime.strftime(
-                    '%Y/%m/%d/%H:%M:%S'))
-        timeranges_rnd2[sidx] = tr
-
-        mult = interval_multipliers_final.get(sidx, 1)
-        wsclean_intervals.interval_length = 50 * mult
-        wsclean_intervals.compute_intervals(nintervals_minor=3)
-        res = wsclean_intervals.results()
-
-        N1_final[sidx] = res['nintervals_major']
-        N2_final[sidx] = res['nintervals_minor']
-        time_intervals_final[sidx] = res['time_intervals']
-        time_intervals_major_avg_final[sidx] = res['time_intervals_major_avg']
-        time_intervals_minor_avg_final[sidx] = res['time_intervals_minor_avg']
-        tr = []
-        for tidx, trange in enumerate(res['time_intervals']):
-            tr.append(
-                trange[0].datetime.strftime('%Y/%m/%d/%H:%M:%S') + '~' + trange[-1].datetime.strftime(
-                    '%Y/%m/%d/%H:%M:%S'))
-        timeranges_final[sidx] = tr
-
-        '''
-        Step 2: rotation-correction-based feature self-calibration (optional depending on brightness)
-        '''
-        feature_slfcal = bright[sidx]
-        if feature_slfcal:
-            ## initial phase self-calibration
-            slfcal_obj = MSselfcal(msfile, time_intervals_init[sidx], time_intervals_major_avg_init[sidx],
-                                   time_intervals_minor_avg_init[sidx],
-                                   spws[sidx], N1_init[sidx], N2_init[sidx], workdir, image_marker='init', niter=100,
-                                   briggs=0.0,
-                                   data_column="DATA",
-                                   pols=pols,
-                                   auto_mask=auto_mask,
-                                   auto_threshold=auto_threshold,
-                                   fits_mask=fits_mask[sidx],
-                                   beam_size=bmsize,
-                                   circular_beam=False,
-                                   )
-            slfcal_obj.run()
-
-            ## check if all data in the fits files are flagged. If so, skip the self-calibration for this spw.
-            # slfcal_obj.run(imaging_only=True)
-            if slfcal_obj.succeeded:
-                slfcal_init_objs.append(slfcal_obj)
-            else:
-                slfcal_init_objs.append(None)
-                slfcal_rnd1_objs.append(None)
-                slfcal_rnd2_objs.append(None)
-                caltbs_all.append(caltbs)
-                continue
-
-            # if N1_init[sidx] == 1:
-            #     timerange_sub = trange2timerange([time_intervals_init[sidx][0][0], time_intervals_init[sidx][0][-1]])
-            # else:
-            #     timerange_sub = trange2timerange(
-            #         [time_intervals_init[sidx][0][-1], time_intervals_init[sidx][N1_init[sidx] - 1][0]])
-
-            caltb = os.path.join(workdir, f"caltb_init_inf_sp{spwstr}.pha")
-            if os.path.exists(caltb):
-                if overwrite_caltb:
-                    os.system('rm -rf ' + caltb)
-            if not os.path.exists(caltb):
-                gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                        timerange='',
-                        uvrange='',
-                        spw=spws[sidx],
-                        combine="scan", antenna=f'{antenna}&{antenna}', refant='0',
-                        solint='inf', refantmode="flex",
-                        gaintype='G',
-                        gaintable=caltbs,
-                        minsnr=1.0, calmode='p', append=False)
-            if os.path.exists(caltb): caltbs.append(caltb)
-
-            caltb = os.path.join(workdir, f"caltb_init_int_sp{spwstr}.pha")
-            if os.path.exists(caltb):
-                if overwrite_caltb:
-                    os.system('rm -rf ' + caltb)
-            if not os.path.exists(caltb):
-                gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                        timerange='',
-                        uvrange='',
-                        spw=spws[sidx],
-                        combine="scan", antenna=f'{antenna}&{antenna}', refant='0',
-                        solint=f'{tdur * 60 / N1_init[sidx] / N2_init[sidx]:.0f}s', refantmode="flex",
-                        gaintype='G',
-                        gaintable=caltbs,
-                        minsnr=1.0, calmode='p', append=False)
-            if os.path.exists(caltb): caltbs.append(caltb)
-
-            if len(caltbs) > ncaltbs:
-                log_print('INFO', f'Applying initial feature selfcal solution (spw {spwstr})  to the data')
-                applycal(vis=msfile, selectdata=True, antenna=antenna,
-                         spw=spws[sidx],
-                         gaintable=caltbs, interp='nearest',
-                         calwt=False, applymode="calonly")
-                ncaltbs = len(caltbs)
-            else:
-                log_print('WARNING', 'Round 1 Feature Slfcal: No new solutions. Skipping applycal.')
-
-            run_end_time_pre_proc = datetime.now()
-            elapsed_time = run_end_time_pre_proc - run_start_time_pre_proc
-            elapsed_time_pre_proc = elapsed_time.total_seconds() / 60
-            log_print('INFO', f"Pre-processing for SPW {spwstr}: completed in {elapsed_time_pre_proc:.1f} minutes")
-
-            run_start_time_scan_shift_corr = datetime.now()
-
-            # reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
-            log_print('INFO', f"Processing SPW {spws[sidx]} for msfile {os.path.basename(msfile)} ...")
-            # briggs = 0.5 if sidx in [0] else 0.0
-            # if sidx in alldaymode_spidx:
-            #     auto_mask = 2
-            #     auto_threshold = 1.5
-            # # elif sidx in [5,6]:
-            # #     auto_mask = 4
-            # #     auto_threshold = 1.5
-            # else:
-            auto_mask = 4
-            auto_threshold = 2
-            slfcal_obj = MSselfcal(msfile, time_intervals_rnd1[sidx], time_intervals_major_avg_rnd1[sidx],
-                                   time_intervals_minor_avg_rnd1[sidx],
-                                   spws[sidx], N1_rnd1[sidx], N2_rnd1[sidx], workdir, image_marker='round1', niter=200,
-                                   briggs=0.0,
-                                   auto_mask=auto_mask,
-                                   auto_threshold=auto_threshold,
-                                   fits_mask=fits_mask[sidx],
-                                   pols=pols,
-                                   beam_size=bmsize,
-                                   circular_beam=False,
-                                   data_column="CORRECTED_DATA")
-            slfcal_obj.run()
-            slfcal_rnd1_objs.append(slfcal_obj)
-
-            caltb = os.path.join(workdir, f"caltb_rnd1_int_sp{spwstr}.pha")
-            if os.path.exists(caltb):
-                if overwrite_caltb:
-                    os.system('rm -rf ' + caltb)
-            if not os.path.exists(caltb):
-                gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                        uvrange='',
-                        spw=spws[sidx],
-                        combine="scan", antenna=f'{antenna}&{antenna}', refant='0',
-                        # solint=f'{tdur *60 / N2[sidx] / N1[sidx]:.0f}s', refantmode="flex",
-                        solint=f'{tdur * 60 / N1_rnd1[sidx] / N2_rnd1[sidx]:.0f}s', refantmode="flex",
-                        gaintype='G',
-                        gaintable=caltbs,
-                        minsnr=1.0, calmode='p', append=False)
-            if os.path.exists(caltb): caltbs.append(caltb)
-
-            if do_sbdcal:
-                caltb_k = os.path.join(workdir, f"caltb_inf_sp{spwstr}.sbd")
-                if os.path.isdir(caltb_k): os.system('rm -rf ' + caltb_k)
-                gaincal(vis=msfile, caltable=caltb_k, solint='inf', combine='scan',
-                        # uvrange='>1.5klambda',
-                        uvrange='',
-                        refant='0', gaintype='K',
-                        spw=spws[sidx],
-                        gaintable=caltbs,
-                        calmode='p', refantmode='flex', minsnr=2.0, minblperant=4,
-                        append=False)
-                if os.path.isdir(caltb_k):
-                    caltbs.append(caltb_k)
-
-            if len(caltbs) > ncaltbs:
-                applycal(vis=msfile, selectdata=True, antenna=antenna,
-                         spw=spws[sidx],
-                         gaintable=caltbs, interp='linear',
-                         calwt=False, applymode="calonly")
-                ncaltbs = len(caltbs)
-                log_print('INFO', f"Round 1 Feature Selfcal for SPW {spws[sidx]}: solution applied")
-            else:
-                log_print('WARNING',
-                          f"Round 1 Feature Selfcal for SPW {spws[sidx]}: no new solutions, skipping applycal")
-
-            log_print('INFO', f"Processing SPW {spws[sidx]}  ...")
-            # if sidx in alldaymode_spidx:
-            #     auto_mask = 2
-            #     auto_threshold = 1
-            # else:
-            auto_mask = 3
-            auto_threshold = 1
-            # reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
-            slfcal_rnd2_obj = MSselfcal(msfile, time_intervals_rnd2[sidx], time_intervals_major_avg_rnd2[sidx],
-                                        time_intervals_minor_avg_rnd2[sidx],
-                                        spws[sidx], N1_rnd2[sidx], N2_rnd2[sidx], workdir, image_marker='round2',
-                                        niter=500,
-                                        briggs=0.0,
-                                        auto_mask=auto_mask,
-                                        auto_threshold=auto_threshold,
-                                        fits_mask=fits_mask[sidx],
-                                        pols=pols,
-                                        beam_size=bmsize,
-                                        circular_beam=False,
-                                        data_column="CORRECTED_DATA"
-                                        )
-            # beam_size=bmsize)
-            slfcal_rnd2_obj.run()
-            slfcal_rnd2_objs.append(slfcal_rnd2_obj)
-
-            caltb = os.path.join(workdir, f"caltb_rnd2_int_sp{spwstr}.pha")
-            if os.path.exists(caltb):
-                if overwrite_caltb:
-                    os.system('rm -rf ' + caltb)
-            if not os.path.exists(caltb):
-                gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                        uvrange='',
-                        spw=spws[sidx],
-                        combine="scan", antenna=f'{antenna}&{antenna}', refant='0',
-                        solint=f'{tdur * 60 / N2_rnd2[sidx] / N1_rnd2[sidx]:.0f}s',
-                        refantmode="flex",
-                        gaintype='G',
-                        gaintable=caltbs,
-                        minsnr=1.0, calmode='p', append=False)
-            if os.path.exists(caltb): caltbs.append(caltb)
-
-            caltb = os.path.join(workdir, f"caltb_rnd2_inf_sp{spwstr}.amp")
-            if os.path.exists(caltb):
-                if overwrite_caltb:
-                    os.system('rm -rf ' + caltb)
-            if not os.path.exists(caltb):
-                gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                        uvrange=uvmin_l_str[sidx],
-                        spw=spws[sidx],
-                        # combine="scan", antenna=f'{antenna}&{antenna', refant='0', solint=f'{tdur *60 / N2[sidx] / N1[sidx]:.0f}s', refantmode="flex",
-                        combine="scan", antenna=f'{antenna}&{antenna}', refant='0', solint='inf', refantmode="flex",
-                        gaintype='G',
-                        gaintable=caltbs,
-                        minsnr=1.0, calmode='a', append=False)
-            if os.path.exists(caltb): caltbs.append(caltb)
-        else:
-            slfcal_init_objs.append(None)
-            slfcal_rnd1_objs.append(None)
-            slfcal_rnd2_objs.append(None)
-
-        '''
-        Step 3: Disk self-calibration
-        '''
-        delmod(vis=msfile)
-        run_start_time_disk_slfcal = datetime.now()
-        log_print('INFO', f"Starting Disk self-calibration for SPW {spws[sidx]} ...")
-
-        # if feature_slfcal:
-        #     uvrange = ''
-        # else:
-        #     uvrange = uvmin_l_str[sidx].replace('>', '<')  ## use the maximum uv range for disk self-calibration
         for sp in sp_index.split(','):
-            # run_start_time_disk_slfcal_sp = datetime.now()
             reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(f'{sp}~{sp}', return_bmsize=True)
-            sp = int(sp)
-            if slfcal_init_objs[sidx] is None:
-                ## this applies to the case when no feature selfcal is performed.
-                model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk'])
-                cmd = f"wsclean -predict -reorder -spws {sp}" + f" \
-                        -name {model_imname} -quiet -intervals-out 1 {msfile}"
-                os.system(cmd)
+            sp_int = int(sp)
+            if slfcal_init_obj is None:
+                model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp_int:02d}_adddisk'])
+                cmd = f"{WSCLEAN_BIN} -predict -reorder -spws {sp} -name {model_imname} -quiet -intervals-out 1 {msfile}"
             else:
-                dsz = float(dsize[sp].rstrip('arcsec'))
-                fdn = fdens[sp]
-                ## this applies to the case when feature selfcal is performed.
-                in_fits_files = sorted(glob(slfcal_init_objs[sidx].model_minor_name_str + '-t????-model.fits'))
-                model_dir_disk_name_str = slfcal_init_objs[sidx].model_minor_name_str.replace(format_spw(spws[sidx]),
-                                                                                              f'{sp:02d}') + '_adddisk'
+                dsz = float(dsize[sp_int].rstrip('arcsec'))
+                fdn = fdens[sp_int]
+                in_fits_files = sorted(glob(slfcal_init_obj.model_minor_name_str + '-t????-model.fits'))
+                model_dir_disk_name_str = slfcal_init_obj.model_minor_name_str.replace(
+                    format_spw(spw), f'{sp_int:02d}') + '_adddisk'
                 if len(in_fits_files) > 0:
                     for in_fits in in_fits_files:
-                        out_fits = in_fits.replace(slfcal_init_objs[sidx].model_minor_name_str, model_dir_disk_name_str)
-                        add_convolved_disk_to_fits(in_fits, out_fits, dsz, fdn, ignore_data=False, bmaj=bmsize / 3600.,
-                                                   rfreq=reffreq, )
-                    cmd = f"wsclean -predict -reorder -spws {sp}" + f" \
-                        -name {model_dir_disk_name_str} -quiet -intervals-out {N1_init[sidx] * N2_init[sidx]} {msfile}"
+                        out_fits = in_fits.replace(slfcal_init_obj.model_minor_name_str, model_dir_disk_name_str)
+                        add_convolved_disk_to_fits(in_fits, out_fits, dsz, fdn, ignore_data=False,
+                                                   bmaj=bmsize / 3600., rfreq=reffreq)
+                    cmd = (f"{WSCLEAN_BIN} -predict -reorder -spws {sp} -name {model_dir_disk_name_str} "
+                           f"-quiet -intervals-out {ri_init['N1'] * ri_init['N2']} {msfile}")
                 else:
                     log_print('WARNING',
-                              f"No feature cal model files found for SPW {spws[sidx]}. Use the uniform disk model for disk self-calibration...")
-                    model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk'])
-                    cmd = f"wsclean -predict -reorder -spws {sp}" + f" \
-                            -name {model_imname} -quiet -intervals-out 1 {msfile}"
-            log_print('INFO', f"Running wsclean predict: {cmd}")
-            os.system(cmd)
+                              f"No feature cal model files found for SPW {spw}. Using uniform disk model.")
+                    model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp_int:02d}_adddisk'])
+                    cmd = f"{WSCLEAN_BIN} -predict -reorder -spws {sp} -name {model_imname} -quiet -intervals-out 1 {msfile}"
+            log_print('INFO', f"Running WSClean predict: {cmd}")
+            subprocess.run(cmd, shell=True, check=False)
 
-        run_end_time_disk_slfcal = datetime.now()
-        elapsed_time = run_end_time_disk_slfcal - run_start_time_disk_slfcal
-        elapsed_time_disk_slfcal = elapsed_time.total_seconds() / 60
-        log_print('INFO',
-                  f"Disk self-calibration for SPW {spwstr}: completed in {elapsed_time_disk_slfcal:.1f} minutes")
+        elapsed = (datetime.now() - run_start).total_seconds() / 60
+        log_print('INFO', f"Disk self-calibration for SPW {spwstr}: completed in {elapsed:.1f} minutes")
 
-        caltb = os.path.join(workdir, f"caltb_disk_inf_sp{spwstr}.pha")
-        if os.path.exists(caltb):
-            if overwrite_caltb:
-                os.system('rm -rf ' + caltb)
-        if not os.path.exists(caltb):
-            gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                    uvrange='',
-                    spw=spws[sidx],
-                    combine="scan",
-                    antenna=f'{antenna}&{antenna}', refant='0', solint='inf', refantmode="strict",
-                    gaintype='G',
-                    gaintable=caltbs,
-                    minsnr=1,
-                    calmode='p', append=False)
-        if os.path.exists(caltb):
-            caltbs.append(caltb)
-
-        caltb = os.path.join(workdir, f"caltb_disk_int_sp{spwstr}.pha")
-        if os.path.exists(caltb):
-            if overwrite_caltb:
-                os.system('rm -rf ' + caltb)
-        if not os.path.exists(caltb):
-            gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                    uvrange='',
-                    spw=spws[sidx],
-                    combine="scan",
+        ncaltbs_before = len(caltbs)
+        # Disk phase calibration (inf)
+        caltbs = _run_gaincal_step(msfile, workdir, spw, spwstr, antenna, caltbs, tdur,
+                                   1, 1, 'disk_inf', 'inf', 'p', refantmode='strict',
+                                   overwrite_caltb=overwrite_caltb)
+        # Disk phase calibration (int)
+        caltbs = _run_gaincal_step(msfile, workdir, spw, spwstr, antenna, caltbs, tdur,
+                                   ri_final['N1'], ri_final['N2'],
+                                   'disk_int', 'auto_minor', 'p', refantmode='strict',
+                                   overwrite_caltb=overwrite_caltb)
+        # Disk amplitude calibration
+        caltb_amp = os.path.join(workdir, f"caltb_disk_int_sp{spwstr}.amp")
+        if os.path.exists(caltb_amp) and overwrite_caltb:
+            shutil.rmtree(caltb_amp, ignore_errors=True)
+        if not os.path.exists(caltb_amp):
+            gaincal(vis=msfile, caltable=caltb_amp, selectdata=True,
+                    uvrange='', spw=spw, combine="scan",
                     antenna=f'{antenna}&{antenna}', refant='0',
-                    solint=f'{tdur * 60 / N2_final[sidx] / N1_final[sidx]:.0f}s',
-                    refantmode="strict",
-                    gaintype='G',
-                    gaintable=caltbs,
-                    minsnr=1,
-                    calmode='p', append=False)
-        if os.path.exists(caltb):
-            caltbs.append(caltb)
+                    solint=f'{tdur * 60 / ri_final["N1"]:.0f}s',
+                    refantmode="flex", gaintype='G', gaintable=caltbs,
+                    minsnr=1, calmode='a', append=False)
+        if os.path.exists(caltb_amp):
+            mstl.flagcaltboutliers(caltb_amp, limit=[0.125, 8.0])
+            caltbs.append(caltb_amp)
 
-        caltb = os.path.join(workdir, f"caltb_disk_int_sp{spwstr}.amp")
-        if os.path.exists(caltb):
-            if overwrite_caltb:
-                os.system('rm -rf ' + caltb)
-        if not os.path.exists(caltb):
-            gaincal(vis=msfile, caltable=caltb, selectdata=True,
-                    uvrange='',
-                    spw=spws[sidx],
-                    combine="scan",
-                    antenna=f'{antenna}&{antenna}', refant='0',
-                    solint=f'{tdur * 60 / N1_final[sidx]:.0f}s',
-                    refantmode="flex",
-                    gaintype='G',
-                    gaintable=caltbs,
-                    minsnr=1,
-                    calmode='a', append=False)
-        if os.path.exists(caltb):
-            mstl.flagcaltboutliers(caltb, limit=[0.125, 8.0])
-            caltbs.append(caltb)
-
-        caltbs_all.append(caltbs)
-
-        ## apply the self-cal solutions to the data and flag any remaining RFI.
-        if len(caltbs) > ncaltbs:
-            log_print('INFO', f"Applying selfcal solutions for SPW {spws[sidx]}")
+        # Apply solutions and flag
+        if len(caltbs) > ncaltbs_before:
+            log_print('INFO', f"Applying selfcal solutions for SPW {spw}")
             applycal(vis=msfile, selectdata=True, antenna=antenna,
-                     spw=spws[sidx],
-                     gaintable=caltbs, interp='linear',
+                     spw=spw, gaintable=caltbs, interp='linear',
                      calwt=False, applymode="calonly")
         else:
-            log_print('WARNING', f"No Selfcal solutions  for SPW {spws[sidx]}, skipping applycal")
+            log_print('WARNING', f"No Selfcal solutions for SPW {spw}, skipping applycal")
 
-        flagdata(vis=msfile, mode="tfcrop", spw=spws[sidx], action='apply', display='',
+        flagdata(vis=msfile, mode="tfcrop", spw=spw, action='apply', display='',
                  timecutoff=6.0, freqcutoff=6.0, maxnpieces=2, flagbackup=False)
 
-        ## subtract the disk model from the viz
-        run_start_time_disk_slfcal_subtract = datetime.now()
-        if slfcal_init_objs[sidx] is not None:
+        # Subtract disk model
+        run_start_sub = datetime.now()
+        if slfcal_init_obj is not None:
             for sp in sp_index.split(','):
                 log_print('INFO', f'Inserting disk model into the data for SPW {sp}')
-                sp = int(sp)
-                model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk'])
-                cmd = f"wsclean -predict -reorder -spws {sp}" + f" \
-                            -name {model_imname} -quiet -intervals-out 1 {msfile}"
-                os.system(cmd)
-        log_print('INFO', f'Subtracting disk model from the data for SPW {sp}')
+                sp_int = int(sp)
+                model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp_int:02d}_adddisk'])
+                cmd = f"{WSCLEAN_BIN} -predict -reorder -spws {sp} -name {model_imname} -quiet -intervals-out 1 {msfile}"
+                subprocess.run(cmd, shell=True, check=False)
+        log_print('INFO', f'Subtracting disk model from the data for SPW {spw}')
         uvsub(vis=msfile)
-        run_end_time_disk_slfcal_subtract = datetime.now()
-        elapsed_time = run_end_time_disk_slfcal_subtract - run_start_time_disk_slfcal_subtract
-        elapsed_time_disk_slfcal_subtract = elapsed_time.total_seconds() / 60
-        log_print('INFO',
-                  f"Disk subtraction for SPW {spwstr}: completed in {elapsed_time_disk_slfcal_subtract:.1f} minutes")
+        elapsed_sub = (datetime.now() - run_start_sub).total_seconds() / 60
+        log_print('INFO', f"Disk subtraction for SPW {spwstr}: completed in {elapsed_sub:.1f} minutes")
 
-        gain = 0.2
-        if segmented_imaging[sidx]:
+    return caltbs
+
+
+def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
+                       msname, ri_final, briggs_val, bmsize, pols,
+                       reftime_daily, viz_timerange, date_str,
+                       is_segmented, imaging_objs, freq_setup,
+                       tr_series_time=None):
+    """Run final imaging (segmented or non-segmented) and return output FITS paths.
+
+    :param tr_series_time: List of (start_Time, end_Time) tuples to filter imaging intervals.
+        If provided, only processes intervals overlapping with these ranges.
+    """
+    gain = 0.2
+    reffreq, cdelt4_real, _ = freq_setup.get_reffreq_and_cdelt(spw, return_bmsize=True)
+
+    with pipeline_stage("final_imaging", spw=spw, spwstr=spwstr, segmented=is_segmented):
+        if is_segmented:
             imname_strlist = ["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']
             imname = '-'.join(imname_strlist)
             clean_obj = ww.WSClean(msfile)
             clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
-                            weight_briggs=briggs[sidx],
-                            niter=20000,
-                            mgain=0.85,
-                            gain=gain,
-                            # gain=0.2,
+                            weight_briggs=briggs_val,
+                            niter=20000, mgain=0.85, gain=gain,
                             data_column='CORRECTED_DATA',
                             name=os.path.join(workdir, imname),
-                            multiscale=True,
-                            multiscale_gain=0.3,
-                            # multiscale_gain=0.5,
+                            multiscale=True, multiscale_gain=0.3,
                             multiscale_scale_bias=0.6,
                             auto_mask=2, auto_threshold=1,
                             minuv_l=200,
-                            # minuv_l=uvmin_l_list[sidx] / 3.0,
-                            # minuvw_m=8,
-                            # maxuvw_m=1500,
-                            intervals_out=N1_final[sidx],
+                            intervals_out=ri_final['N1'],
                             no_negative=False, quiet=True,
-                            circular_beam=True,
-                            beam_size=bmsize,
-                            # theoretic_beam=True,  ## to avoid bad beam fitting and very small beam size
+                            circular_beam=True, beam_size=bmsize,
                             spws=sp_index)
             clean_obj.run(dryrun=False)
 
@@ -2776,202 +2236,570 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             fitsname_helio = [f.replace('image.fits', 'image.helio.fits') for f in fitsname]
             fitsname_helio_ref_daily = [f.replace('image.fits', 'image.helio.ref_daily.fits') for f in fitsname]
             try:
-                hf.imreg(vis=msfile, imagefile=fitsname, fitsfile=fitsname_helio, timerange=timeranges_final[sidx],
-                         toTb=True)
+                hf.imreg(vis=msfile, imagefile=fitsname, fitsfile=fitsname_helio,
+                         timerange=ri_final['timeranges'], toTb=True)
                 for eoidx, (fits_helio, fits_helio_ref_daily) in enumerate(
                         zip(fitsname_helio, fitsname_helio_ref_daily)):
                     solar_diff_rot_heliofits(fits_helio, reftime_daily, fits_helio_ref_daily,
-                                             in_time=time_intervals_major_avg_final[sidx][eoidx])
+                                             in_time=ri_final['time_intervals_major_avg'][eoidx])
                 fitsfilefinal = fitsname_helio_ref_daily
-            except Exception as e:
-                log_print('ERROR', f"Error in hf.imreg or solar_diff_rot_heliofits: {e}")
+            except Exception:
+                log_print('ERROR', f"[final_imaging] helioprojective registration failed | "
+                                   f"{_format_log_state(spw=spw, spwstr=spwstr, n_fits=len(fitsname))}\n"
+                                   f"{traceback.format_exc()}")
                 fitsfilefinal = []
-            log_print('INFO', f"Final imaging for SPW {spws[sidx]}: completed")
+            log_print('INFO', f"Final imaging for SPW {spw}: completed")
         else:
             clean_obj = ww.WSClean(msfile)
-            imaging_obj = MSselfcal(msfile, time_intervals_final[sidx], time_intervals_major_avg_final[sidx],
-                                    time_intervals_minor_avg_final[sidx],
-                                    spws[sidx], N1_final[sidx], N2_final[sidx], workdir, image_marker='temp',
-                                    niter=10000,
-                                    briggs=briggs[sidx],
-                                    gain=gain,
+            imaging_obj = MSselfcal(msfile, ri_final['time_intervals'], ri_final['time_intervals_major_avg'],
+                                    ri_final['time_intervals_minor_avg'],
+                                    spw, ri_final['N1'], ri_final['N2'], workdir, image_marker='temp',
+                                    niter=10000, briggs=briggs_val, gain=gain,
                                     minuv_l=200,
-                                    # minuv_l=uvmin_l_list[sidx] / 3.0,
-                                    # minuv_l=None,
-                                    # minuvw_m=8,
-                                    # maxuvw_m=1500,
                                     auto_mask=2, auto_threshold=1,
-                                    data_column="CORRECTED_DATA",
-                                    pols=pols,
-                                    no_negative=False,
-                                    circular_beam=False,
-                                    # beam_size=bmsize,
-                                    theoretic_beam=True,  ## to avoid bad beam fitting and very small beam size
-                                    reftime_daily=reftime_daily
-                                    )
+                                    data_column="CORRECTED_DATA", pols=pols,
+                                    no_negative=False, circular_beam=False,
+                                    theoretic_beam=True,
+                                    reftime_daily=reftime_daily)
             imaging_obj.run()
             imaging_objs[sidx] = imaging_obj
 
             if not imaging_obj.succeeded:
-                log_print('ERROR', f"Final imaging for SPW {spws[sidx]} failed when creating viz model. Skipping...")
-                continue
+                log_print('ERROR', f"Final imaging for SPW {spw} failed when creating viz model. Skipping...")
+                clean_junk('-'.join(["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']))
+                return [], imaging_objs
 
             uvsub(vis=msfile)
             delmod(vis=msfile)
 
             model_dir_name_str = imaging_objs[sidx].model_ref_name_str
-            cmd = "wsclean -predict -reorder -spws " + sp_index + f" \
-                -name {model_dir_name_str}  -quiet -intervals-out {N1_final[sidx]} {msfile}"
-            os.system(cmd)
-            uvsub(vis=msfile, reverse=True)  # Now the viz data contains residuals + corrected models
+            cmd = (f"{WSCLEAN_BIN} -predict -reorder -spws {sp_index} "
+                   f"-name {model_dir_name_str} -quiet -intervals-out {ri_final['N1']} {msfile}")
+            subprocess.run(cmd, shell=True, check=False)
+            uvsub(vis=msfile, reverse=True)
+
             imname_strlist = ["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']
             imname = '-'.join(imname_strlist)
-            clean_obj.setup(size=1024, scale="2.5asec",
-                            pol=pols,
-                            weight_briggs=briggs[sidx],
-                            niter=20000,
-                            mgain=0.85,
-                            gain=gain,
-                            # gain=0.2,
+            clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
+                            weight_briggs=briggs_val,
+                            niter=20000, mgain=0.85, gain=gain,
                             data_column='CORRECTED_DATA',
                             name=os.path.join(workdir, imname),
-                            multiscale=True,
-                            multiscale_gain=0.3,
+                            multiscale=True, multiscale_gain=0.3,
                             multiscale_scale_bias=0.6,
                             auto_mask=2, auto_threshold=1,
                             minuv_l=200,
-                            # minuv_l=uvmin_l_list[sidx] / 3.0,
-                            # minuv_l=None,
-                            # minuvw_m=8,
-                            # maxuvw_m=1500,
                             intervals_out=1,
                             no_negative=False, quiet=True,
-                            theoretic_beam=True,  ## to avoid bad beam fitting and very small beam size
-                            circular_beam=False,
+                            theoretic_beam=True, circular_beam=False,
                             spws=sp_index)
             clean_obj.run(dryrun=False)
-            log_print('INFO', f"Final imaging for SPW {spws[sidx]}: completed")
+            log_print('INFO', f"Final imaging for SPW {spw}: completed")
             fitsname = sorted(glob(os.path.join(workdir, imname + '*image.fits')))
             fitsname_helio = [f.replace('image.fits', 'image.helio.fits') for f in fitsname]
             try:
-                hf.imreg(vis=msfile, imagefile=fitsname, fitsfile=fitsname_helio, timerange=[viz_timerange], toTb=True)
+                hf.imreg(vis=msfile, imagefile=fitsname, fitsfile=fitsname_helio,
+                         timerange=[viz_timerange], toTb=True)
                 fitsfilefinal = fitsname_helio
-            except Exception as e:
-                log_print('ERROR', f"Error in hf.imreg or solar_diff_rot_heliofits: {e}")
+            except Exception:
+                log_print('ERROR', f"[final_imaging] helioprojective registration failed | "
+                                   f"{_format_log_state(spw=spw, spwstr=spwstr, n_fits=len(fitsname))}\n"
+                                   f"{traceback.format_exc()}")
                 fitsfilefinal = []
 
-        clearn_junk(imname)
+    clean_junk('-'.join(["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']))
 
-        synfitsfiles = []
-        for eoidx, eofile in enumerate(fitsfilefinal):
-            datetimestr = time_intervals_major_avg_final[sidx][eoidx].datetime.strftime('%Y%m%dT%H%M%SZ')
-            if segmented_imaging[sidx]:
-                synfitsfile = os.path.join(imgoutdir,
-                                           f"eovsa.synoptic.{datetimestr}.s{spwstr}.tb.fits")
+    synfitsfiles = []
+    for eoidx, eofile in enumerate(fitsfilefinal):
+        interval_time = ri_final['time_intervals_major_avg'][eoidx]
+        # Filter by tr_series_time if specified
+        if tr_series_time is not None:
+            in_range = any(t0.mjd <= interval_time.mjd <= t1.mjd for t0, t1 in tr_series_time)
+            if not in_range:
+                continue
+        datetimestr = interval_time.datetime.strftime('%Y%m%dT%H%M%SZ')
+        if is_segmented:
+            synfitsfile = os.path.join(imgoutdir,
+                                       f"eovsa.synoptic.{datetimestr}.s{spwstr}.tb.fits")
+        else:
+            synfitsfile = os.path.join(imgoutdir,
+                                       f"eovsa.synoptic_daily.{date_str}T200000Z.s{spwstr}.tb.fits")
+        synfitsfiles.append(synfitsfile)
+        log_print('INFO', f"Copying {eofile} to {synfitsfile} ...")
+        shutil.copy2(eofile, synfitsfile)
+
+    return synfitsfiles, imaging_objs
+
+
+def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=None,
+                 figoutdir=None, clearcache=False, clearlargecache=False,
+                 pols='XX', verbose=True, hanning=False, do_sbdcal=False,
+                 overwrite=False, overwrite_caltb=True, mergeFITSonly=False,
+                 niter_init=None, ncpu='auto', tr_series_imaging=None,
+                 spws_imaging=None):
+    """
+    Executes the EOVSA data processing pipeline for solar observation data.
+
+    :param vis: Path to the input measurement set (MS) data.
+    :type vis: str
+    :param outputvis: Output path for the processed MS, defaults to an empty string.
+    :type outputvis: str, optional
+    :param workdir: Working directory for intermediate data, defaults to None which uses './'.
+    :type workdir: str, optional
+    :param slfcaltbdir: Directory for storing calibration tables, defaults to None.
+    :type slfcaltbdir: str, optional
+    :param imgoutdir: Output directory for image files, defaults to None.
+    :type imgoutdir: str, optional
+    :param figoutdir: Output directory for diagnostic figures, defaults to None.
+    :type figoutdir: str, optional
+    :param clearcache: If True, clears all cache files after processing, defaults to False.
+    :type clearcache: bool, optional
+    :param clearlargecache: If True, clears large cache files (model directories) after processing.
+        When set, clearcache is forced to False. Defaults to False.
+    :type clearlargecache: bool, optional
+    :param pols: Polarization types to process, defaults to 'XX'.
+    :type pols: str, optional
+    :param verbose: Enables verbose output during processing, defaults to True.
+    :type verbose: bool, optional
+    :param hanning: If True, applies Hanning smoothing to the data, defaults to False.
+    :type hanning: bool, optional
+    :param do_sbdcal: Boolean flag to perform single-band delay calibration, defaults to False.
+    :type do_sbdcal: bool
+    :param overwrite: If True, overwrites existing files, defaults to False.
+    :type overwrite: bool, optional
+    :param overwrite_caltb: If True, overwrites existing calibration tables, defaults to True.
+    :type overwrite_caltb: bool, optional
+    :param mergeFITSonly: If True, skips all processing and only merges existing FITS files.
+    :type mergeFITSonly: bool, optional
+    :param niter_init: Override number of iterations for the init self-cal round.
+        If None, uses the value from SELFCAL_ROUNDS config.
+    :type niter_init: int, optional
+    :param ncpu: Number of CPUs for parallel processing. 'auto' uses all available cores.
+    :type ncpu: str or int, optional
+    :param tr_series_imaging: Time ranges for imaging as list of time range strings.
+        If provided, only processes intervals that overlap with these ranges.
+    :type tr_series_imaging: list, optional
+    :param spws_imaging: Spectral windows to process. If provided, overrides the default spwidx2proc.
+    :type spws_imaging: list, optional
+    :return: Dictionary mapping spectral window index to output FITS file paths.
+    :rtype: dict
+    """
+    with pipeline_stage(
+        "pipeline_run",
+        vis=vis,
+        outputvis=outputvis,
+        workdir=workdir,
+        mergeFITSonly=mergeFITSonly,
+        clearcache=clearcache,
+        clearlargecache=clearlargecache,
+        overwrite=overwrite,
+        ncpu=ncpu,
+        spws_imaging=spws_imaging,
+    ):
+        if os.path.exists(outputvis) and not overwrite:
+            log_print('INFO', f"Output MS file {outputvis} already exists. Skipping processing.")
+            return outputvis
+
+        # --- Handle clearcache / clearlargecache interaction ---
+        if clearlargecache:
+            clearcache = False
+
+        # --- Resolve ncpu ---
+        if ncpu == 'auto':
+            import multiprocessing
+            ncpu = multiprocessing.cpu_count()
+        else:
+            ncpu = int(ncpu)
+
+        # --- Override niter_init in SELFCAL_ROUNDS if specified ---
+        if niter_init is not None:
+            for rd in SELFCAL_ROUNDS:
+                if rd['name'] == 'init':
+                    rd['niter'] = niter_init
+                    break
+
+        # --- Override spwidx2proc if spws_imaging is specified ---
+        if spws_imaging is not None:
+            spwidx2proc = [int(s) for s in spws_imaging]
+        else:
+            spwidx2proc = PIPELINE_CONFIG['spwidx2proc']
+
+        bright_thresh_ = np.array(PIPELINE_CONFIG['bright_thresh'])
+        tb_ratio_thresh_ = np.array(PIPELINE_CONFIG['tb_ratio_thresh'])
+        briggs_ = PIPELINE_CONFIG['briggs']
+
+        if workdir is None:
+            workdir = './'
+        if not workdir.endswith('/'):
+            workdir += '/'
+        os.makedirs(workdir, exist_ok=True)
+        os.chdir(workdir)
+        if slfcaltbdir is None:
+            slfcaltbdir = workdir + '/'
+        if imgoutdir is None:
+            imgoutdir = workdir + '/'
+        if figoutdir is None:
+            figoutdir = workdir + '/'
+        os.makedirs(figoutdir, exist_ok=True)
+
+        msfile = os.path.normpath(vis)
+
+        # Get the base name without any of the known extensions
+        basename = os.path.basename(msfile)
+        if basename.lower().endswith('.ms.tar.gz'):
+            msname = basename[:-len('.ms.tar.gz')]
+        elif basename.lower().endswith('.ms'):
+            msname = basename[:-len('.ms')]
+        else:
+            raise ValueError(f"Unsupported file format: {basename}")
+
+        msfile_copy = os.path.join(workdir, f'{msname}.ms')
+        if not os.path.exists(msfile_copy):
+            if msfile.lower().endswith('.ms'):
+                shutil.copytree(msfile, msfile_copy)
+            elif msfile.lower().endswith('.ms.tar.gz'):
+                subprocess.run(['tar', '-zxf', msfile, '-C', workdir], check=True)
             else:
-                synfitsfile = os.path.join(imgoutdir,
-                                           f"eovsa.synoptic_daily.{date_str}T200000Z.s{spwstr}.tb.fits")
-            synfitsfiles.append(synfitsfile)
-            log_print('INFO', f"Copying {eofile} to {synfitsfile} ...")
-            os.system(f'cp {eofile} {synfitsfile}')
+                raise ValueError(f"Unsupported file format: {msfile}")
+        msfile = msfile_copy
 
-        if not segmented_imaging[sidx]:
-            if len(synfitsfiles) > 0:
-                outfits_all[sidx] = synfitsfiles[0]
+        viz_timerange = ant_trange(msfile)
+        (tstart, tend) = viz_timerange.split('~')
+        tbg_msfile = Time(qa.quantity(tstart, 's')['value'], format='mjd').to_datetime()
+        ted_msfile = Time(qa.quantity(tend, 's')['value'], format='mjd').to_datetime()
+        tmid_msfile = tbg_msfile + (ted_msfile - tbg_msfile) / 2
 
-        # split(vis=msfile, outputvis=msfile_sp, spw=spws[sidx], datacolumn='corrected')
+        antenna = '0~12'
+        if tbg_msfile >= EOVSA15_UPGRADE_DATE.to_datetime():
+            antenna = '0~14'
+        ## date_str is set to the day 1 if the time is between 08:00 UT on day 1 to 08:00 UT(+1) on day 2
+        if tbg_msfile.time() < time(8, 0):
+            date_local = tbg_msfile.date() - timedelta(days=1)
+        else:
+            date_local = tbg_msfile.date()
+        date_str = date_local.strftime('%Y%m%d')
+        reftime_daily = Time(datetime.combine(date_local, time(20, 0)))
+        freq_setup = FrequencySetup(Time(tbg_msfile))
+        spws_indices = freq_setup.spws_indices
+        tb_models = {}
+        outfits_all = {}
+        bright = {}
+        bright_thresh = {}
+        tb_ratio_thresh = {}
+        segmented_imaging = {}
+        briggs = {}
+        fits_mask = {}
+        imaging_objs = {}
+        spws = freq_setup.spws
+        defaultfreq = freq_setup.defaultfreq
+        freq = defaultfreq
+        nbands = freq_setup.nbands
 
-        run_end_time = datetime.now()
-        elapsed_time = run_end_time - run_start_time
-        elapsed_time_total = elapsed_time.total_seconds() / 60
-        log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_time_total:.1f} minutes")
+        for sidx, sp_index in enumerate(spws_indices):
+            tb_models[sidx] = None
+            outfits_all[sidx] = None
+            bright[sidx] = False
+            imaging_objs[sidx] = None
+            bright_thresh[sidx] = bright_thresh_[sidx]
+            tb_ratio_thresh[sidx] = tb_ratio_thresh_[sidx]
+            segmented_imaging[sidx] = True if sidx in [0, 1, 2, 3] else False
+            briggs[sidx] = briggs_[sidx]
 
-    for sidx, spw in enumerate(spws):
-        spwstr = format_spw(spw)
-        sp_st, sp_ed = spws[sidx].split('~')
-        dszs = [float(dsize[int(sp)].rstrip('arcsec')) for sp in range(int(sp_st), int(sp_ed) + 1)]
-        fdns = [fdens[int(sp)] for sp in range(int(sp_st), int(sp_ed) + 1)]
-        reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
-        outfits = os.path.join(imgoutdir, f'eovsa.synoptic_daily.{date_str}T200000Z.s{spwstr}.tb.fits')
-        outfits_disk = outfits.replace('.tb.fits', '.tb.disk.fits')
-        if segmented_imaging[sidx]:
-            synfitsfiles = sorted(glob(os.path.join(imgoutdir,
-                                                    f"eovsa.synoptic.{date_str[:-1]}?T??????Z.s{spwstr}.tb.fits")))
-            # snr_threshold = 10 if feature_slfcal else 5
-            snr_threshold = 3
-            if len(synfitsfiles) > 0:  # and tb_models[sidx] is not None:
-                log_print('INFO', f"Merging synoptic images for SPW {spwstr} to {outfits} ...")
-                merge_FITSfiles(synfitsfiles, outfits, overwrite=True, snr_threshold=snr_threshold, )
-                # rms_threshold=tb_models[sidx] * 2)
-                outfits_all[sidx] = outfits
-                synfitsfiles_disk = [l.replace('.tb.fits', '.tb.disk.fits') for l in synfitsfiles]
-                try:
-                    add_convolved_disk_to_fits(synfitsfiles + [outfits], synfitsfiles_disk + [outfits_disk], dszs, fdns,
+        dsize, fdens = calc_diskmodel(tmid_msfile, nbands, freq)
+        fdens = fdens / 2.0  # convert from I to XX
+
+        uvmin_l_str = _compute_uv_ranges(spws_indices, spws, freq, spwidx2proc)
+
+        run_start_time = datetime.now()
+
+        # --- Pre-processing: flagging, hanning smoothing ---
+        if os.path.isdir(msfile + '.flagversions'):
+            if verbose:
+                log_print('INFO', f'Flagversion of {msfile} already exists. Skipped...')
+        else:
+            if verbose:
+                log_print('INFO', f'Flagging any high amplitudes viz from flares or RFIs in {msfile}')
+            with pipeline_stage("preprocess:flagging", msfile=msfile):
+                flagmanager(msfile, mode='save', versionname='pipeline_init')
+                flagdata(vis=msfile, mode="tfcrop", spw='', action='apply', display='',
+                         timecutoff=3.0, freqcutoff=2.0, maxnpieces=2, flagbackup=False)
+                flagmanager(msfile, mode='save', versionname='pipeline_remove_RFI-and-BURSTS')
+
+        if hanning:
+            msfile_hanning = msfile + '.hanning'
+            if not os.path.exists(msfile_hanning):
+                if verbose:
+                    log_print('INFO', f'Perform hanningsmooth for {msfile}...')
+                with pipeline_stage("preprocess:hanning", msfile=msfile):
+                    hanningsmooth(vis=msfile, datacolumn='data', outputvis=msfile_hanning)
+            else:
+                if verbose:
+                    log_print('INFO', f'The hanningsmoothed {msfile} already exists. Skipped...')
+            msfile = msfile_hanning
+
+        delmod(msfile)
+
+        wsclean_intervals = WSCleanTimeIntervals(msfile, combine_scans=True)
+        wsclean_intervals.interval_length = 50
+        wsclean_intervals.compute_intervals(nintervals_minor=3)
+        tdur = wsclean_intervals.results()['tdur']
+
+        caltbs_all = []
+        slfcal_init_objs = []
+        imname_init_disk_strlist = ["eovsa", "disk", "init", f"{msname}"]
+
+        # --- Parse tr_series_imaging time ranges ---
+        tr_series_time = None
+        if tr_series_imaging is not None:
+            from eovsapy.util import Time as eoTime
+            tr_series_time = []
+            for tr in tr_series_imaging:
+                if '~' in tr:
+                    t0, t1 = tr.split('~')
+                    tr_series_time.append((eoTime(t0), eoTime(t1)))
+                else:
+                    log_print('WARNING', f"Ignoring invalid time range '{tr}'. Expected format: 'start~end'.")
+
+        if mergeFITSonly:
+            log_print('INFO', "mergeFITSonly=True: skipping self-calibration and imaging, proceeding to merge.")
+        else:
+            # --- Main loop over spectral windows ---
+            for sidx, sp_index in enumerate(spws_indices):
+                spwstr = format_spw(spws[sidx])
+                msfile_sp = f'{msname}.sp{spwstr}.slfcaled.ms'
+                caltbs = []
+
+                with pipeline_stage("spw", spw=spws[sidx], sidx=sidx, spwstr=spwstr, msfile=msfile):
+                    if os.path.exists(msfile_sp):
+                        if overwrite:
+                            shutil.rmtree(msfile_sp, ignore_errors=True)
+                        else:
+                            log_print('INFO', f"MS file {msfile_sp} already exists. Skipping processing.")
+                            slfcal_init_objs.append(None)
+                            caltbs_all.append(caltbs)
+                            continue
+                    if sidx not in spwidx2proc:
+                        slfcal_init_objs.append(None)
+                        caltbs_all.append(caltbs)
+                        continue
+
+                    reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
+                    log_print('INFO', f"Processing SPW {spws[sidx]} for msfile {msname} ...")
+
+                    # --- Step 1: Brightness check ---
+                    with pipeline_stage("brightness_check", spw=spws[sidx], sidx=sidx, spwstr=spwstr):
+                        delmod(vis=msfile)
+                        imname = '-'.join(imname_init_disk_strlist + [f"sp{spwstr}"])
+                        clean_obj = ww.WSClean(msfile)
+                        clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
+                                        weight_briggs=0.0, niter=500, mgain=0.85,
+                                        data_column='DATA',
+                                        name=os.path.join(workdir, imname),
+                                        multiscale=True, multiscale_gain=0.3,
+                                        multiscale_scale_bias=0.6,
+                                        auto_mask=6, auto_threshold=3,
+                                        intervals_out=1,
+                                        no_negative=True, quiet=True,
+                                        circular_beam=True, beam_size=bmsize,
+                                        spws=sp_index)
+                        clean_obj.run(dryrun=False)
+                        clean_junk(imname)
+
+                    in_fits = os.path.join(workdir, f"{imname}-image.fits")
+                    fits_candidates = sorted(glob(os.path.join(workdir, f"{imname}*image.fits")))
+                    if not os.path.exists(in_fits):
+                        if len(fits_candidates) == 1:
+                            in_fits = fits_candidates[0]
+                            log_print('WARNING',
+                                      f"Exact WSClean FITS not found; using candidate {in_fits} for SPW {spws[sidx]}")
+                        else:
+                            log_print('ERROR',
+                                      f"Expected WSClean FITS not found for SPW {spws[sidx]}: {in_fits}. "
+                                      f"Candidates={fits_candidates}")
+                            slfcal_init_objs.append(None)
+                            caltbs_all.append(caltbs)
+                            continue
+                    diskstatss = []
+                    for i, sp in enumerate(sp_index.split(',')):
+                        reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(f'{sp}~{sp}', return_bmsize=True)
+                        sp = int(sp)
+                        out_fits = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk-model.fits'])
+                        dsz = float(dsize[sp].rstrip('arcsec'))
+                        fdn = fdens[sp]
+                        diskstats = add_convolved_disk_to_fits(in_fits, out_fits, dsz, fdn, ignore_data=True,
+                                                               bmaj=bmsize / 3600., rfreq=reffreq,
+                                                               create_mask=(i == 0))
+                        diskstatss.append(diskstats)
+
+                    fits_mask[sidx] = os.path.join(workdir, f"{imname}-mask.fits")
+                    tb_image = np.nanmean([ds[7] for ds in diskstatss])
+                    if np.isnan(tb_image):
+                        log_print('ERROR', f"TB image for SPW {spws[sidx]} is NaN. Skipping this SPW.")
+                        slfcal_init_objs.append(None)
+                        caltbs_all.append(caltbs)
+                        continue
+                    tb_model = np.nanmean([ds[8] for ds in diskstatss])
+                    tb_models[sidx] = tb_model * 1e3
+                    snr = np.nanmean([ds[10] for ds in diskstatss])
+                    bright_ratio = tb_image / tb_model
+                    bright[sidx] = bright_ratio * snr > bright_thresh[sidx]
+                    log_print('INFO',
+                              f"SPW {spws[sidx]}: tb_image = {tb_image:.1f} kK, tb_model = {tb_model:.1f} kK, "
+                              f"Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]}, SNR = {snr:.1f}")
+
+                    if sidx == 0 and snr >= 5:
+                        bright[sidx] = True
+                        log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
+                    if sidx == 1 and snr >= 30:
+                        bright[sidx] = True
+                        log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
+                    if bright[sidx]:
+                        log_print('INFO', f"SPW {spws[sidx]} is bright. Proceeding with segmented imaging.")
+                        segmented_imaging[sidx] = True
+                    if bright_ratio < tb_ratio_thresh[sidx]:
+                        segmented_imaging[sidx] = False
+
+                    # --- Compute time intervals for all rounds ---
+                    round_intervals = {}
+                    for round_def in SELFCAL_ROUNDS:
+                        mult = round_def['interval_multipliers'].get(sidx, 1)
+                        round_intervals[round_def['name']] = _compute_round_intervals(wsclean_intervals, mult)
+                    mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(sidx, 1)
+                    round_intervals['final'] = _compute_round_intervals(wsclean_intervals, mult)
+
+                    # --- Step 2: Feature self-calibration (if bright) ---
+                    feature_slfcal = bright[sidx]
+                    datacolumn = "DATA"
+                    if feature_slfcal:
+                        slfcal_failed = False
+                        slfcal_init_obj = None
+                        for round_def in SELFCAL_ROUNDS:
+                            slfcal_obj, caltbs, datacolumn = _run_slfcal_round(
+                                round_def, msfile, round_intervals[round_def['name']],
+                                spws[sidx], spwstr, workdir, antenna, caltbs, tdur,
+                                pols, bmsize, fits_mask[sidx], datacolumn,
+                                overwrite_caltb, uvmin_l_str[sidx], do_sbdcal=do_sbdcal,
+                                clearcache=clearcache)
+                            if round_def['name'] == 'init':
+                                if slfcal_obj is None:
+                                    slfcal_failed = True
+                                    break
+                                slfcal_init_obj = slfcal_obj
+                        if slfcal_failed:
+                            slfcal_init_objs.append(None)
+                            caltbs_all.append(caltbs)
+                            continue
+                        slfcal_init_objs.append(slfcal_init_obj)
+                    else:
+                        slfcal_init_objs.append(None)
+
+                    # --- Step 3: Disk self-calibration ---
+                    ri_init = round_intervals['init']
+                    ri_final = round_intervals['final']
+                    caltbs = _run_disk_selfcal(
+                        msfile, sidx, spws[sidx], spwstr, sp_index, workdir, antenna,
+                        caltbs, slfcal_init_objs[sidx], imname_init_disk_strlist,
+                        freq_setup, dsize, fdens, ri_init, ri_final, tdur,
+                        uvmin_l_str[sidx], overwrite_caltb, pols)
+                    caltbs_all.append(caltbs)
+
+                    # --- Step 4: Final imaging ---
+                    synfitsfiles, imaging_objs = _run_final_imaging(
+                        msfile, sidx, spws[sidx], spwstr, sp_index, workdir, imgoutdir,
+                        msname, ri_final, briggs[sidx], bmsize, pols,
+                        reftime_daily, viz_timerange, date_str,
+                        segmented_imaging[sidx], imaging_objs, freq_setup,
+                        tr_series_time=tr_series_time)
+
+                    if not segmented_imaging[sidx] and len(synfitsfiles) > 0:
+                        outfits_all[sidx] = synfitsfiles[0]
+
+                    elapsed_total = (datetime.now() - run_start_time).total_seconds() / 60
+                    log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_total:.1f} minutes")
+
+        # --- Post-processing: merge FITS, add disk, move caltables ---
+        for sidx, spw in enumerate(spws):
+            spwstr = format_spw(spw)
+            sp_st, sp_ed = spws[sidx].split('~')
+            dszs = [float(dsize[int(sp)].rstrip('arcsec')) for sp in range(int(sp_st), int(sp_ed) + 1)]
+            fdns = [fdens[int(sp)] for sp in range(int(sp_st), int(sp_ed) + 1)]
+            reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
+            outfits = os.path.join(imgoutdir, f'eovsa.synoptic_daily.{date_str}T200000Z.s{spwstr}.tb.fits')
+            outfits_disk = outfits.replace('.tb.fits', '.tb.disk.fits')
+            if segmented_imaging.get(sidx, False):
+                synfitsfiles = sorted(glob(os.path.join(imgoutdir,
+                                                        f"eovsa.synoptic.{date_str[:-1]}?T??????Z.s{spwstr}.tb.fits")))
+                snr_threshold = 3
+                if len(synfitsfiles) > 0:
+                    log_print('INFO', f"Merging synoptic images for SPW {spwstr} to {outfits} ...")
+                    merge_FITSfiles(synfitsfiles, outfits, overwrite=True, snr_threshold=snr_threshold)
+                    outfits_all[sidx] = outfits
+                    synfitsfiles_disk = [l.replace('.tb.fits', '.tb.disk.fits') for l in synfitsfiles]
+                    try:
+                        add_convolved_disk_to_fits(synfitsfiles + [outfits], synfitsfiles_disk + [outfits_disk],
+                                                   dszs, fdns, ignore_data=False, toTb=True,
+                                                   rfreq=reffreq, bmaj=bmsize / 3600.)
+                    except Exception:
+                        log_print('ERROR', f"[postprocess:add_disk] failed | "
+                                           f"{_format_log_state(spw=spw, spwstr=spwstr, n_synfits=len(synfitsfiles))}\n"
+                                           f"{traceback.format_exc()}")
+                else:
+                    log_print('WARNING', f"No synoptic images found for SPW {spwstr}. Skipping merge_FITSfiles.")
+            else:
+                if os.path.exists(outfits):
+                    log_print('INFO', f"Add disk to synoptic image {outfits} ...")
+                    outfits_all[sidx] = outfits
+                    add_convolved_disk_to_fits([outfits], [outfits_disk], dszs, fdns,
                                                ignore_data=False, toTb=True,
                                                rfreq=reffreq, bmaj=bmsize / 3600.)
-                except Exception as e:
-                    log_print('ERROR', f"Error in add_convolved_disk_to_fits: {e}, skipping disk addition.")
-            else:
-                log_print('WARNING', f"No synoptic images found for SPW {spwstr}. Skipping merge_FITSfiles.")
-        else:
-            if os.path.exists(outfits):
-                log_print('INFO', f"Add disk to synoptic image {outfits} ...")
-                outfits_all[sidx] = outfits
-                add_convolved_disk_to_fits([outfits], [outfits_disk], dszs, fdns,
-                                           ignore_data=False, toTb=True,
-                                           rfreq=reffreq, bmaj=bmsize / 3600.)
-            else:
-                log_print('WARNING', f"No synoptic image found for SPW {spwstr}. Skipping disk addition.")
+                else:
+                    log_print('WARNING', f"No synoptic image found for SPW {spwstr}. Skipping disk addition.")
 
-    # ms2concat = glob(f'{msname}.sp*.slfcaled.ms')
-    # if os.path.exists(outputvis):
-    #     if overwrite:
-    #         os.system('rm -rf ' + outputvis)
-    #         concat(vis=ms2concat, concatvis=outputvis)
-    #         log_print('INFO', f"Concatenated MS file written to {outputvis}")
-    #     else:
-    #         log_print('WARNING', f"Output MS file {outputvis} already exists. Skipping concatenation.")
-    # else:
-    #     concat(vis=ms2concat, concatvis=outputvis)
-    #     log_print('INFO', f"Concatenated MS file written to {outputvis}")
-
-    log_print('INFO', f"Moving calibration tables to {slfcaltbdir} ...")
-    caltbs_comb = [item for sublist in caltbs_all for item in sublist]
-    for caltb in caltbs_comb:
-        if os.path.exists(caltb):
-            if not os.path.exists(slfcaltbdir):
-                os.makedirs(slfcaltbdir)
-            targetfile = f'{slfcaltbdir}/{os.path.basename(caltb).replace("caltb_", f"caltb_{date_str}_")}'
+        # Move calibration tables to output directory
+        log_print('INFO', f"Moving calibration tables to {slfcaltbdir} ...")
+        caltbs_comb = [item for sublist in caltbs_all for item in sublist]
+        for caltb in caltbs_comb:
+            if os.path.exists(caltb):
+                os.makedirs(slfcaltbdir, exist_ok=True)
+                targetfile = os.path.join(slfcaltbdir,
+                                          os.path.basename(caltb).replace("caltb_", f"caltb_{date_str}_"))
+                if os.path.exists(targetfile):
+                    shutil.rmtree(targetfile, ignore_errors=True)
+                shutil.move(caltb, targetfile)
+        if os.path.isdir(msfile + '.flagversions'):
+            targetfile = os.path.join(os.path.dirname(outputvis), os.path.basename(msfile) + '.flagversions')
             if os.path.exists(targetfile):
-                os.system(f'rm -rf {targetfile}')
-            os.system(f'mv {caltb} {targetfile}')
-    if os.path.isdir(msfile + '.flagversions') == True:
-        targetfile = f'{os.path.dirname(outputvis)}/{msfile}.flagversions'
-        if os.path.exists(targetfile):
-            os.system(f'rm -rf {targetfile}')
-        os.system(f'mv {msfile}.flagversions {os.path.dirname(outputvis)}/')
+                shutil.rmtree(targetfile, ignore_errors=True)
+            shutil.move(msfile + '.flagversions', os.path.dirname(outputvis))
 
-    # if clearlargecache:
-    #     clearcache = False
-    #     shutil.rmtree(os.path.join(subdir, 'images'), ignore_errors=True)
-    #     shutil.rmtree(os.path.join(subdir, '*.ms'), ignore_errors=True)
-    #     shutil.rmtree(os.path.join(subdir, '*.model'), ignore_errors=True)
-    #     print(f'files in {os.path.join(subdir, "images")} removed.')
-    #     print(f'files in {os.path.join(subdir, "*.ms")} removed.')
-    #     print(f'files in {os.path.join(subdir, "*.model")} removed.')
+        # --- Cache cleanup ---
+        if clearcache:
+            log_print('INFO', "Clearing all cache files in workdir ...")
+            for pattern in ['*.dirty.fits', '*.psf.fits', '*.residual.fits', '*.model.fits',
+                             'modelrot_*', '*.slfcaled.ms']:
+                for f in glob(os.path.join(workdir, pattern)):
+                    if os.path.isdir(f):
+                        shutil.rmtree(f, ignore_errors=True)
+                    else:
+                        os.remove(f)
+        elif clearlargecache:
+            log_print('INFO', "Clearing large cache files (model directories) in workdir ...")
+            for pattern in ['modelrot_*', '*.slfcaled.ms']:
+                for f in glob(os.path.join(workdir, pattern)):
+                    if os.path.isdir(f):
+                        shutil.rmtree(f, ignore_errors=True)
+                    else:
+                        os.remove(f)
 
-    return outfits_all
+        log_step('INFO', 'pipeline_run', 'completed', processed_spws=sorted(outfits_all.keys()))
+        return outfits_all
 
 
 if __name__ == '__main__':
-    '''
-    this code is trying to address the issue of smearing effect in all-day synthesis images.
-    description of the issue: https://www.ovsa.njit.edu/wiki/index.php/All-Day_Synthesis_Issues
-    This code is built on python 3.8.
-    '''
-    description = 'this code is trying to address the issue of smearing effect in all-day synthesis images. Description of the issue: https://www.ovsa.njit.edu/wiki/index.php/All-Day_Synthesis_Issues. This code is built on python 3.8.'
     parser = argparse.ArgumentParser(
-        description="Executes the EOVSA data processing pipeline for solar observation data.")
+        description="EOVSA synoptic imaging pipeline (WSClean). "
+                    "Addresses smearing in all-day synthesis images: "
+                    "https://www.ovsa.njit.edu/wiki/index.php/All-Day_Synthesis_Issues")
     parser.add_argument('vis', type=str, help='Path to the input measurement set (MS) data.')
     parser.add_argument('--outputvis', type=str, default='', help='Output path for the processed MS.')
     parser.add_argument('--workdir', type=str, help='Working directory for intermediate data.')
@@ -2993,8 +2821,13 @@ if __name__ == '__main__':
     parser.add_argument('--spws_imaging', nargs='*', help='Spectral windows selected for imaging.')
     parser.add_argument('--hanning', action='store_true', help='Applies Hanning smoothing to the data.')
     parser.add_argument('--do_sbdcal', action='store_true', help='Perform single-band delay calibration.')
+    parser.add_argument('--debug_mode', action='store_true', help='Enables debug mode with finer control over parameters.')
 
     args = parser.parse_args()
+
+    if args.debug_mode:
+        log_print('INFO', "Debug mode enabled. Running debug pipeline script instead.")
+        log_print('INFO', "Use debug_pipeline_wsclean.py for standalone debug/test runs.")
 
     pipeline_run(
         vis=args.vis,
@@ -3002,7 +2835,16 @@ if __name__ == '__main__':
         workdir=args.workdir,
         slfcaltbdir=args.slfcaltbdir,
         imgoutdir=args.imgoutdir,
+        figoutdir=args.figoutdir,
+        clearcache=args.clearcache,
+        clearlargecache=args.clearlargecache,
         pols=args.pols,
+        overwrite=args.overwrite,
+        mergeFITSonly=args.mergeFITSonly,
+        niter_init=args.niter_init,
+        ncpu=args.ncpu,
+        tr_series_imaging=args.tr_series_imaging,
+        spws_imaging=args.spws_imaging,
         hanning=args.hanning,
-        do_sbdcal=args.do_sbdcal
+        do_sbdcal=args.do_sbdcal,
     )

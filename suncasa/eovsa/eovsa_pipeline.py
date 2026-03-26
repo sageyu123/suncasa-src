@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime, timedelta
 # from astropy.time import Time
+import traceback
 from suncasa.suncasatasks import ptclean6 as ptclean
 from suncasa.suncasatasks import calibeovsa
 from suncasa.suncasatasks import importeovsa
@@ -307,10 +308,18 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
     print(f'Visibility file exists: {fileexist}')
     if doimport:
         print(f'doimport: {doimport}')
-        print('Overwriting existing visibility file...')
-        fileexist=False
+        if overwrite:
+            print('Overwriting existing visibility file...')
+            fileexist = False
+        elif fileexist:
+            print('Visibility file already exists; reusing it instead of overwriting.')
 
     if not fileexist:
+        if not doimport:
+            print('WARNING: No visibility file exists and doimport=False. Aborting without import.')
+            print(f'DEBUG calib_pipeline: trange={trange}, doimport={doimport}')
+            return None
+
         print('Visibility file does not exist. Running calibration pipeline...')
         if isinstance(trange, Time):
             mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite)
@@ -324,6 +333,23 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
 
         for idx, f in enumerate(invis):
             invis[idx] = f.rstrip('/')
+
+        print("DEBUG calib_pipeline: trange2ms result")
+        print(f"  trange={trange}")
+        print(f"  doimport={doimport}")
+        print(f"  fileexist={fileexist}")
+        print(f"  mslist.keys()={list(mslist.keys())}")
+        print(f"  n_invis={len(invis)}")
+        print(f"  invis={invis}")
+        print(f"  mspath={mslist.get('mspath')}")
+        print(f"  udbpath={mslist.get('udbpath')}")
+        print(f"  udbfile={mslist.get('udbfile')}")
+        print(f"  udb2ms={mslist.get('udb2ms')}")
+
+        if not invis:
+            print('WARNING: Import was requested but no MS files were returned. Aborting.')
+            print(f'DEBUG calib_pipeline: mslist={mslist}')
+            return None
 
         outputvis = os.path.join(os.path.dirname(invis[0]), os.path.basename(invis[0])[:11] + '.ms')
         tdate = get_tdate_from_basename(outputvis)
@@ -857,6 +883,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                caltype=caltype, interp=interp)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
+                print(traceback.format_exc())
         if clearcache:
             os.chdir(workdir)
             os.system('rm -rf {}'.format(subdir))
