@@ -57,7 +57,8 @@ def setup_time_axis(ax, start, end, minticks=5, maxticks=10):
 
 
 def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', figname=None, combine=True,
-         clip=[10, 99.995], add_logo=False, fast_plot=True, interactive=False, overwrite=False, fix_tlim=False, fix_vrange=False):
+         clip=[10, 99.995], clip_ovrolwa=None, clip_eovsa=None, add_logo=False, fast_plot=True, interactive=False,
+         overwrite=False, fix_tlim=False, fix_vrange=False):
     """
     Plot the OVRO-LWA and EOVSA spectrograms along with STIX and GOES light curves for a given timestamp or time range.
 
@@ -71,8 +72,12 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
     :type figname: str, optional
     :param combine: If True, combine all plots into a single figure, defaults to True. Otherwise, save each plot (OVRO-LWA, EOVSA, STIX, GOES) separately.
     :type combine: bool, optional
-    :param clip: The percentile values for clipping the color scale of EOVSA and OVRO-LWA spectrograms, defaults to [10, 99.995].
+    :param clip: Default percentile values applied to both EOVSA and OVRO-LWA spectrograms when dataset-specific values are not provided, defaults to [10, 99.995].
     :type clip: list of float, optional
+    :param clip_ovrolwa: Percentile values for clipping the OVRO-LWA spectrogram. Falls back to ``clip`` if not provided.
+    :type clip_ovrolwa: list of float, optional
+    :param clip_eovsa: Percentile values for clipping the EOVSA spectrogram. Falls back to ``clip`` if not provided.
+    :type clip_eovsa: list of float, optional
     :param add_logo: If True, add logos to the plots, defaults to False.
     :type add_logo: bool, optional
     :param fast_plot: If True, use fast plotting methods, defaults to True. If you want to plot the full resolution, set it to False. But it will take longer to plot. If the time range is less than 30 minutes, it will automatically set to False.
@@ -96,8 +101,19 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
     # Example 3: Plotting the synoptic spectrogram for a specific time interval on 2024 July 31  in full resolution
     ovsp.plot(timerange=[datetime(2024, 7, 31, 18, 20), datetime(2024, 7, 31, 18, 40)],
         figdir='/data1/workdir/', fast_plot=False, clip=[5, 99.995])
+        
+    # Example 4: Plotting the synoptic spectrogram for a specific time interval on 2025 December 10 and saving to web directory
+    ovsp.plot(timerange=[datetime(2025, 12, 10, 22, 0), datetime(2025, 12, 10, 23, 0)],
+        figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/2025/12/10/', fast_plot=False, clip=[10, 99.5])        
     """
     t0 = time.time()
+
+    if clip is None:
+        clip = [10, 99.995]
+    if clip_ovrolwa is None:
+        clip_ovrolwa = clip
+    if clip_eovsa is None:
+        clip_eovsa = clip
 
     import numpy as np
     import pandas as pd
@@ -154,7 +170,7 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
         if figname is None:
             # Define the file name for the combined figure
             figname = os.path.join(figdir, f'fig-OVSA_spec_{timestamp.strftime("%Y%m%d")}.jpg')
-        if os.path.exists(figname):
+        if timerange is None and os.path.exists(figname):
             if overwrite:
                 os.system(f'rm -f {figname}')
             else:
@@ -210,7 +226,7 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
         if fix_vrange:
             ## Set the dynamic range to at least a decade.
             vmin = 0.7
-            vmax = max(vmin*50, np.nanpercentile(d_ovrolwa.data, clip[1]))
+            vmax = max(vmin*50, np.nanpercentile(d_ovrolwa.data, clip_ovrolwa[1]))
             norm_I_ovrolwa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
             print(f'Fix OVRO-LWA vrange to [{vmin}, {vmax}] SFU')
             minmaxpercentile = False
@@ -218,7 +234,7 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
             minmaxpercentile = True
         d_ovrolwa.plot(pol='I', timerange=timerange_ovrolwa, bkgtim=ovrolwa_bkgtim, plot_fast=fast_plot,
                        norm=norm_I_ovrolwa,
-                       percentile=clip, minmaxpercentile=minmaxpercentile, freq_unit='MHz', cmap=cmap, axes=ax_ovrolwa)
+                       percentile=clip_ovrolwa, minmaxpercentile=minmaxpercentile, freq_unit='MHz', cmap=cmap, axes=ax_ovrolwa)
         ovrolwa_tim = d_ovrolwa.time_axis
         ovro_lwa_start, ovro_lwa_end = ovrolwa_tim[0], ovrolwa_tim[-1]
     else:
@@ -264,14 +280,14 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
         norm_I_eovsa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
         if fix_vrange:
             vmin = 5
-            vmax = max(vmin*10, np.nanpercentile(d_eovsa.data, clip[1]))
+            vmax = max(vmin*10, np.nanpercentile(d_eovsa.data, clip_eovsa[1]))
             norm_I_eovsa = mcolors.LogNorm(vmin=vmin, vmax=vmax)
             minmaxpercentile = False
             print(f'Fix EOVSA vrange to [{vmin}, {vmax}] SFU')
         else:
             minmaxpercentile = True
         d_eovsa.plot(pol='I', timerange=timerange_eovsa, bkgtim=eovsa_bkgtim, plot_fast=False, norm=norm_I_eovsa,
-                     percentile=clip, minmaxpercentile=minmaxpercentile, freq_unit='GHz', cmap=cmap, axes=ax_eovsa)
+                     percentile=clip_eovsa, minmaxpercentile=minmaxpercentile, freq_unit='GHz', cmap=cmap, axes=ax_eovsa)
         eovsa_tim = d_eovsa.time_axis
         eovsa_start, eovsa_end = eovsa_tim[0], eovsa_tim[-1]
     else:
@@ -343,14 +359,71 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
     print(f'processing GOES X-ray light curves for {timestamp.strftime("%Y-%m-%d")}')
     # Download GOES X-ray light curves
     try:
+        def _has_downloaded_files(fetch_result) -> bool:
+            if fetch_result is None:
+                return False
+            try:
+                return len(fetch_result) > 0
+            except Exception:
+                return False
+
+        xrs_client = None
         try:
-            goes_query = Fido.search(a.Time(overall_start.datetime, overall_end.datetime), a.Instrument('XRS'),
-                                     a.Resolution("flx1s"), a.goes.SatelliteNumber(18))
-        except Exception as e:
-            print(f'Error: {e}. Loose search for GOES data')
-            goes_query = Fido.search(a.Time(overall_start.datetime, overall_end.datetime), a.Instrument('XRS'))
-        goes_files = Fido.fetch(goes_query)
-        if goes_files:
+            from sunpy.net.dataretriever.sources.goes import XRSClient
+
+            xrs_client = XRSClient()
+        except Exception:
+            try:
+                from sunpy.net.dataretriever.sources.goes_xrs import XRSClient
+
+                xrs_client = XRSClient()
+            except Exception:
+                xrs_client = None
+
+        def _search_and_fetch_goes(time_attr, sat_num=None):
+            attrs = [time_attr, a.Instrument('XRS')]
+            if sat_num is not None:
+                try:
+                    attrs.append(a.goes.SatelliteNumber(sat_num))
+                except Exception:
+                    pass
+
+            if xrs_client is not None and hasattr(xrs_client, "search") and hasattr(xrs_client, "fetch"):
+                query = xrs_client.search(*attrs)
+                if len(query) == 0 and sat_num is not None:
+                    query = xrs_client.search(time_attr, a.Instrument('XRS'))
+                if len(query) == 0:
+                    return None
+                return xrs_client.fetch(query)
+
+            query = Fido.search(*attrs)
+            if len(query) == 0 and sat_num is not None:
+                query = Fido.search(time_attr, a.Instrument('XRS'))
+            if len(query) == 0:
+                return None
+            return Fido.fetch(query)
+
+        goes_files = None
+        time_attr = a.Time(
+            overall_start.datetime - timedelta(minutes=10),
+            overall_end.datetime + timedelta(minutes=10),
+        )
+        for sat_num in (18, 17, 16):
+            try:
+                goes_files = _search_and_fetch_goes(time_attr, sat_num=sat_num)
+                if _has_downloaded_files(goes_files):
+                    break
+            except Exception as e:
+                msg = str(e)
+                if "not understood by any clients" in msg:
+                    print(f'Error: {msg}. GOES XRS client unavailable; using NOAA JSON fallback.')
+                    goes_files = None
+                    break
+                print(f'Error: {msg}. Failed GOES-{sat_num} query; trying another satellite.')
+                goes_files = None
+
+        goes_ts = None
+        if _has_downloaded_files(goes_files):
             goes = ts.TimeSeries(goes_files)
             if isinstance(goes, list):
                 df_comb = goes[0].to_dataframe()
@@ -361,14 +434,17 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
                     df_comb = pd.concat([df_comb, df])
             else:
                 df_comb = goes.to_dataframe()
-            units = dict([("xrsa", u.W / u.m ** 2), ("xrsb", u.W / u.m ** 2)])
-            meta = dict({"instrument": "GOES X-ray sensor", "measurements": "primary", "type": "quicklook"})
-            goes_ts = ts.TimeSeries(df_comb[['xrsa', 'xrsb']], meta, units, source="xrs")
-        else:
+
+            if df_comb is not None and len(df_comb) > 0:
+                units = dict([("xrsa", u.W / u.m ** 2), ("xrsb", u.W / u.m ** 2)])
+                meta = dict({"instrument": "GOES X-ray sensor", "measurements": "primary", "type": "quicklook"})
+                goes_ts = ts.TimeSeries(df_comb[['xrsa', 'xrsb']], meta, units, source="xrs")
+            else:
+                print('GOES files contained no usable data; falling back to NOAA JSON.')
+
+        if goes_ts is None:
             goes_json_data = pd.read_json("https://services.swpc.noaa.gov/json/goes/primary/xrays-7-day.json")
-            # This will get us the short wavelength data.
             goes_short = goes_json_data[goes_json_data["energy"] == "0.05-0.4nm"]
-            # This will get us the long wavelength data.
             goes_long = goes_json_data[goes_json_data["energy"] == "0.1-0.8nm"]
 
             time_array = parse_time(goes_short["time_tag"])
@@ -376,15 +452,22 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
             filtered_short = goes_short[filtered_indices]
             filtered_long = goes_long[filtered_indices]
 
-            # Create a DataFrame with the filtered data
             filtered_time_array = time_array[filtered_indices]
-            goes_data = pd.DataFrame({
-                "xrsa": filtered_short["flux"].values,
-                "xrsb": filtered_long["flux"].values
-            }, index=filtered_time_array.datetime)
+            if len(filtered_time_array) == 0:
+                raise ValueError(
+                    'No GOES data available in NOAA 7-day JSON feed for requested time range.'
+                )
+            goes_data = pd.DataFrame(
+                {
+                    "xrsa": filtered_short["flux"].values,
+                    "xrsb": filtered_long["flux"].values,
+                },
+                index=filtered_time_array.datetime,
+            )
             units = dict([("xrsa", u.W / u.m ** 2), ("xrsb", u.W / u.m ** 2)])
             meta = dict({"instrument": "GOES X-ray sensor", "measurements": "primary", "type": "quicklook"})
             goes_ts = ts.TimeSeries(goes_data, meta, units, source="xrs")
+
         goes_ts.plot(axes=ax_goes)
     except Exception as e:
         print(f'Error: {e}. Proceeding without GOES data.')
@@ -471,32 +554,33 @@ def plot(timestamp=None, timerange=None, figdir='/common/lwa/spec_v2/daily/', fi
 
 
 if __name__ == '__main__':
-    # import os
-    # from datetime import datetime, timedelta
-    # from suncasa.utils import ovsa_spectrogram as ovsp
-    #
-    # current_date = datetime.now()
-    # previous_day = (current_date - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    # print(f'plotting OVSA spectrogram for {previous_day.strftime("%Y-%m-%d")}')
-    # ovsp.plot(previous_day, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{previous_day.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True)
-
     import os
     from datetime import datetime, timedelta
     from suncasa.utils import ovsa_spectrogram as ovsp
 
-    start_date = datetime(2023, 7, 26)
-    end_date = datetime(2025, 8, 30)
-    # start_date = datetime(2024, 5, 9)
-    # end_date = datetime(2024, 5, 12)
-    start_date = datetime(2025, 8, 30)
-    end_date = datetime(2025, 9, 14)
+    current_date = datetime.now()
+    previous_day = (current_date - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    print(f'plotting OVSA spectrogram for {previous_day.strftime("%Y-%m-%d")}')
+    ovsp.plot(previous_day, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{previous_day.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=True)
 
-    current_date = start_date
-    while current_date <= end_date:
-        try:
-            print(f'plotting OVSA spectrogram for {current_date.strftime("%Y-%m-%d")}')
-            ovsp.plot(current_date, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{current_date.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=True)
-        except Exception as e:
-            print(f"Error processing date {current_date}: {e}")
-        current_date += timedelta(days=1)
 
+    # import os
+    # from datetime import datetime, timedelta
+    # from suncasa.utils import ovsa_spectrogram as ovsp
+    #
+    # # start_date = datetime(2023, 7, 26)
+    # # end_date = datetime(2025, 8, 30)
+    # # start_date = datetime(2024, 5, 9)
+    # # end_date = datetime(2024, 5, 12)
+    # start_date = datetime(2025, 9, 15)
+    # end_date = datetime(2025, 10, 7)
+    #
+    # current_date = start_date
+    # while current_date <= end_date:
+    #     try:
+    #         print(f'plotting OVSA spectrogram for {current_date.strftime("%Y-%m-%d")}')
+    #         ovsp.plot(current_date, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{current_date.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=True)
+    #     except Exception as e:
+    #         print(f"Error processing date {current_date}: {e}")
+    #     current_date += timedelta(days=1)
+    #

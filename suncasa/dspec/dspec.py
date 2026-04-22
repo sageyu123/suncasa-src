@@ -216,6 +216,7 @@ class Dspec:
     uvrange = None
     pol = None
     spec_unit = 'sfu'
+    spec_name = 'Intensity'
 
     def __init__(self, fname=None, specfile=None, bl='', uvrange='', field='', scan='',
                  datacolumn='data', domedian=False, timeran=None, spw=None, timebin='0s', regridfreq=False,
@@ -1029,7 +1030,7 @@ class Dspec:
 
     def plot(self, pol='I', vmin=None, vmax=None, norm='log', cmap='viridis', cmap2='viridis', vmin2=None, vmax2=None, figsize=None,
              timerange=None, freqrange=None, bkgtim=None, interp_method='linear',  ignore_gaps=True, freq_unit='GHz', spec_unit=None,
-             plot_fast=False, percentile=[1, 99], minmaxpercentile=False, axes=None, **kwargs):
+             plot_fast=False, percentile=[1, 99], minmaxpercentile=False, axes=None, spec_name=None, **kwargs):
         """
         Plots the dynamic spectrum for a given polarization.
 
@@ -1075,6 +1076,8 @@ class Dspec:
         :type percentile: list of float, optional
         :param minmaxpercentile: If True, uses percentile for vmin and vmax. Default is False.
         :type minmaxpercentile: bool, optional
+        :param spec_name: Label to display for the spectrum quantity (e.g., for colorbars). Defaults to the object's `spec_name` if set.
+        :type spec_name: str, optional
         :param kwargs: Any additional plot arguments that should be used when plotting.
         :type kwargs: dict
 
@@ -1094,16 +1097,19 @@ class Dspec:
         import matplotlib.pyplot as plt
         from astropy.time import Time
 
-        if pol not in ['RR', 'LL', 'RRLL', 'XX', 'YY', 'XY', 'YX', 'XXYY', 'I', 'V', 'IV', 'IP']:
+        if pol.upper() not in ['RR', 'LL', 'RRLL', 'XX', 'YY', 'XY', 'YX', 'XXYY', 'I', 'V', 'IV', 'IP']:
             print("Please enter 'RR', 'LL', 'RRLL','XX', 'YY', 'XY', 'YX', 'XXYY', 'I', 'V', 'IV', or 'IP' for pol")
             return 0
 
         spec = self.data
 
+        cmap_input = cmap
         try:
-            cmap = copy(plt.get_cmap(cmap))
-        except:
+            cmap = copy(plt.get_cmap(cmap_input))
+            cmap_is_default = isinstance(cmap_input, str) and cmap_input == 'viridis'
+        except Exception:
             cmap = copy(plt.get_cmap('viridis'))
+            cmap_is_default = True
         cmap.set_bad(cmap(0.0))
 
         if norm == 'linear':
@@ -1134,11 +1140,9 @@ class Dspec:
         if spec_unit.lower() == 'k':
             spec_unit_print = 'K'
         if spec_unit.lower() == 'sfu':
-            spec_unit_print = 's.f.u'
-        if hasattr(self, 'spec_name'):
-            spec_name = self.spec_name
-        else:
-            spec_name = 'Intensity'
+            spec_unit_print = 'sfu'
+        if spec_name is None:
+            spec_name = getattr(self, 'spec_name', 'Intensity')
 
         if spec.ndim == 2:
             nfreq, ntim = len(self.freq_axis), len(self.time_axis)
@@ -1243,8 +1247,9 @@ class Dspec:
                 freq_plt = freq_plt[fidx]
 
                 # Change the default for Stokes V
-                if pol == 'V':
-                    cmap = 'gray'
+                if pol == 'V' and cmap_is_default:
+                    cmap = copy(plt.get_cmap('gray'))
+                    cmap.set_bad(cmap(0.0))
                     if (vmax is None) and (vmin is None):
                         vmax = np.nanmax(np.abs(spec_plt))
                         vmin = -vmax

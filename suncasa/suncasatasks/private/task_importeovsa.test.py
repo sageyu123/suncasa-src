@@ -99,8 +99,7 @@ def udb_corr_external(filelist, udbcorr_path, use_exist_udbcorr=False):
             filelist = pickle.load(sf)
 
     if filelist == []:
-        casalog.post('WARNING: udb_corr failed to return any results. Skipping this file list.')
-        return []
+        raise ValueError('udb_corr failed to return any results. Please check your calibration.')
     return filelist
 
 
@@ -301,15 +300,29 @@ def importeovsa_iter(filelist, timebin, width, visprefix, nocreatms, modelms, do
     casalog.post('----------------------------------------')
     casalog.post("Updating the main table of {}".format(msname))
     casalog.post('----------------------------------------')
+    if 'FLAG_CATEGORY' in tb.colnames():
+        tb.putcolkeyword('FLAG_CATEGORY', 'CATEGORY', np.array(['DEFAULT'], dtype='<U7'))
     for l, cband in enumerate(chan_band):
         time1 = time.time()
         # nchannels = len(cband['cidx'])
+        ch0 = cband['cidx'][0]
+        ch1 = cband['cidx'][-1] + 1
+        if nrows > 0:
+            casalog.post(
+                'band {0:02d}: FLAG shape {1}, FLAG_CATEGORY shape {2}'.format(
+                    (l + 1),
+                    flag[:, ch0:ch1, 0].shape,
+                    flag[:, ch0:ch1, 0][:, :, np.newaxis].shape,
+                )
+            )
         for row in range(nrows):
             if not doscaling or keep_nsclms:
-                datacell = out[:, cband['cidx'][0]:cband['cidx'][-1] + 1, row]
+                datacell = out[:, ch0:ch1, row]
                 rownr = int(row + l * nrows)
                 tb.putcell('DATA', rownr, datacell)
-            tb.putcell('FLAG', rownr, flag[:, cband['cidx'][0]:cband['cidx'][-1] + 1, row])
+            tb.putcell('FLAG', rownr, flag[:, ch0:ch1, row])
+            flagcat = np.ones_like(flag[:, ch0:ch1, row][:, :, np.newaxis], dtype=np.bool_)
+            tb.putcell('FLAG_CATEGORY', rownr, flagcat)
         casalog.post('---spw {0:02d} is updated in --- {1:10.2f} seconds ---'.format((l + 1), time.time() - time1))
     tb.putcol('UVW', uvwarray)
     tb.putcol('SIGMA', sigma)
@@ -504,15 +517,10 @@ def importeovsa(idbfiles=None, ncpu=None, timebin=None, width=None, visprefix=No
                 pass
 
         if filelist_tmp == []:
-            casalog.post('WARNING: udb_corr failed to return any results. Skipping import for this file list.')
-            return []
+            raise ValueError('udb_corr failed to return any results. Please check your calibration.')
         else:
             filelist = filelist_tmp
         # filelist = udb_corr_external(filelist, udbcorr_path, use_exist_udbcorr)
-
-    if not filelist:
-        casalog.post('WARNING: No calibrated files returned. Skipping import.')
-        return []
 
     if not modelms:
         if nocreatms:

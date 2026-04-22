@@ -8,10 +8,6 @@ from astropy.time import Time
 from suncasa.io import ndfits
 
 imgfitsdir = '/data1/eovsa/fits/synoptic/'
-# imgfitsbkdir = '/data1/workdir/synoptic_bk/'
-
-# imgfitsdir = '/data1/workdir/synoptic_bk/'
-imgfitsbkdir = '/data1/workdir/synoptic_newbk/'
 
 
 #
@@ -50,9 +46,6 @@ def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False,
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
     datestrdir = dateobj.strftime("%Y/%m/%d/")
     imgindir = imgfitsdir + datestrdir
-    imgbkdir = imgfitsbkdir + datestrdir
-    if not os.path.exists(imgbkdir):
-        os.makedirs(imgbkdir)
 
     if verbose: print('Processing EOVSA image fits files for date {}'.format(dateobj.strftime('%Y-%m-%d')))
     files = glob(os.path.join(imgindir, '*.tb.*fits'))
@@ -65,23 +58,21 @@ def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False,
             continue
         else:
             hdul.close()
-        filein = os.path.join(imgbkdir, os.path.basename(fl))
-        if not os.path.exists(filein):
-            os.system('mv {} {}'.format(fl, filein))
-        hdul = fits.open(filein)
-        for hdu in hdul:
-            if hdu.header['NAXIS'] == 0:
-                continue
-            else:
-                break
-        data = np.squeeze(hdu.data).copy()
+        with fits.open(fl) as hdul:
+            for hdu in hdul:
+                if hdu.header['NAXIS'] == 0:
+                    continue
+                else:
+                    break
+            data = np.squeeze(hdu.data).copy()
+            header = hdu.header.copy()
         # if verbose: print('Processing {}'.format(fl))
         if overwritefits:
             if os.path.exists(fl):
                 os.system('rm -f {}'.format(fl))
         if not os.path.exists(fl):
             data[np.isnan(data)] = 0.0
-            ndfits.write(fl, data, hdu.header, compression_type='RICE_1', quantize_level=4.0)
+            ndfits.write(fl, data, header, compression_type='RICE_1', quantize_level=4.0)
 
         fj2name = fl.replace('.fits', '.jp2')
         if writejp2:
@@ -89,9 +80,8 @@ def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False,
                 if os.path.exists(fj2name):
                     os.system('rm -f {}'.format(fj2name))
             if not os.path.exists(fj2name):
-                data = np.squeeze(hdu.data).copy()
                 data[np.isnan(data)] = 0.0
-                ndfits.write_j2000_image(fj2name, data[::-1, :], hdu.header)
+                ndfits.write_j2000_image(fj2name, data[::-1, :], header)
     return
 
 def main(dateobj=None, ndays=1, overwritejp2=False, overwritefits=False):

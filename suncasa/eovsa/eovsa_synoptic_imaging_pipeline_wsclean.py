@@ -26,6 +26,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tarfile
 import traceback
 from datetime import datetime, time, timedelta
 from contextlib import contextmanager
@@ -310,22 +311,13 @@ def detect_noisy_images(data_stack,
     ny, nx = images.shape[1], images.shape[2]
     mask_ring, mask_disk = get_solar_radius_mask(rsun_pix, crpix1, crpix2, ny, nx, rsun_ratio=rsun_ratio)
 
-    # Compute RMS and SNR for each frame
-    ring_rms_values = []
-    disk_rms_values = []
-    snr_values = []
-    for img in images:
-        noise_pixels = img[mask_ring]
-        disk_pixels = img[mask_disk]
-        signal = np.nanpercentile(disk_pixels, 99.999)
-        rms = np.sqrt(np.nanmean(noise_pixels ** 2))
-        ring_rms_values.append(rms)
-        disk_rms_values.append(np.sqrt(np.nanmean(disk_pixels ** 2)))
-        snr_values.append(signal / rms)
-
-    ring_rms_values = np.array(ring_rms_values)
-    snr_values = np.array(snr_values)
-    disk_rms_values = np.array(disk_rms_values)
+    # Compute RMS and SNR for all frames (vectorized)
+    ring_pixels = images[:, mask_ring]   # (n_images, n_ring_pixels)
+    disk_pixels = images[:, mask_disk]   # (n_images, n_disk_pixels)
+    ring_rms_values = np.sqrt(np.nanmean(ring_pixels ** 2, axis=1))
+    disk_rms_values = np.sqrt(np.nanmean(disk_pixels ** 2, axis=1))
+    signals = np.nanpercentile(disk_pixels, 99.999, axis=1)
+    snr_values = signals / ring_rms_values
 
     # --- Automatic RMS threshold (knee detection) ---
     sorted_rms = np.sort(ring_rms_values)
@@ -2766,11 +2758,12 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 if os.path.exists(targetfile):
                     shutil.rmtree(targetfile, ignore_errors=True)
                 shutil.move(caltb, targetfile)
-        if os.path.isdir(msfile + '.flagversions'):
-            targetfile = os.path.join(os.path.dirname(outputvis), os.path.basename(msfile) + '.flagversions')
+        if outputvis and os.path.isdir(msfile + '.flagversions'):
+            targetdir = os.path.dirname(outputvis) or '.'
+            targetfile = os.path.join(targetdir, os.path.basename(msfile) + '.flagversions')
             if os.path.exists(targetfile):
                 shutil.rmtree(targetfile, ignore_errors=True)
-            shutil.move(msfile + '.flagversions', os.path.dirname(outputvis))
+            shutil.move(msfile + '.flagversions', targetdir)
 
         # --- Cache cleanup ---
         if clearcache:
@@ -2790,6 +2783,52 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         shutil.rmtree(f, ignore_errors=True)
                     else:
                         os.remove(f)
+
+        # --- Assemble selfcal'd outputvis from per-spw splits via concat ---
+        if outputvis and not os.path.exists(outputvis):
+            log_print('INFO', f"Building selfcal'd outputvis {outputvis} from per-spw splits ...")
+            os.makedirs(os.path.dirname(outputvis) or '.', exist_ok=True)
+            slfcaled_spw_ms_list = []
+            for sidx, sp_index in enumerate(spws_indices):
+                spwstr = format_spw(spws[sidx])
+                msfile_sp = os.path.join(workdir, f'{msname}.sp{spwstr}.slfcaled.ms')
+                if os.path.exists(msfile_sp):
+                    shutil.rmtree(msfile_sp, ignore_errors=True)
+                log_print('INFO', f"Splitting SPW {spws[sidx]} (CORRECTED_DATA) -> {msfile_sp}")
+                split(vis=msfile, outputvis=msfile_sp, spw=spws[sidx], datacolumn='corrected')
+                if os.path.isdir(msfile_sp):
+                    slfcaled_spw_ms_list.append(msfile_sp)
+                else:
+                    log_print('WARNING', f"Split failed for SPW {spws[sidx]}; skipping in outputvis.")
+            if slfcaled_spw_ms_list:
+                log_print('INFO',
+                          f"Concatenating {len(slfcaled_spw_ms_list)} per-spw MS files into {outputvis} ...")
+                concat(vis=slfcaled_spw_ms_list, concatvis=outputvis, freqtol='', dirtol='')
+                log_print('INFO', f"Selfcal'd outputvis saved to {outputvis}")
+                # Tar the outputvis and remove the MS directory
+                outputvis_tar = outputvis + '.tar.gz'
+                log_print('INFO', f"Archiving {outputvis} to {outputvis_tar} ...")
+                with tarfile.open(outputvis_tar, 'w:gz') as tar:
+                    tar.add(outputvis, arcname=os.path.basename(outputvis))
+                if os.path.exists(outputvis_tar) and os.path.getsize(outputvis_tar) > 0:
+                    shutil.rmtree(outputvis)
+                    log_print('INFO', f"Removed {outputvis} after successful archiving to {outputvis_tar}")
+                else:
+                    log_print('WARNING', f"Tar archive {outputvis_tar} appears empty or missing. Keeping {outputvis}.")
+            else:
+                log_print('WARNING', "No per-spw slfcaled MS files produced; outputvis not created.")
+
+        # --- Tar the source UDB*.ms working copy and remove it ---
+        if os.path.isdir(msfile):
+            tar_path = msfile + '.tar.gz'
+            log_print('INFO', f"Archiving {msfile} to {tar_path} ...")
+            with tarfile.open(tar_path, 'w:gz') as tar:
+                tar.add(msfile, arcname=os.path.basename(msfile))
+            if os.path.exists(tar_path) and os.path.getsize(tar_path) > 0:
+                shutil.rmtree(msfile)
+                log_print('INFO', f"Removed {msfile} after successful archiving to {tar_path}")
+            else:
+                log_print('WARNING', f"Tar archive {tar_path} appears empty or missing. Keeping {msfile}.")
 
         log_step('INFO', 'pipeline_run', 'completed', processed_spws=sorted(outfits_all.keys()))
         return outfits_all

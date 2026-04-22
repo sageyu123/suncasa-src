@@ -44,6 +44,81 @@ qa = qatool()
 ia = iatool()
 
 
+def load_calwidget_v2_npz(npz_path):
+    '''Load refcal + phacals from a calwidget v2 calibeovsa-ready NPZ.
+
+    Returns a tuple ``(refcal, phacals)`` whose dict layout matches what
+    :func:`eovsapy.sqlutil.sql2refcalX` and :func:`sql2phacalX` produce, so the
+    rest of :func:`calibeovsa` can consume them unchanged.
+
+    Promoted-antenna metadata (the per-antenna source phacal timestamp written
+    by ``Promote to Refcal``) is attached to ``refcal['promoted_antennas']``
+    for audit purposes; the scalar ``refcal['timestamp']`` still drives the
+    phacal-to-refcal time filter, so promoted antennas inherit the refcal's
+    time for now (downstream is unchanged).
+    '''
+    import json as _json
+
+    with np.load(npz_path, allow_pickle=False) as data:
+        kind = str(data['kind'])
+        if kind != 'calibeovsa_v1':
+            raise ValueError(
+                'Unrecognized calwidget v2 npz kind {0!r} in {1}'.format(kind, npz_path)
+            )
+        vis = data['refcal__vis_real'] + 1j * data['refcal__vis_imag']
+        flag = np.asarray(data['refcal__flag'])
+        # Prefer the widget's smooth analytic-fit phase (Chebyshev for Ant 1,
+        # polynomial for Ant 2+) as the calibration phase — that IS the
+        # calibration the widget intends to apply. Fall back to the raw
+        # band-averaged vis phase for older NPZs without refcal__model_pha.
+        # NaN entries in the model mark (ant, pol, band) combinations the
+        # widget did not fit (missing bands, masked antennas); promote those
+        # to flag=1 so downstream zeroing (pha[flag==1]=0) handles them.
+        if 'refcal__model_pha' in data.files and data['refcal__model_pha'].size > 0:
+            model_pha = np.asarray(data['refcal__model_pha'], dtype=np.float64)
+            fitted = np.isfinite(model_pha)
+            pha = np.where(fitted, model_pha, 0.0)
+            flag = np.where(fitted, flag, 1).astype(flag.dtype)
+        else:
+            pha = np.angle(vis)
+        refcal = {
+            'pha': pha,
+            'amp': np.abs(vis),
+            'flag': flag,
+            'sigma': np.asarray(data['refcal__sigma']),
+            'fghz': np.asarray(data['refcal__fghz']),
+            'timestamp': Time(float(data['refcal__timestamp_lv']), format='lv'),
+            't_bg': Time(float(data['refcal__t_bg_lv']), format='lv'),
+            't_ed': Time(float(data['refcal__t_ed_lv']), format='lv'),
+            'promoted_antennas': _json.loads(str(data['refcal__promoted_antennas_json'])),
+        }
+        phacal_ids = [int(v) for v in np.asarray(data['phacal_scan_ids']).tolist()]
+        phacals = []
+        for scan_id in phacal_ids:
+            prefix = 'phacal_{0}'.format(scan_id)
+            inner = {
+                'pha': np.asarray(data[prefix + '__phacal_pha']),
+                'amp': np.asarray(data[prefix + '__phacal_amp']),
+                'flag': np.asarray(data[prefix + '__phacal_flag']),
+                'sigma': np.asarray(data[prefix + '__phacal_sigma']),
+                'fghz': np.asarray(data[prefix + '__phacal_fghz']),
+                'timestamp': Time(float(data[prefix + '__t_pha_lv']), format='lv'),
+                't_bg': Time(float(data[prefix + '__phacal_t_bg_lv']), format='lv'),
+                't_ed': Time(float(data[prefix + '__phacal_t_ed_lv']), format='lv'),
+            }
+            phacals.append({
+                'pslope': np.asarray(data[prefix + '__pslope']),
+                't_pha': Time(float(data[prefix + '__t_pha_lv']), format='lv'),
+                'flag': np.asarray(data[prefix + '__flag']),
+                'poff': np.asarray(data[prefix + '__poff']),
+                't_ref': Time(float(data[prefix + '__t_ref_lv']), format='lv'),
+                't_bg': Time(float(data[prefix + '__t_bg_lv']), format='lv'),
+                't_ed': Time(float(data[prefix + '__t_ed_lv']), format='lv'),
+                'phacal': inner,
+            })
+    return refcal, phacals
+
+
 def flag_phambd_by_spw(caltb, flagspw='0~1'):
     sp_st, sp_ed = flagspw.split('~')
     tb.open(caltb, nomodify=False)
@@ -71,7 +146,8 @@ def flag_phambd_by_spw(caltb, flagspw='0~1'):
 
 def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, doflag=True, flagant='',
                flagspw='', doimage=False, imagedir=None, antenna='', timerange=None, spw=None, stokes=None,
-               dosplit=False, outputvis=None, doconcat=False, concatvis=None, keep_orig_ms=True):
+               dosplit=False, outputvis=None, doconcat=False, concatvis=None, keep_orig_ms=True,
+               cal_npz=None):
     '''
 
     :param vis: EOVSA visibility dataset(s) to be calibrated 
@@ -86,6 +162,13 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
     '''
 
     interp0 = interp
+
+    cal_npz_refcal = None
+    cal_npz_phacals = None
+    if cal_npz:
+        cal_npz_refcal, cal_npz_phacals = load_calwidget_v2_npz(cal_npz)
+        print('Loaded refcal + {0} phacal(s) from calwidget v2 NPZ {1}'.format(
+            len(cal_npz_phacals), cal_npz))
 
     if type(vis) == str:
         vis = [vis]
@@ -172,7 +255,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 flagant = '15'
 
             if ('refpha' in caltype) or ('refamp' in caltype) or ('refcal' in caltype):
-                refcal = sql2refcalX(btime)
+                if cal_npz_refcal is not None:
+                    refcal = cal_npz_refcal
+                else:
+                    refcal = sql2refcalX(btime)
                 # shape is 15 (nant) x 2 (npol) x 34 (nband)
                 # EOVSA15 upgrade-related Note:
                 # the number of antennas in refcal['pha'] is changed to 16 after EOVSA15 upgrade
@@ -345,7 +431,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 spwmaps.append(nspw * [0])
 
             if 'phacal' in caltype:
-                phacals = np.array(sql2phacalX([bt, et], nrecords=0, neat=True, verbose=False))
+                if cal_npz_phacals is not None:
+                    phacals = np.array(cal_npz_phacals)
+                else:
+                    phacals = np.array(sql2phacalX([bt, et], nrecords=0, neat=True, verbose=False))
                 if not phacals.any() or len(phacals) == 0:
                     print("Found no phacal records in SQL database, will skip phase calibration")
                 else:

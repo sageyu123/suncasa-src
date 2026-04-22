@@ -1281,7 +1281,7 @@ def imreg(vis=None, imagefile=None, timerange=None,
     return fitsfile
 
 
-def calc_phasecenter_from_solxy(vis, timerange='', xycen=None, usemsphacenter=True, observatory=None):
+def calc_phasecenter_from_solxy(vis, timerange='', xycen=None, usemsphacenter=True, observatory=None, verbose=False):
     '''
     return the phase center in RA and DEC of a given solar coordinates
 
@@ -1369,6 +1369,11 @@ def calc_phasecenter_from_solxy(vis, timerange='', xycen=None, usemsphacenter=Tr
         newra = ra0 + raoff
         newdec = dec0 + decoff
         phasecenter = 'J2000 ' + str(newra) + 'rad ' + str(newdec) + 'rad'
+    if verbose:
+        ref_phasecenter = 'J2000 ' + str(ra0) + 'rad ' + str(dec0) + 'rad'
+        print('[calc_phasecenter_from_solxy] Ref phasecenter : {}'.format(ref_phasecenter))
+        print('[calc_phasecenter_from_solxy] New phasecenter  : {}'.format(phasecenter))
+
     return phasecenter, midtim
 
 

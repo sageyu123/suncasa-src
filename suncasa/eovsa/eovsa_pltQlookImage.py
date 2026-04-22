@@ -14,9 +14,13 @@ from glob import glob
 import numpy as np
 from astropy.time import Time
 import urllib.request
+import urllib.error
 import socket
 
 socket.setdefaulttimeout(180)
+HELIOVIEWER_TIMEOUT_S = 5
+HELIOVIEWER_TIMEOUT_LIMIT = 3
+QUERY_TIMEOUT_S = 5
 
 imgfitsdir = '/data1/eovsa/fits/synoptic/'
 imgfitstmpdir = '/data1/workdir/fitstmp/'
@@ -322,11 +326,21 @@ def pltSdoQlookImage(datestr, dpis_dict, fig=None, ax=None, overwrite=False, ver
             if overwrite and os.path.exists(sdofile):
                 os.system('rm -rf {}'.format(sdofile))
             if not os.path.exists(sdofile):
-                try:
-                    urllib.request.urlretrieve(sdourl, sdofile)
-                except:
-                    print('The connection with {} has timed out. Skipped!'.format(sdourl))
-            ax.cla()
+                timeout_hits = 0
+                while timeout_hits < HELIOVIEWER_TIMEOUT_LIMIT and not os.path.exists(sdofile):
+                    try:
+                        with urllib.request.urlopen(sdourl, timeout=HELIOVIEWER_TIMEOUT_S) as response:
+                            with open(sdofile, 'wb') as outfp:
+                                outfp.write(response.read())
+                    except (socket.timeout, TimeoutError, urllib.error.URLError) as err:
+                        timeout_hits += 1
+                        print('The connection with {} has timed out (attempt {}/{}).'.format(
+                            sdourl, timeout_hits, HELIOVIEWER_TIMEOUT_LIMIT))
+                        print(err)
+                        if timeout_hits >= HELIOVIEWER_TIMEOUT_LIMIT:
+                            print('Skipping {} after {} timeouts.'.format(sdourl, timeout_hits))
+                            break
+                ax.cla()
 
             if not os.path.exists(sdofile): continue
             if not os.path.exists(imgoutdir): os.makedirs(imgoutdir)
@@ -368,7 +382,7 @@ def pltBbsoQlookImage(datestr, dpis_dict, fig=None, ax=None, overwrite=False, ve
 
     def extract(url, prefix='bbso_halph_fr_', suffix='.fts'):
         import urllib.request
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(url, timeout=QUERY_TIMEOUT_S) as response:
             f = response.read()
 
         parser = MyHTMLParser(prefix, suffix)
@@ -416,9 +430,12 @@ def pltBbsoQlookImage(datestr, dpis_dict, fig=None, ax=None, overwrite=False, ve
                 bbsofile = os.path.join(imgindir, key + '.fits')
                 if not os.path.exists(bbsofile):
                     try:
-                        urllib.request.urlretrieve(bbsourl, bbsofile)
-                    except:
+                        with urllib.request.urlopen(bbsourl, timeout=QUERY_TIMEOUT_S) as response:
+                            with open(bbsofile, 'wb') as outfp:
+                                outfp.write(response.read())
+                    except (socket.timeout, TimeoutError, urllib.error.URLError) as err:
                         print('The connection with {} has timed out. Skipped!'.format(bbsourl))
+                        print(err)
                 ax.cla()
                 if not os.path.exists(bbsofile): continue
                 if not os.path.exists(imgoutdir): os.makedirs(imgoutdir)
@@ -559,12 +576,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Pipeline for plotting EOVSA daily full-disk images at multiple frequencies.'
     )
-    # Default date is set to two days before the current date at 20:00 UT,
+    # Default date is set to one day before the current date at 20:00 UT,
     # formatted as YYYY-MM-DDT20:00.
-    default_date = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%dT20:00')
+    default_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%dT20:00')
     parser.add_argument(
         '--date', type=str, default=default_date,
-        help='Date to process in YYYY-MM-DDT20:00 format, defaults to 20:00 UT two days before the current date.'
+        help='Date to process in YYYY-MM-DDT20:00 format, defaults to 20:00 UT one day before the current date.'
     )
     parser.add_argument(
         '--ndays', type=int, default=1,
@@ -631,5 +648,3 @@ if __name__ == '__main__':
         show_warning=args.show_warning,
         debug=args.debug
     )
-
-
