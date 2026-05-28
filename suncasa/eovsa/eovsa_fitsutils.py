@@ -42,39 +42,60 @@ imgfitsdir = '/data1/eovsa/fits/synoptic/'
 #     hdulnew.writeto(fname, output_verify='fix')
 
 
-def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False, overwritefits=False):
+def synoptic_product_dir(dateobj, version='v3.0', create=False, fallback=True):
+    datestrdir = dateobj.strftime("%Y/%m/%d")
+    versioned_dir = os.path.join(imgfitsdir, datestrdir, version)
+    if create:
+        os.makedirs(versioned_dir, exist_ok=True)
+        return versioned_dir
+    if os.path.isdir(versioned_dir):
+        return versioned_dir
+    flat_dir = os.path.join(imgfitsdir, datestrdir)
+    if fallback:
+        return flat_dir
+    return versioned_dir
+
+
+def fits_tag_infix(fits_tag):
+    if not fits_tag:
+        return ''
+    return '.{}'.format(str(fits_tag).lstrip('.'))
+
+
+def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False, overwritefits=False,
+                     version='v3.0', fits_tag=''):
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
-    datestrdir = dateobj.strftime("%Y/%m/%d/")
-    imgindir = imgfitsdir + datestrdir
+    imgindir = synoptic_product_dir(dateobj, version=version, fallback=True)
+    imgoutdir = synoptic_product_dir(dateobj, version=version, create=True, fallback=False)
 
     if verbose: print('Processing EOVSA image fits files for date {}'.format(dateobj.strftime('%Y-%m-%d')))
-    files = glob(os.path.join(imgindir, '*.tb.*fits'))
+    if fits_tag:
+        files = glob(os.path.join(imgindir, 'eovsa.synoptic_daily{}.*.tb.*fits'.format(fits_tag_infix(fits_tag))))
+    else:
+        files = glob(os.path.join(imgindir, '*.tb.*fits'))
     files = sorted(files)
     for fl in files:
         if not os.path.exists(fl): continue
-        hdul = fits.open(fl)
-        if len(hdul) > 1:
-            hdul.close()
-            continue
-        else:
-            hdul.close()
-        with fits.open(fl) as hdul:
-            for hdu in hdul:
-                if hdu.header['NAXIS'] == 0:
-                    continue
-                else:
+        with fits.open(fl, memmap=False) as hdul:
+            hdu = None
+            for item in hdul:
+                if item.data is not None and item.header.get('NAXIS', 0) > 0:
+                    hdu = item
                     break
+            if hdu is None:
+                continue
             data = np.squeeze(hdu.data).copy()
             header = hdu.header.copy()
         # if verbose: print('Processing {}'.format(fl))
+        outfits = os.path.join(imgoutdir, os.path.basename(fl))
         if overwritefits:
-            if os.path.exists(fl):
-                os.system('rm -f {}'.format(fl))
-        if not os.path.exists(fl):
+            if os.path.exists(outfits):
+                os.system('rm -f {}'.format(outfits))
+        if not os.path.exists(outfits):
             data[np.isnan(data)] = 0.0
-            ndfits.write(fl, data, header, compression_type='RICE_1', quantize_level=4.0)
+            ndfits.write(outfits, data, header, compression_type='RICE_1', quantize_level=4.0)
 
-        fj2name = fl.replace('.fits', '.jp2')
+        fj2name = outfits.replace('.fits', '.jp2')
         if writejp2:
             if overwritejp2:
                 if os.path.exists(fj2name):
@@ -84,7 +105,7 @@ def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False,
                 ndfits.write_j2000_image(fj2name, data[::-1, :], header)
     return
 
-def main(dateobj=None, ndays=1, overwritejp2=False, overwritefits=False):
+def main(dateobj=None, ndays=1, overwritejp2=False, overwritefits=False, version='v3.0', fits_tag=''):
     """
     Main pipeline for creating compressed FITS and JP2 files of EOVSA daily full-disk images.
 
@@ -118,7 +139,8 @@ def main(dateobj=None, ndays=1, overwritejp2=False, overwritefits=False):
     while dateobs <= ted:
         datestr = dateobs.strftime("%Y-%m-%d")
         rewriteImageFits(datestr, verbose=True, writejp2=True,
-                          overwritejp2=overwritejp2, overwritefits=overwritefits)
+                          overwritejp2=overwritejp2, overwritefits=overwritefits,
+                          version=version, fits_tag=fits_tag)
         dateobs = dateobs + timedelta(days=1)
 
 
@@ -148,6 +170,14 @@ if __name__ == '__main__':
         '--overwritefits', action='store_true',
         help='Overwrite existing EOVSA FITS files.'
     )
+    parser.add_argument(
+        '--version', type=str, default='v3.0',
+        help='Synoptic imaging product version folder to process.'
+    )
+    parser.add_argument(
+        '--fits-tag', type=str, default='',
+        help='Optional tag inserted after eovsa.synoptic_daily for alternate FITS products.'
+    )
     # Optional positional date arguments: year month day (overrides --date if provided)
     parser.add_argument(
         'date_args', type=int, nargs='*',
@@ -168,6 +198,9 @@ if __name__ == '__main__':
     print(f"  ndays: {args.ndays}")
     print(f"  overwritejp2: {args.overwritejp2}")
     print(f"  overwritefits: {args.overwritefits}")
+    print(f"  version: {args.version}")
+    print(f"  fits_tag: {args.fits_tag}")
 
     # Call the main function with the parsed datetime object.
-    main(dateobj, args.ndays, overwritejp2=args.overwritejp2, overwritefits=args.overwritefits)
+    main(dateobj, args.ndays, overwritejp2=args.overwritejp2, overwritefits=args.overwritefits,
+         version=args.version, fits_tag=args.fits_tag)

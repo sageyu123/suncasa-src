@@ -27,6 +27,49 @@ imgfitstmpdir = '/data1/workdir/fitstmp/'
 pltfigdir = '/common/webplots/SynopticImg/eovsamedia/eovsa-browser/'
 
 
+def synoptic_product_path(dateobj, filename, version=None):
+    datestrdir = dateobj.strftime("%Y/%m/%d")
+    candidates = []
+    if version:
+        candidates.append(os.path.join(imgfitsdir, datestrdir, version, filename))
+    candidates.append(os.path.join(imgfitsdir, datestrdir, filename))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+def synoptic_preview_dir(dateobj, version=None, create=False):
+    datestrdir = dateobj.strftime("%Y/%m/%d")
+    outdir = os.path.join(pltfigdir, datestrdir)
+    if version:
+        outdir = os.path.join(outdir, version)
+    if create:
+        os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+
+def fits_tag_infix(fits_tag):
+    if not fits_tag:
+        return ''
+    return '.{}'.format(str(fits_tag).lstrip('.'))
+
+
+def eovsa_preview_filename(size, band_number, fits_tag=''):
+    # fits_tag selects the input FITS product; browser previews are canonical per version folder.
+    return '{}_eovsa_bd{:02d}.jpg'.format(size, band_number)
+
+
+def synoptic_daily_product_filename(dateobj, spwstr, version='v3.0', fits_tag=''):
+    datestr = dateobj.strftime('%Y%m%d')
+    tag = fits_tag_infix(fits_tag)
+    if version == 'v1.0':
+        return 'eovsa_{}.spw{}.tb.disk.fits'.format(datestr, spwstr)
+    if version == 'v2.0':
+        return f'eovsa.synoptic_daily{tag}.{datestr}T200000_UTC.s{spwstr}.tb.fits'
+    return f'eovsa.synoptic_daily{tag}.{datestr}T200000Z.s{spwstr}.tb.disk.fits'
+
+
 def clearImage():
     for (dirpath, dirnames, filenames) in os.walk(pltfigdir):
         for filename in filenames:
@@ -70,8 +113,6 @@ def pltEmptyImage2(dpis_dict={'t': 32.0}):
 def pltEmptyImage(datestr, spws, vmaxs, vmins, dpis_dict={'t': 32.0}):
     plt.ioff()
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
-    datestrdir = dateobj.strftime("%Y/%m/%d/")
-    imgindir = imgfitsdir + datestrdir
     imgoutdir = './nodata/'
 
     cmap = plt.get_cmap('sdoaia304')
@@ -84,7 +125,10 @@ def pltEmptyImage(datestr, spws, vmaxs, vmins, dpis_dict={'t': 32.0}):
     for s, sp in enumerate(spws):
         ax.cla()
         spwstr = '-'.join(['{:02d}'.format(int(sp_)) for sp_ in sp.split('~')])
-        eofile = imgindir + 'eovsa_{}.spw{}.tb.disk.fits'.format(dateobj.strftime('%Y%m%d'), spwstr)
+        eofile = synoptic_product_path(
+            dateobj,
+            synoptic_daily_product_filename(dateobj, spwstr, version='v1.0'),
+            version='v1.0')
         if not os.path.exists(eofile): continue
         if not os.path.exists(imgoutdir): os.makedirs(imgoutdir)
         eomap = smap.Map(eofile)
@@ -109,15 +153,13 @@ def pltEmptyImage(datestr, spws, vmaxs, vmins, dpis_dict={'t': 32.0}):
     return
 
 
-def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None, overwrite=False, verbose=False):
+def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None, overwrite=False, verbose=False,
+                           version='v3.0', fits_tag=''):
     from astropy.visualization.stretch import AsinhStretch
     from astropy.visualization import ImageNormalize
     plt.ioff()
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
-    datestr = dateobj.strftime('%Y%m%d')
-    datestrdir = dateobj.strftime("%Y/%m/%d/")
-    imgindir = imgfitsdir + datestrdir
-    imgoutdir = pltfigdir + datestrdir
+    imgoutdir = synoptic_preview_dir(dateobj, version=version)
 
     cmap = plt.get_cmap('sdoaia304')
     cmap.set_bad(color='k')
@@ -135,17 +177,20 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
     for s, sp in enumerate(spws):
         fexists = []
         for l, dpi in dpis_dict.items():
-            figname = os.path.join(imgoutdir, f'{l}_eovsa_bd{s+1:02d}_v3.0.jpg')
+            figname = os.path.join(imgoutdir, eovsa_preview_filename(l, s + 1, fits_tag=fits_tag))
             fexists.append(os.path.exists(figname))
 
         if overwrite or (False in fexists):
             ax.cla()
             spwstr = '-'.join(['{:02d}'.format(int(sp_)) for sp_ in sp.split('~')])
-            eofile = os.path.join(imgindir, f'eovsa.synoptic_daily.{datestr}T200000Z.s{spwstr}.tb.disk.fits')
+            eofile = synoptic_product_path(
+                dateobj,
+                synoptic_daily_product_filename(dateobj, spwstr, version=version, fits_tag=fits_tag),
+                version=version)
             if not os.path.exists(eofile):
                 print('Fail to plot {} as it does not exist'.format(eofile))
                 continue
-            if not os.path.exists(imgoutdir): os.makedirs(imgoutdir)
+            synoptic_preview_dir(dateobj, version=version, create=True)
             try:
                 eomap = smap.Map(eofile)
                 stretch = AsinhStretch(a=0.15)
@@ -169,7 +214,7 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
 
                 print(f'Processing EOVSA images {eofile}')
                 for l, dpi in dpis_dict.items():
-                    figname = os.path.join(imgoutdir, f'{l}_eovsa_bd{s+1:02d}_v3.0.jpg')
+                    figname = os.path.join(imgoutdir, eovsa_preview_filename(l, s + 1, fits_tag=fits_tag))
                     fig.savefig(figname, dpi=int(dpi), pil_kwargs={"quality":85})
                     print('EOVSA image saved to {}'.format(figname))
             except Exception as err:
@@ -182,14 +227,13 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
     return
 
 
-def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None, overwrite=False, verbose=False):
+def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None, overwrite=False, verbose=False,
+                        version='v1.0', fits_tag=''):
     from astropy.visualization.stretch import AsinhStretch
     from astropy.visualization import ImageNormalize
     plt.ioff()
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
-    datestrdir = dateobj.strftime("%Y/%m/%d/")
-    imgindir = imgfitsdir + datestrdir
-    imgoutdir = pltfigdir + datestrdir
+    imgoutdir = synoptic_preview_dir(dateobj, version=version)
 
     cmap = plt.get_cmap('sdoaia304')
     cmap.set_bad(color='k')
@@ -207,17 +251,20 @@ def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None
     for s, sp in enumerate(spws):
         fexists = []
         for l, dpi in dpis_dict.items():
-            figname = os.path.join(imgoutdir, '{}_eovsa_bd{:02d}.jpg'.format(l, s + 1))
+            figname = os.path.join(imgoutdir, eovsa_preview_filename(l, s + 1, fits_tag=fits_tag))
             fexists.append(os.path.exists(figname))
 
         if overwrite or (False in fexists):
             ax.cla()
             spwstr = '-'.join(['{:02d}'.format(int(sp_)) for sp_ in sp.split('~')])
-            eofile = imgindir + 'eovsa_{}.spw{}.tb.disk.fits'.format(dateobj.strftime('%Y%m%d'), spwstr)
+            eofile = synoptic_product_path(
+                dateobj,
+                synoptic_daily_product_filename(dateobj, spwstr, version=version, fits_tag=fits_tag),
+                version=version)
             if not os.path.exists(eofile):
                 print('Fail to plot {} as it does not exist'.format(eofile))
                 continue
-            if not os.path.exists(imgoutdir): os.makedirs(imgoutdir)
+            synoptic_preview_dir(dateobj, version=version, create=True)
             try:
                 eomap = smap.Map(eofile)
                 stretch = AsinhStretch(a=0.15)
@@ -240,7 +287,7 @@ def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None
                 ax.set_ylim(-1227, 1227)
 
                 for l, dpi in dpis_dict.items():
-                    figname = os.path.join(imgoutdir, '{}_eovsa_bd{:02d}.jpg'.format(l, s + 1))
+                    figname = os.path.join(imgoutdir, eovsa_preview_filename(l, s + 1, fits_tag=fits_tag))
                     fig.savefig(figname, dpi=int(dpi), pil_kwargs={"quality":85})
                     print('EOVSA image saved to {}'.format(figname))
             except Exception as err:
@@ -491,7 +538,7 @@ def pltBbsoQlookImage(datestr, dpis_dict, fig=None, ax=None, overwrite=False, ve
     return
 
 def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_sdo=False,
-         ovwrite_bbso=False, show_warning=False, debug=False):
+         ovwrite_bbso=False, show_warning=False, debug=False, version='all', fits_tag=''):
     """
     Main pipeline for plotting EOVSA daily full-disk images at multiple frequencies.
 
@@ -511,6 +558,10 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
     :type show_warning: bool, optional
     :param debug: If True, run the pipeline in debugging mode; default is False.
     :type debug: bool, optional
+    :param version: EOVSA product version to plot, or "all" for the legacy v1/v3 pair.
+    :type version: str, optional
+    :param fits_tag: Optional tag inserted after eovsa.synoptic_daily for alternate FITS products.
+    :type fits_tag: str, optional
     :raises Exception: If an error occurs during processing.
     :return: None
     :rtype: None
@@ -555,12 +606,20 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
             spws_v3 = ['0~1', '2~4', '5~10', '11~20', '21~30', '31~43', '44~49']
         else:
             spws = ['1~3', '4~9', '10~16', '17~24', '25~30']
+            spws_v3 = spws
 
         datestr = dateobs.strftime("%Y-%m-%d")
-        pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict_eo, fig, ax,
-                            overwrite=ovwrite_eovsa, verbose=True)
-        pltEovsaQlookImage_v3(datestr, spws_v3, vmaxs, vmins, dpis_dict_eo, fig, ax,
-                               overwrite=ovwrite_eovsa, verbose=True)
+        eovsa_versions = ['v1.0', 'v3.0'] if version == 'all' else [version]
+        for eovsa_version in eovsa_versions:
+            version_fits_tag = '' if eovsa_version == 'v1.0' else fits_tag
+            if eovsa_version == 'v1.0':
+                pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict_eo, fig, ax,
+                                    overwrite=ovwrite_eovsa, verbose=True, version=eovsa_version,
+                                    fits_tag=version_fits_tag)
+            else:
+                pltEovsaQlookImage_v3(datestr, spws_v3, vmaxs, vmins, dpis_dict_eo, fig, ax,
+                                       overwrite=ovwrite_eovsa, verbose=True, version=eovsa_version,
+                                       fits_tag=version_fits_tag)
         pltSdoQlookImage(datestr, dpis_dict_sdo, fig, ax,
                          overwrite=ovwrite_sdo, verbose=True, clearcache=clearcache, debug=debug)
         pltBbsoQlookImage(datestr, dpis_dict_bbso, fig, ax,
@@ -611,6 +670,14 @@ if __name__ == '__main__':
         '--debug', action='store_true',
         help='Run the pipeline in debugging mode.'
     )
+    parser.add_argument(
+        '--version', type=str, default='all',
+        help='EOVSA product version to plot into vX.Y preview folders, or "all" for the legacy v1/v3 pair.'
+    )
+    parser.add_argument(
+        '--fits-tag', type=str, default='',
+        help='Optional tag inserted after eovsa.synoptic_daily for alternate FITS products.'
+    )
     # Optional positional date arguments: year month day (overrides --date if provided)
     parser.add_argument(
         'date_args', type=int, nargs='*',
@@ -636,6 +703,8 @@ if __name__ == '__main__':
     print(f"  ovwrite_bbso: {args.ovwrite_bbso}")
     print(f"  show_warning: {args.show_warning}")
     print(f"  debug: {args.debug}")
+    print(f"  version: {args.version}")
+    print(f"  fits_tag: {args.fits_tag}")
 
     # Run the main pipeline function with the datetime object.
     main(
@@ -646,5 +715,7 @@ if __name__ == '__main__':
         ovwrite_sdo=args.ovwrite_sdo,
         ovwrite_bbso=args.ovwrite_bbso,
         show_warning=args.show_warning,
-        debug=args.debug
+        debug=args.debug,
+        version=args.version,
+        fits_tag=args.fits_tag
     )

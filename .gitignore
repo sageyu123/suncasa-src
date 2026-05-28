@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.pycache/
 *.py[cod]
 *$py.class
 
@@ -171,3 +172,6 @@ cython_debug/
 .DS_Store
 
 obsolete/
+
+dev/
+scripts/deploy_suncasa_to_pipeline.sh

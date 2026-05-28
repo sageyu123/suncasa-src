@@ -2,14 +2,18 @@ import argparse
 import json
 from datetime import datetime, timedelta
 # from astropy.time import Time
+import shutil
 import traceback
+import numpy as np
 from suncasa.suncasatasks import ptclean6 as ptclean
 from suncasa.suncasatasks import calibeovsa
 from suncasa.suncasatasks import importeovsa
+from suncasa.suncasatasks.private.task_calibeovsa_test import (
+    calibeovsa as calibeovsa_npz,
+)
 
 import re
 import sys
-import numpy as np
 from eovsapy.dump_tsys import findfiles
 from eovsapy.sqlutil import sql2phacalX, sql2refcalX
 from eovsapy.util import Time
@@ -41,7 +45,7 @@ tb = tbtool()
 
 def get_tdate_from_basename(vis):
     # Define the regular expression pattern
-    pattern = r'UDB(\d{8})\.ms(\.tar\.gz)?'
+    pattern = r'UDB(\d{8})(?:\d+)?(?:\..*)?\.ms(\.tar\.gz)?'
 
     # Extract the basename from the vis path
     basename = os.path.basename(vis)
@@ -59,6 +63,38 @@ def get_tdate_from_basename(vis):
         return tdate
     else:
         raise ValueError("The basename does not match the expected format.")
+
+
+def get_default_cal_tag(version, cal_tag=None):
+    if cal_tag:
+        return cal_tag
+    raise ValueError('cal_tag is required when cal_npz is supplied; use a unique NPZ experiment label.')
+
+
+def remove_path(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def stage_cal_npz_inputs(invis, workdir, cal_tag):
+    """Copy imported UDB scan MS inputs to scratch before calibeovsa mutates them."""
+    stage_dir = os.path.join(workdir, 'cal_npz_imported_ms_' + (cal_tag or 'untagged'))
+    os.makedirs(stage_dir, exist_ok=True)
+    staged = []
+    for src in invis:
+        src = os.path.normpath(src)
+        dst = os.path.join(stage_dir, os.path.basename(src.rstrip('/')))
+        if os.path.exists(dst):
+            remove_path(dst)
+        print(f'Staging imported UDB MS for NPZ calibration: {src} -> {dst}')
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+        staged.append(dst)
+    return staged
 
 
 import socket
@@ -126,6 +162,18 @@ qlookfigdir = pathconfig.qlookfigdir
 synopticfigdir = pathconfig.synopticfigdir
 workdir_default = pathconfig.workdir_default
 
+SUPPORTED_PIPELINE_VERSIONS = ('v1.0', 'v2.0', 'v3.0', 'v3.1')
+WSCLEAN_PIPELINE_VERSIONS = ('v3.0', 'v3.1')
+
+
+def get_synoptic_day_output_dir(tim):
+    tim = Time(tim)
+    return os.path.join(qlookfitsdir, tim.datetime.strftime("%Y/%m/%d"))
+
+
+def get_synoptic_product_output_dir(tim, version):
+    return os.path.join(get_synoptic_day_output_dir(tim), version)
+
 
 def get_local_day_bounds(tim):
     """Return the local-day bounds used by the daily EOVSA pipeline."""
@@ -138,25 +186,44 @@ def get_local_day_bounds(tim):
     return btime, etime
 
 
-def get_synoptic_output_info(tim):
-    """Return the expected synoptic daily FITS products and status file for one day."""
+def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
+    """Return the expected synoptic daily FITS products and status file for one day.
+
+    When ``fits_tag`` is a non-empty string (e.g. ``'test'`` for calwidget_v2
+    NPZ benchmark runs), it is spliced into the FITS and status filenames as
+    an infix so the alternate products sit alongside the production ones
+    without collision.
+    """
     from suncasa.eovsa.eovsa_synoptic_imaging_pipeline_wsclean import FrequencySetup
 
     tim = Time(tim)
     date_str = tim.datetime.strftime('%Y%m%d')
-    imgoutdir = os.path.join(qlookfitsdir, tim.datetime.strftime("%Y/%m/%d/"))
+    day_outdir = get_synoptic_day_output_dir(tim)
+    imgoutdir = get_synoptic_product_output_dir(tim, version)
+    tag = f'.{fits_tag}' if fits_tag else ''
     freq_setup = FrequencySetup(tim)
     fitsfiles = []
     for spw in freq_setup.spws:
         spwstr = spw.replace('~', '-')
-        fitsfiles.append(os.path.join(imgoutdir, f'eovsa.synoptic_daily.{date_str}T200000Z.s{spwstr}.tb.fits'))
-    statusfile = os.path.join(imgoutdir, f'eovsa.synoptic_pipeline_status.{date_str}.json')
-    return {'date_str': date_str, 'imgoutdir': imgoutdir, 'fitsfiles': fitsfiles, 'statusfile': statusfile}
+        fitsfiles.append(os.path.join(
+            imgoutdir,
+            f'eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb.disk.fits'))
+    statusfile = os.path.join(
+        day_outdir,
+        f'eovsa.synoptic_pipeline_status.{date_str}.{version}{tag}.json')
+    return {
+        'date_str': date_str,
+        'version': version,
+        'day_outdir': day_outdir,
+        'imgoutdir': imgoutdir,
+        'fitsfiles': fitsfiles,
+        'statusfile': statusfile,
+    }
 
 
-def summarize_synoptic_outputs(tim):
+def summarize_synoptic_outputs(tim, version='v3.0', fits_tag=''):
     """Summarize synoptic daily FITS availability for one pipeline day."""
-    info = get_synoptic_output_info(tim)
+    info = get_synoptic_output_info(tim, version=version, fits_tag=fits_tag)
     existing = [f for f in info['fitsfiles'] if os.path.exists(f)]
     return {
         **info,
@@ -286,7 +353,7 @@ def getspwfreq(vis):
     return cfreqs
 
 
-def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overwrite=True):
+def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overwrite=True, prefer_scan_ms=False):
     '''This finds all solar UDBms files within a timerange; If the UDBms file does not exist 
        in EOVSAUDBMSSCL, create one by calling importeovsa
        Required inputs:
@@ -301,6 +368,9 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
                   a list of ms files it has found.
        doscaling - Boolean. If true, scale cross-correlation amplitudes by using auto-correlations
        verbose - Boolean. If true, return more information
+       prefer_scan_ms - Boolean. If true, ignore the daily UDBYYYYMMDD.ms product
+                        and return/import reusable raw scan MS files named
+                        UDBYYYYMMDDhhmmss.ms.
     '''
     import glob
     if trange is None:
@@ -368,7 +438,7 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
 
     msfile_synoptic = os.path.join(outpath, 'UDB' + tdatetime.strftime("%Y%m%d") + '.ms')
 
-    if os.path.exists(msfile_synoptic):
+    if os.path.exists(msfile_synoptic) and not prefer_scan_ms:
         if overwrite and doimport:
             os.system(f'rm -rf {msfile_synoptic}*')
 
@@ -377,7 +447,7 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
     udbfilelist = sclist['scanlist']
     udbfilelist = [os.path.basename(ll) for ll in udbfilelist]
 
-    if os.path.exists(msfile_synoptic):
+    if os.path.exists(msfile_synoptic) and not prefer_scan_ms:
         return {'mspath': outpath, 'udbpath': inpath, 'udbfile': sorted(udbfilelist), 'udb2ms': [],
                 'ms': [msfile_synoptic],
                 'tstlist': sclist['tstlist'], 'tedlist': sclist['tedlist']}
@@ -412,23 +482,37 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
 
 def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearcache=False, verbose=False, pols='XX',
                    version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
-                   force_imaging_rerun=False):
-    ''' 
+                   force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model'):
+    '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
                       3) a single or a list of UDBms file(s)
                       4) None -- use current date Time.now()
+
+       cal_npz: optional path to a calwidget_v2 calibeovsa NPZ (e.g.
+                /common/webplots/phasecal/YYYYMMDD_calwidget_v2_calibeovsa.npz).
+                When provided and version is v3.0 or v3.1, calibration is read from the
+                NPZ via task_calibeovsa_test.calibeovsa instead of MySQL, and
+                outputs are tagged so they do not collide with the production
+                artefacts.
+       cal_tag: required output filename tag for cal_npz runs.
+       refcal_npz_mode: refcal apply mode for calwidget_v2 NPZ runs. ``triplet``
+                preserves the legacy ph+sbd+mbd path; ``smooth_model`` applies
+                sampled smooth refcal phase plus sbd and no refcal mbd table.
     '''
+
+    cal_tag = get_default_cal_tag(version, cal_tag) if cal_npz else ''
+    use_imported_scan_ms = bool(cal_npz)
 
     if workdir is None:
         workdir = workdir_default
     os.chdir(workdir)
     if isinstance(trange, Time):
-        mslist = trange2ms(trange=trange, doimport=False)
+        mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
         invis = mslist['ms']
     if isinstance(trange, str):
         try:
-            mslist = trange2ms(trange=trange, doimport=False)
+            mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
             invis = mslist['ms']
         except:
             invis = [trange]
@@ -441,71 +525,102 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
     tdate = trange.datetime
     vispath = os.path.join(udbmsdir, tdate.strftime('%Y%m'))
     vis = os.path.join(vispath, tdate.strftime('UDB%Y%m%d') + '.ms')
-    print(f'Trying to use visibility file: {vis}')
-    if os.path.exists(vis):
-        print(f'Visibility file {vis} exists.')
-        fileexist = True
+    if use_imported_scan_ms:
+        fileexist = bool(invis)
+        print('Trying to use imported scan-level UDB MS inputs for NPZ calibration.')
+        print(f'Imported scan-level UDB MS count: {len(invis)}')
     else:
-        if os.path.exists(f'{vis}.tar.gz'):
-            print(f'Visibility file {vis}.tar.gz exists. Extracting...')
+        print(f'Trying to use visibility file: {vis}')
+        if os.path.exists(vis):
+            print(f'Visibility file {vis} exists.')
             fileexist = True
-            vis= f'{vis}.tar.gz'
-            # os.system(f'tar -xzf {vis}.tar.gz -C {vispath}')
+        else:
+            if os.path.exists(f'{vis}.tar.gz'):
+                print(f'Visibility file {vis}.tar.gz exists. Extracting...')
+                fileexist = True
+                vis= f'{vis}.tar.gz'
+                # os.system(f'tar -xzf {vis}.tar.gz -C {vispath}')
 
     print(f'Visibility file exists: {fileexist}')
     if doimport:
         print(f'doimport: {doimport}')
-        if overwrite:
+        if overwrite and not use_imported_scan_ms:
             print('Overwriting existing visibility file...')
             fileexist = False
+        elif overwrite and use_imported_scan_ms:
+            print('Preserving imported scan-level UDB MS files; overwrite applies to downstream products.')
         elif fileexist:
             print('Visibility file already exists; reusing it instead of overwriting.')
 
-    if not fileexist:
+    if (not fileexist) or use_imported_scan_ms:
         if not doimport:
-            print('WARNING: No visibility file exists and doimport=False. Aborting without import.')
-            print(f'DEBUG calib_pipeline: trange={trange}, doimport={doimport}')
-            return None
+            if use_imported_scan_ms and fileexist:
+                print('Reusing imported scan-level UDB MS files; skipping importeovsa.')
+            else:
+                print('WARNING: No reusable visibility input exists and doimport=False. Aborting without import.')
+                print(f'DEBUG calib_pipeline: trange={trange}, doimport={doimport}')
+                return None
 
-        print('Visibility file does not exist. Running calibration pipeline...')
-        if isinstance(trange, Time):
-            mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite)
-            invis = mslist['ms']
-        if isinstance(trange, str):
-            try:
-                mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite)
+        if (not fileexist) or doimport:
+            print('Visibility input does not exist or import was requested. Running import lookup...')
+            if isinstance(trange, Time):
+                mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite,
+                                   prefer_scan_ms=use_imported_scan_ms)
                 invis = mslist['ms']
-            except:
-                invis = [trange]
+            if isinstance(trange, str):
+                try:
+                    mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite,
+                                       prefer_scan_ms=use_imported_scan_ms)
+                    invis = mslist['ms']
+                except:
+                    invis = [trange]
 
-        for idx, f in enumerate(invis):
-            invis[idx] = f.rstrip('/')
+            for idx, f in enumerate(invis):
+                invis[idx] = f.rstrip('/')
 
-        print("DEBUG calib_pipeline: trange2ms result")
-        print(f"  trange={trange}")
-        print(f"  doimport={doimport}")
-        print(f"  fileexist={fileexist}")
-        print(f"  mslist.keys()={list(mslist.keys())}")
-        print(f"  n_invis={len(invis)}")
-        print(f"  invis={invis}")
-        print(f"  mspath={mslist.get('mspath')}")
-        print(f"  udbpath={mslist.get('udbpath')}")
-        print(f"  udbfile={mslist.get('udbfile')}")
-        print(f"  udb2ms={mslist.get('udb2ms')}")
+            print("DEBUG calib_pipeline: trange2ms result")
+            print(f"  trange={trange}")
+            print(f"  doimport={doimport}")
+            print(f"  fileexist={fileexist}")
+            print(f"  prefer_scan_ms={use_imported_scan_ms}")
+            print(f"  mslist.keys()={list(mslist.keys())}")
+            print(f"  n_invis={len(invis)}")
+            print(f"  invis={invis}")
+            print(f"  mspath={mslist.get('mspath')}")
+            print(f"  udbpath={mslist.get('udbpath')}")
+            print(f"  udbfile={mslist.get('udbfile')}")
+            print(f"  udb2ms={mslist.get('udb2ms')}")
 
         if not invis:
-            print('WARNING: Import was requested but no MS files were returned. Aborting.')
+            print('WARNING: No MS files were returned. Aborting.')
             print(f'DEBUG calib_pipeline: mslist={mslist}')
             return None
 
-        outputvis = os.path.join(os.path.dirname(invis[0]), os.path.basename(invis[0])[:11] + '.ms')
+        cal_invis = stage_cal_npz_inputs(invis, workdir, cal_tag) if use_imported_scan_ms else invis
+        daily_ms_tag = f'.{cal_tag}' if cal_tag else ''
+        outputvis = os.path.join(
+            os.path.dirname(cal_invis[0]),
+            os.path.basename(cal_invis[0])[:11] + f'{daily_ms_tag}.ms')
+        if use_imported_scan_ms and os.path.exists(outputvis):
+            remove_path(outputvis)
         tdate = get_tdate_from_basename(outputvis)
         flagant = '13~15' if Time(tdate).mjd >= EOVSA15_UPGRADE_DATE.mjd else '15'
-        vis = calibeovsa(invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
-                         doflag=True,
-                         flagant=flagant,
-                         doimage=False, doconcat=True,
-                         concatvis=outputvis, keep_orig_ms=False)
+        if cal_npz:
+            # Bypass the auto-generated CASA wrapper (which does not expose
+            # cal_npz) and call the private task module directly.
+            vis = calibeovsa_npz(cal_invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
+                                 doflag=True,
+                                 flagant=flagant,
+                                 doimage=False, doconcat=True,
+                                 concatvis=outputvis, keep_orig_ms=False,
+                                 keep_corrected_column=True,
+                                 cal_npz=cal_npz, refcal_npz_mode=refcal_npz_mode)
+        else:
+            vis = calibeovsa(cal_invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
+                             doflag=True,
+                             flagant=flagant,
+                             doimage=False, doconcat=True,
+                             concatvis=outputvis, keep_orig_ms=False)
     else:
         if verbose:
             print(f'Using existing visibility file: {vis}')
@@ -518,17 +633,18 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
     outpath = os.path.join(udbmspath, tdate.strftime('%Y%m')) + '/'
     if not os.path.exists(outpath):
         os.makedirs(outpath)
-    imgoutdir = os.path.join(qlookfitsdir, tdate.strftime("%Y/%m/%d/"))
+    imgoutdir = get_synoptic_product_output_dir(Time(tdate), version)
     if not os.path.exists(imgoutdir):
         os.makedirs(imgoutdir)
     figoutdir = os.path.join(synopticfigdir, tdate.strftime("%Y/"))
     if not os.path.exists(figoutdir):
         os.makedirs(figoutdir)
 
+    ms_tag = f'.{cal_tag}' if cal_tag else ''
     if version == 'v1.0':
-        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + '.ms')
+        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'{ms_tag}.ms')
     else:
-        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'.{version}.ms')
+        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'.{version}{ms_tag}.ms')
     slfcaltbdir_path = os.path.join(slfcaltbdir, tdate.strftime('%Y%m')) + '/'
 
     if verbose:
@@ -543,7 +659,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'clearcache': clearcache,
                'pols': pols, 'ncpu': ncpu})
     overwrite_pipeline = overwrite or force_imaging_rerun
-    if force_imaging_rerun and version == 'v3.0':
+    if force_imaging_rerun and version in WSCLEAN_PIPELINE_VERSIONS:
         print(f'Cron recovery mode enabled for {tdate.strftime("%Y-%m-%d")}: rerunning imaging despite existing outputvis.')
 
     if version == 'v1.0':
@@ -558,16 +674,17 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 slfcaltbdir=slfcaltbdir_path,
                                 imgoutdir=imgoutdir, figoutdir=figoutdir, clearcache=clearcache, pols=pols, ncpu=ncpu,
                                 overwrite=overwrite)
-    elif version == 'v3.0':
+    elif version in WSCLEAN_PIPELINE_VERSIONS:
         from suncasa.eovsa import eovsa_synoptic_imaging_pipeline_wsclean as esip
         vis = esip.pipeline_run(vis, outputvis=output_file_path,
                                 workdir=workdir,
                                 slfcaltbdir=slfcaltbdir_path,
-                                imgoutdir=imgoutdir, pols=pols, overwrite=overwrite_pipeline)
+                                imgoutdir=imgoutdir, pols=pols, overwrite=overwrite_pipeline,
+                                fits_tag=cal_tag)
         if clearcache:
             os.system(f'rm -rf {workdir}/*')
     else:
-        print(f'Version {version} is not supported. Valid versions are v1.0, v2.0, and v3.0. Use the default version 1.0.')
+        print(f'Version {version} is not supported. Valid versions are {", ".join(SUPPORTED_PIPELINE_VERSIONS)}. Use the default version 1.0.')
         vis = ed.pipeline_run(vis, outputvis=output_file_path,
                               workdir=workdir,
                               slfcaltbdir=slfcaltbdir_path,
@@ -946,7 +1063,7 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
 
 def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrite=False, doimport=True, pols='XX',
              version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
-             smart_cal_check=None):
+             smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model'):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -976,9 +1093,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :type overwrite: bool, optional
     :param doimport: Whether to perform the import step, defaults to True.
     :type doimport: bool, optional
-    :param pols: Polarizations to process, can be 'XX' or 'XXYY', defaults to 'XX'.
+    :param pols: Polarizations to process, can be 'XX', 'YY', or 'XXYY', defaults to 'XX'.
     :type pols: str, optional
-    :param version: Version of the pipeline to use, choices are 'v1.0' or 'v2.0', defaults to 'v1.0'.
+    :param version: Version of the pipeline to use, choices are 'v1.0', 'v2.0', 'v3.0', or 'v3.1', defaults to 'v1.0'.
     :type version: str, optional
     :param ncpu: Number of CPUs to use for processing, defaults to 'auto'.
     :type ncpu: str, optional
@@ -995,6 +1112,12 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         after the observing-day label, then allows the run to proceed with the latest
         calibration records available in MySQL.
     :type smart_cal_check: bool, optional
+    :param cal_npz: optional path to a calwidget_v2 calibeovsa NPZ.
+    :type cal_npz: str, optional
+    :param cal_tag: required output filename tag for cal_npz runs.
+    :type cal_tag: str, optional
+    :param refcal_npz_mode: refcal apply mode for calwidget_v2 NPZ runs.
+    :type refcal_npz_mode: str, optional
 
     :raises ValueError: Raises an exception if the date parameters are out of the valid Gregorian calendar range.
 
@@ -1009,6 +1132,15 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     >>> python eovsa_pipeline.py -h
     """
     smart_cal_check = should_enable_smart_cal_check(smart_cal_check)
+    if cal_npz:
+        # Calwidget_v2 NPZ supplies refcal+phacal directly, so MySQL readiness
+        # gating is not applicable. Disable smart_cal_check in test runs to
+        # avoid querying SQL for records the run is intentionally bypassing.
+        smart_cal_check = False
+        cal_tag = get_default_cal_tag(version, cal_tag)
+    else:
+        cal_tag = ''
+    fits_tag = cal_tag
     workdir = workdir_default
     os.chdir(workdir)
     if year is None:
@@ -1022,9 +1154,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     for d in range(ndays):
         t1 = Time(t.mjd - d, format='mjd')
         datestr = t1.iso[:10]
-        synoptic_info = summarize_synoptic_outputs(t1)
+        synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
         statusfile = synoptic_info['statusfile']
-        if smart_cal_check and version == 'v3.0':
+        is_wsclean_version = version in WSCLEAN_PIPELINE_VERSIONS
+        if smart_cal_check and is_wsclean_version:
             readiness = {}
             run_state = 'running'
             if synoptic_info['fits_complete']:
@@ -1100,18 +1233,20 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
             vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
                                            workdir=subdir, clearcache=False, pols=pols, version=version, ncpu=ncpu,
                                            caltype=caltype, interp=interp,
-                                           force_imaging_rerun=smart_cal_check and version == 'v3.0')
+                                           force_imaging_rerun=smart_cal_check and is_wsclean_version,
+                                           cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
                                                workdir=subdir, clearcache=False, pols=pols, version=version, ncpu=ncpu,
                                                caltype=caltype, interp=interp,
-                                               force_imaging_rerun=smart_cal_check and version == 'v3.0')
+                                               force_imaging_rerun=smart_cal_check and is_wsclean_version,
+                                               cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
-                if smart_cal_check and version == 'v3.0':
-                    synoptic_info = summarize_synoptic_outputs(t1)
+                if smart_cal_check and is_wsclean_version:
+                    synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
                     write_pipeline_status(
                         statusfile,
                         'failed',
@@ -1128,8 +1263,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                         latest_phacal_timestamp_utc=readiness.get('latest_phacal_timestamp_utc'),
                     )
                 continue
-        if smart_cal_check and version == 'v3.0':
-            synoptic_info = summarize_synoptic_outputs(t1)
+        if smart_cal_check and is_wsclean_version:
+            synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
             outputvis_root = os.path.join(
                 udbmsslfcaleddir,
                 t1.datetime.strftime('%Y%m'),
@@ -1171,9 +1306,10 @@ if __name__ == '__main__':
                         help='Process data from DATE_IN_YY_MM_DD-ndays to DATE_IN_YY_MM_DD, default is 1.')
     parser.add_argument('--overwrite', action='store_true', default=False, help='Overwrite existing processed data')
     parser.add_argument('--doimport', action='store_true', default=False, help='Perform import step before processing')
-    parser.add_argument('--pols', type=str, default='XX', choices=['XX', 'XXYY'], help='Polarizations to process')
+    parser.add_argument('--pols', type=str, default='XX', choices=['XX', 'YY', 'XXYY'],
+                        help='Polarizations to process')
     parser.add_argument('--ncpu', type=str, default='auto', help='Number of CPUs to use for processing')
-    parser.add_argument('--version', type=str, default='v3.0', choices=['v1.0', 'v2.0', 'v3.0'],
+    parser.add_argument('--version', type=str, default='v3.0', choices=SUPPORTED_PIPELINE_VERSIONS,
                         help='Version of the EOVSA pipeline to use')
     parser.add_argument('--debugging', action='store_true', default=False, help='Run the pipeline in debugging mode')
     parser.add_argument('--caltype', type=str, nargs='+', default=['refpha', 'phacal'],
@@ -1187,6 +1323,21 @@ if __name__ == '__main__':
                         help='For cron-style runs, wait for same-day observer-written refcal/phacal records until '
                              '04:00 UTC two days later, then run with the latest MySQL calibrations; also track '
                              'per-day status and allow imaging reruns when outputvis exists but daily FITS are incomplete.')
+    parser.add_argument('--cal-npz', type=str, default=None,
+                        help='Path to a calwidget_v2 calibeovsa NPZ '
+                             '(e.g. /common/webplots/phasecal/YYYYMMDD_calwidget_v2_calibeovsa.npz). '
+                             'When provided, calibration is read from the NPZ instead of MySQL via '
+                             'suncasa.suncasatasks.private.task_calibeovsa_test, outputs are tagged with '
+                             '--cal-tag (required for cal-npz runs) '
+                             'so they do not collide with production artefacts, '
+                             'and --smart-cal-check is '
+                             'force-disabled because MySQL-readiness gating does not apply.')
+    parser.add_argument('--cal-tag', type=str, default=None,
+                        help='Tag for cal-npz test outputs. Required for cal-npz runs. '
+                             'Used for both FITS and MS products.')
+    parser.add_argument('--refcal-npz-mode', type=str, default='smooth_model', choices=['triplet', 'smooth_model'],
+                        help='Refcal apply mode for calwidget_v2 NPZ runs. '
+                             'triplet preserves ph+sbd+mbd; smooth_model uses sampled smooth phase plus sbd only.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1199,4 +1350,5 @@ if __name__ == '__main__':
 
     # Run the main pipeline function
     pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
-             args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check)
+             args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
+             args.cal_npz, args.cal_tag, args.refcal_npz_mode)
