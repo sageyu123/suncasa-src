@@ -44,7 +44,6 @@ from suncasa.casa_compat import import_casatasks
 from suncasa.utils import helioimage2fits as hf
 from suncasa.utils import mstools as mstl
 from suncasa.eovsa import wrap_wsclean as ww
-from suncasa.io import ndfits
 from astropy.io import fits
 from astropy.convolution import Gaussian2DKernel, convolve
 import numpy as np
@@ -91,34 +90,6 @@ qa = qatool()
 ia = iatool()
 ms = mstool()
 tb = tbtool()
-
-
-def write_compressed_fits(out_fits, data, header, overwrite=True):
-    status = ndfits.write(
-        out_fits,
-        np.asarray(data).copy(),
-        header.copy(),
-        overwrite=overwrite,
-        compression_type='RICE_1',
-        quantize_level=4.0,
-    )
-    if status != 1:
-        raise ValueError(f'Failed to write compressed FITS: {out_fits}')
-    return out_fits
-
-
-def write_compressed_fits_from_file(in_fits, out_fits, overwrite=True):
-    with fits.open(in_fits, memmap=False) as hdul:
-        image_hdu = None
-        for hdu in hdul:
-            if hdu.data is not None and hdu.header.get('NAXIS', 0) > 0:
-                image_hdu = hdu
-                break
-        if image_hdu is None:
-            raise ValueError(f'No image HDU found in {in_fits}')
-        data = np.asarray(image_hdu.data).copy()
-        header = image_hdu.header.copy()
-    return write_compressed_fits(out_fits, data, header, overwrite=overwrite)
 
 
 def _resolve_wsclean_bin():
@@ -1359,7 +1330,7 @@ def add_convolved_disk_to_fits(
         if no_negative:
             dat[dat < 0] = 0
         out_data = diskmodel_conv if ignore_data else dat + diskmodel_conv
-        write_compressed_fits(outf, out_data, hdr, overwrite=True)
+        fits.writeto(outf, out_data, hdr, overwrite=True)
 
         dat_disk = dat_squeeze[mask_disk]
         p100, p9999, p50 = np.nanpercentile(dat_disk, [100, 99.99, 50])
@@ -1713,7 +1684,7 @@ def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
         seconds=exptime / 2.0)
     newheader.update({'EXPTIME': exptime, 'DATE-OBS': date_obs.strftime('%Y-%m-%dT%H:%M:%S')})
     newheader['HISTORY'] = 'Merged from multiple images'
-    write_compressed_fits(outfits, date_merged, newheader, overwrite=overwrite)
+    fits.writeto(outfits, date_merged, newheader, overwrite=overwrite)
     log_print('INFO',
               f'{np.count_nonzero(deselect_index)} out of {len(fitsfilesin)} images (index{np.where(deselect_index)}) are not selected for merging due to low SNR.')
     return outfits
@@ -2211,7 +2182,7 @@ def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
                     model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp_int:02d}_adddisk'])
                     cmd = f"{WSCLEAN_BIN} -predict -reorder -spws {sp} -pol {pols} -name {model_imname} -quiet -intervals-out 1 {msfile}"
             log_print('INFO', f"Running WSClean predict: {cmd}")
-            subprocess.run(cmd, shell=True, check=False)
+            subprocess.run(cmd, shell=True, check=True)
 
         elapsed = (datetime.now() - run_start).total_seconds() / 60
         log_print('INFO', f"Disk self-calibration for SPW {spwstr}: completed in {elapsed:.1f} minutes")
@@ -2261,7 +2232,7 @@ def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
                 sp_int = int(sp)
                 model_imname = '-'.join(imname_init_disk_strlist + [f'sp{sp_int:02d}_adddisk'])
                 cmd = f"{WSCLEAN_BIN} -predict -reorder -spws {sp} -pol {pols} -name {model_imname} -quiet -intervals-out 1 {msfile}"
-                subprocess.run(cmd, shell=True, check=False)
+                subprocess.run(cmd, shell=True, check=True)
         log_print('INFO', f'Subtracting disk model from the data for SPW {spw}')
         uvsub(vis=msfile)
         elapsed_sub = (datetime.now() - run_start_sub).total_seconds() / 60
@@ -2350,7 +2321,7 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
             model_dir_name_str = imaging_objs[sidx].model_ref_name_str
             cmd = (f"{WSCLEAN_BIN} -predict -reorder -spws {sp_index} "
                    f"-pol {pols} -name {model_dir_name_str} -quiet -intervals-out {ri_final['N1']} {msfile}")
-            subprocess.run(cmd, shell=True, check=False)
+            subprocess.run(cmd, shell=True, check=True)
             uvsub(vis=msfile, reverse=True)
 
             imname_strlist = ["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']
@@ -2401,8 +2372,8 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
             synfitsfile = os.path.join(imgoutdir,
                                        f"eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb.fits")
         synfitsfiles.append(synfitsfile)
-        log_print('INFO', f"Writing compressed FITS {eofile} to {synfitsfile} ...")
-        write_compressed_fits_from_file(eofile, synfitsfile, overwrite=True)
+        log_print('INFO', f"Copying {eofile} to {synfitsfile} ...")
+        shutil.copy2(eofile, synfitsfile)
 
     return synfitsfiles, imaging_objs
 
