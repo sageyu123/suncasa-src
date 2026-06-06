@@ -162,8 +162,18 @@ qlookfigdir = pathconfig.qlookfigdir
 synopticfigdir = pathconfig.synopticfigdir
 workdir_default = pathconfig.workdir_default
 
-SUPPORTED_PIPELINE_VERSIONS = ('v1.0', 'v2.0', 'v3.0', 'v3.1')
-WSCLEAN_PIPELINE_VERSIONS = ('v3.0', 'v3.1')
+SUPPORTED_PIPELINE_VERSIONS = (
+    'v1.0',
+    'v2.0',
+    'v3.0',
+    'v3.1',
+    'v3.1_alt',
+)
+WSCLEAN_PIPELINE_VERSIONS = (
+    'v3.0',
+    'v3.1',
+    'v3.1_alt',
+)
 
 
 def get_synoptic_day_output_dir(tim):
@@ -482,7 +492,8 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
 
 def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearcache=False, verbose=False, pols='XX',
                    version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
-                   force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model'):
+                   force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
+                   secondary_npz=None):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -498,7 +509,12 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
        cal_tag: required output filename tag for cal_npz runs.
        refcal_npz_mode: refcal apply mode for calwidget_v2 NPZ runs. ``triplet``
                 preserves the legacy ph+sbd+mbd path; ``smooth_model`` applies
-                sampled smooth refcal phase plus sbd and no refcal mbd table.
+                sampled smooth refcal phase plus sbd and no refcal mbd table;
+                ``bph_sbd`` applies saved band phase plus sbd and no refcal mbd
+                table.
+       secondary_npz: optional secondary calwidget_v2 calibeovsa NPZ. In
+                ``bph_sbd`` runs, finite/unflagged secondary BPH fills missing
+                primary BPH slots while primary SBD remains authoritative.
     '''
 
     cal_tag = get_default_cal_tag(version, cal_tag) if cal_npz else ''
@@ -614,7 +630,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  doimage=False, doconcat=True,
                                  concatvis=outputvis, keep_orig_ms=False,
                                  keep_corrected_column=True,
-                                 cal_npz=cal_npz, refcal_npz_mode=refcal_npz_mode)
+                                 cal_npz=cal_npz, refcal_npz_mode=refcal_npz_mode,
+                                 secondary_npz=secondary_npz)
         else:
             vis = calibeovsa(cal_invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
                              doflag=True,
@@ -1063,7 +1080,8 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
 
 def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrite=False, doimport=True, pols='XX',
              version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
-             smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model'):
+             smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
+             secondary_npz=None):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1118,6 +1136,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :type cal_tag: str, optional
     :param refcal_npz_mode: refcal apply mode for calwidget_v2 NPZ runs.
     :type refcal_npz_mode: str, optional
+    :param secondary_npz: optional secondary calwidget_v2 calibeovsa NPZ for
+        BPH fill in ``bph_sbd`` runs.
+    :type secondary_npz: str, optional
 
     :raises ValueError: Raises an exception if the date parameters are out of the valid Gregorian calendar range.
 
@@ -1234,14 +1255,16 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            workdir=subdir, clearcache=False, pols=pols, version=version, ncpu=ncpu,
                                            caltype=caltype, interp=interp,
                                            force_imaging_rerun=smart_cal_check and is_wsclean_version,
-                                           cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode)
+                                           cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
+                                           secondary_npz=secondary_npz)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
                                                workdir=subdir, clearcache=False, pols=pols, version=version, ncpu=ncpu,
                                                caltype=caltype, interp=interp,
                                                force_imaging_rerun=smart_cal_check and is_wsclean_version,
-                                               cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode)
+                                               cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
+                                               secondary_npz=secondary_npz)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1332,12 +1355,18 @@ if __name__ == '__main__':
                              'so they do not collide with production artefacts, '
                              'and --smart-cal-check is '
                              'force-disabled because MySQL-readiness gating does not apply.')
+    parser.add_argument('--secondary-npz', type=str, default=None,
+                        help='Optional secondary calwidget_v2 calibeovsa NPZ. In bph_sbd runs, '
+                             'finite/unflagged secondary BPH fills missing primary BPH slots; '
+                             'primary SBD remains authoritative.')
     parser.add_argument('--cal-tag', type=str, default=None,
                         help='Tag for cal-npz test outputs. Required for cal-npz runs. '
                              'Used for both FITS and MS products.')
-    parser.add_argument('--refcal-npz-mode', type=str, default='smooth_model', choices=['triplet', 'smooth_model'],
+    parser.add_argument('--refcal-npz-mode', type=str, default='smooth_model',
+                        choices=['triplet', 'smooth_model', 'bph_sbd'],
                         help='Refcal apply mode for calwidget_v2 NPZ runs. '
-                             'triplet preserves ph+sbd+mbd; smooth_model uses sampled smooth phase plus sbd only.')
+                             'triplet preserves ph+sbd+mbd; smooth_model uses sampled smooth phase plus sbd only; '
+                             'bph_sbd uses saved band phase plus sbd only.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1351,4 +1380,4 @@ if __name__ == '__main__':
     # Run the main pipeline function
     pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
              args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
-             args.cal_npz, args.cal_tag, args.refcal_npz_mode)
+             args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz)

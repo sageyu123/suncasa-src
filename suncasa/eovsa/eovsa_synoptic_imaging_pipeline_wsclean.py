@@ -41,6 +41,7 @@ from typing import NamedTuple, List, Union
 from scipy.signal import fftconvolve
 import numbers
 from suncasa.casa_compat import import_casatasks
+from suncasa.io import ndfits
 from suncasa.utils import helioimage2fits as hf
 from suncasa.utils import mstools as mstl
 from suncasa.eovsa import wrap_wsclean as ww
@@ -232,6 +233,58 @@ def _format_log_state(**state):
 def log_step(level, step, message, **state):
     """Emit a log line with an explicit pipeline step and state summary."""
     log_print(level, f"[{step}] {message} | {_format_log_state(**state)}")
+
+
+def _write_compressed_synoptic_fits(src_fits, dst_fits, overwrite=True):
+    """Write a tiled-compressed FITS copy for final synoptic products."""
+    dst_tmp = dst_fits
+    inplace = os.path.abspath(src_fits) == os.path.abspath(dst_fits)
+    if inplace:
+        dst_tmp = f"{dst_fits}.tmp_compressed"
+
+    with fits.open(src_fits, memmap=False) as hdul:
+        if any(isinstance(hdu, fits.hdu.CompImageHDU) for hdu in hdul):
+            if not inplace or src_fits != dst_tmp:
+                shutil.copy2(src_fits, dst_tmp)
+        else:
+            compressed_hdus = []
+            for hdu_idx, hdu in enumerate(hdul):
+                is_image_hdu = isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU))
+                if hdu_idx == 0:
+                    if hdu.data is None:
+                        compressed_hdus.append(fits.PrimaryHDU(header=hdu.header.copy()))
+                    else:
+                        compressed_hdus.append(fits.PrimaryHDU())
+
+                if is_image_hdu and hdu.data is not None:
+                    data = np.array(hdu.data)
+                    nonsingleton_ndim = data.ndim - np.count_nonzero(np.array(data.shape) == 1)
+                    if nonsingleton_ndim > 3:
+                        log_print('WARNING',
+                                  f"Skipping FITS compression for {src_fits}: "
+                                  f"image has {nonsingleton_ndim} non-singleton dimensions")
+                        if not inplace:
+                            shutil.copy2(src_fits, dst_fits)
+                        return dst_fits
+                    header, data = ndfits.headersqueeze(hdu.header.copy(), data)
+                    compressed_hdus.append(fits.CompImageHDU(
+                        data=data, header=header, compression_type='RICE_1', quantize_level=4.0))
+                elif hdu_idx > 0:
+                    compressed_hdus.append(hdu.copy())
+
+            fits.HDUList(compressed_hdus).writeto(dst_tmp, overwrite=overwrite, output_verify='fix')
+
+    if inplace:
+        os.replace(dst_tmp, dst_fits)
+    return dst_fits
+
+
+def _compress_synoptic_fits_in_place(fitsfiles):
+    """Compress final synoptic FITS files after all WSClean-facing steps are done."""
+    files = [fitsfiles] if isinstance(fitsfiles, str) else list(fitsfiles)
+    for fitsfile in files:
+        if fitsfile and os.path.exists(fitsfile):
+            _write_compressed_synoptic_fits(fitsfile, fitsfile)
 
 
 @contextmanager
@@ -2100,49 +2153,77 @@ def _compute_uv_ranges(spws_indices, spws, freq, spwidx2proc):
     return uvmin_l_str
 
 
-def _prepare_single_pol_ms(msfile, workdir, msname, pols, overwrite=False):
-    """Return a single-correlation working MS for YY diagnostic runs."""
+def _validate_xx_yy_correlation_order(msfile):
+    """Verify the working MS stores XX and YY in the first two correlation slots."""
+    poltb = os.path.join(msfile, 'POLARIZATION')
+    tb.open(poltb)
+    try:
+        for row in range(tb.nrows()):
+            corr_type = tb.getcell('CORR_TYPE', row)
+            if corr_type.shape[0] < 2 or int(corr_type[0]) != 9 or int(corr_type[1]) != 12:
+                raise RuntimeError(
+                    f"Expected CORR_TYPE [XX, YY, ...] in {poltb} row {row}; got {corr_type.tolist()}")
+    finally:
+        tb.close()
+
+
+def _swap_xx_yy_data_columns(msfile):
+    """Swap XX and YY data-like columns in-place without changing MS metadata."""
+    _validate_xx_yy_correlation_order(msfile)
+    swap_columns = [
+        'DATA', 'CORRECTED_DATA', 'MODEL_DATA', 'FLAG',
+        'WEIGHT', 'SIGMA', 'WEIGHT_SPECTRUM', 'SIGMA_SPECTRUM',
+    ]
+    tb.open(msfile, nomodify=False)
+    try:
+        columns = [col for col in swap_columns if col in tb.colnames()]
+        ddids = sorted(set(int(x) for x in tb.getcol('DATA_DESC_ID')))
+        log_print('INFO', f"Swapping XX/YY slots in {os.path.basename(msfile)} columns {columns}")
+        for ddid in ddids:
+            subtable = tb.query(f'DATA_DESC_ID == {ddid}')
+            try:
+                for col in columns:
+                    values = subtable.getcol(col)
+                    if values.shape[0] < 2:
+                        continue
+                    swapped = values.copy()
+                    swapped[0] = values[1]
+                    swapped[1] = values[0]
+                    subtable.putcol(col, swapped)
+            finally:
+                subtable.close()
+        tb.flush()
+    finally:
+        tb.close()
+
+
+def _prepare_yy_as_xx_ms(msfile, workdir, msname, pols, overwrite=False):
+    """Return a YY-as-XX full-correlation working MS for YY diagnostic runs."""
     pol = str(pols).upper().replace(',', '')
-    yy_as_xx = pol == 'YY_AS_XX'
     if pol not in ('YY', 'YY_AS_XX'):
         return msfile, msname
 
-    pol_msname = f'{msname}.YYasXX' if yy_as_xx else f'{msname}.{pol}'
+    pol_msname = f'{msname}.YYasXX'
     pol_msfile = os.path.join(workdir, f'{pol_msname}.ms')
+    swap_marker = os.path.join(pol_msfile, '.yy_as_xx_swap_done')
     if os.path.isdir(pol_msfile):
         if overwrite:
             shutil.rmtree(pol_msfile, ignore_errors=True)
         else:
-            log_print('INFO', f"Using existing {pol}-only working MS {pol_msfile}")
+            _validate_xx_yy_correlation_order(pol_msfile)
+            if not os.path.exists(swap_marker):
+                raise RuntimeError(
+                    f"Existing YY-as-XX working MS is missing swap marker; rerun with overwrite=True: {pol_msfile}")
+            log_print('INFO', f"Using existing YY-as-XX working MS {pol_msfile}")
             return pol_msfile, pol_msname
 
-    log_print('INFO', f"Creating YY-only working MS {pol_msfile} from {msfile}")
-    split(vis=msfile, outputvis=pol_msfile, correlation='YY', datacolumn='data')
+    log_print('INFO', f"Creating YY-as-XX working MS {pol_msfile} from {msfile}")
+    shutil.copytree(msfile, pol_msfile)
     if not os.path.isdir(pol_msfile):
-        raise RuntimeError(f"Failed to create YY-only working MS: {pol_msfile}")
-    if yy_as_xx:
-        poltb = os.path.join(pol_msfile, 'POLARIZATION')
-        tb.open(poltb, nomodify=False)
-        relabeled_rows = 0
-        try:
-            for row in range(tb.nrows()):
-                corr_type = tb.getcell('CORR_TYPE', row)
-                corr_product = tb.getcell('CORR_PRODUCT', row)
-                if corr_type.shape[0] == 0:
-                    continue
-                if corr_type.shape[0] != 1:
-                    raise RuntimeError(
-                        f"Expected one correlation in {poltb} row {row}; got CORR_TYPE shape {corr_type.shape}")
-                corr_type[...] = 9  # CASA Stokes enum: XX
-                corr_product[...] = 0  # receptor X,X
-                tb.putcell('CORR_TYPE', row, corr_type)
-                tb.putcell('CORR_PRODUCT', row, corr_product)
-                relabeled_rows += 1
-        finally:
-            tb.close()
-        if relabeled_rows == 0:
-            raise RuntimeError(f"No populated polarization rows found in {poltb}")
-        log_print('INFO', f"Relabeled YY-only working MS as XX for downstream diagnostic path: {pol_msfile} ({relabeled_rows} row(s))")
+        raise RuntimeError(f"Failed to create YY-as-XX working MS: {pol_msfile}")
+    _swap_xx_yy_data_columns(pol_msfile)
+    with open(swap_marker, 'w') as marker:
+        marker.write('XX and YY data-like columns swapped; metadata intentionally unchanged.\n')
     return pol_msfile, pol_msname
 
 
@@ -2372,8 +2453,11 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
             synfitsfile = os.path.join(imgoutdir,
                                        f"eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb.fits")
         synfitsfiles.append(synfitsfile)
-        log_print('INFO', f"Copying {eofile} to {synfitsfile} ...")
-        shutil.copy2(eofile, synfitsfile)
+        log_print('INFO', f"Writing compressed synoptic FITS {synfitsfile} from {eofile} ...")
+        # Keep every WSClean-facing FITS uncompressed. WSClean cannot read the
+        # tiled-compressed FITS files written below, and moving compression
+        # earlier in the model/imaging path breaks later WSClean predict runs.
+        _write_compressed_synoptic_fits(eofile, synfitsfile)
 
     return synfitsfiles, imaging_objs
 
@@ -2509,9 +2593,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             else:
                 raise ValueError(f"Unsupported file format: {msfile}")
         msfile = msfile_copy
-        msfile, msname = _prepare_single_pol_ms(msfile, workdir, msname, pols, overwrite=overwrite)
-        if str(pols).upper().replace(',', '') == 'YY_AS_XX':
-            log_print('INFO', "Using YY data relabeled as XX for downstream diagnostic imaging")
+        msfile, msname = _prepare_yy_as_xx_ms(msfile, workdir, msname, pols, overwrite=overwrite)
+        if str(pols).upper().replace(',', '') in ('YY', 'YY_AS_XX'):
+            log_print('INFO', "Using YY data swapped into the XX slot for downstream diagnostic imaging")
             pols = 'XX'
 
         viz_timerange = ant_trange(msfile)
@@ -2799,6 +2883,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         log_print('ERROR', f"[postprocess:add_disk] failed | "
                                            f"{_format_log_state(spw=spw, spwstr=spwstr, n_synfits=len(synfitsfiles))}\n"
                                            f"{traceback.format_exc()}")
+                    _compress_synoptic_fits_in_place(
+                        synfitsfiles + [outfits] + synfitsfiles_disk + [outfits_disk])
                 else:
                     log_print('WARNING', f"No synoptic images found for SPW {spwstr}. Skipping merge_FITSfiles.")
             else:
@@ -2808,6 +2894,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     add_convolved_disk_to_fits([outfits], [outfits_disk], dszs, fdns,
                                                ignore_data=False, toTb=True,
                                                rfreq=reffreq, bmaj=bmsize / 3600.)
+                    _compress_synoptic_fits_in_place([outfits, outfits_disk])
                 else:
                     log_print('WARNING', f"No synoptic image found for SPW {spwstr}. Skipping disk addition.")
 
