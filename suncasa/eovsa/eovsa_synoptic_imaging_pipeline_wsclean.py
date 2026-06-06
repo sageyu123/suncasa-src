@@ -1533,6 +1533,42 @@ def format_spw(spw):
     return '-'.join(['{:02d}'.format(int(sp_)) for sp_ in spw.split('~')])
 
 
+def _spw_range_bounds(spw):
+    parts = str(spw).split('~')
+    if len(parts) == 1:
+        start = end = int(parts[0])
+    elif len(parts) == 2:
+        start, end = (int(part) for part in parts)
+    else:
+        raise ValueError(f"Invalid SPW range {spw!r}")
+    if end < start:
+        raise ValueError(f"Invalid descending SPW range {spw!r}")
+    return start, end
+
+
+def _spw_indices_for_range(spw):
+    start, end = _spw_range_bounds(spw)
+    return ','.join(str(sp) for sp in range(start, end + 1))
+
+
+def _fine_spectral_spws_for_range(spw):
+    """Split one coarse SPW range into 2-band chunks, using a leading 3-band chunk for odd counts."""
+    start, end = _spw_range_bounds(spw)
+    nspw = end - start + 1
+    if nspw <= 3:
+        return [f'{start}~{end}']
+
+    chunks = []
+    cursor = start
+    if nspw % 2:
+        chunks.append(f'{cursor}~{cursor + 2}')
+        cursor += 3
+    while cursor <= end:
+        chunks.append(f'{cursor}~{min(cursor + 1, end)}')
+        cursor += 2
+    return chunks
+
+
 class FrequencySetup:
     """
     Manages frequency setup based on observation date for radio astronomy imaging.
@@ -2467,7 +2503,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  pols='XX', verbose=True, hanning=False, do_sbdcal=False,
                  overwrite=False, overwrite_caltb=True, mergeFITSonly=False,
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
-                 spws_imaging=None, fits_tag=''):
+                 spws_imaging=None, fits_tag='', fine_spectral_imaging=False):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -2512,7 +2548,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
     :type tr_series_imaging: list, optional
     :param spws_imaging: Spectral windows to process. If provided, overrides the default spwidx2proc.
     :type spws_imaging: list, optional
-    :return: Dictionary mapping spectral window index to output FITS file paths.
+    :param fine_spectral_imaging: If True, run an additional final-imaging pass
+        on finer SPW chunks after the standard final-imaging pass.
+    :type fine_spectral_imaging: bool, optional
+    :return: Dictionary mapping coarse indexes and fine SPW keys to output FITS file paths.
     :rtype: dict
     """
     with pipeline_stage(
@@ -2526,6 +2565,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         overwrite=overwrite,
         ncpu=ncpu,
         spws_imaging=spws_imaging,
+        fine_spectral_imaging=fine_spectral_imaging,
     ):
         if os.path.exists(outputvis) and not overwrite:
             log_print('INFO', f"Output MS file {outputvis} already exists. Skipping processing.")
@@ -2625,6 +2665,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         briggs = {}
         fits_mask = {}
         imaging_objs = {}
+        fine_imaging_spws = {}
+        fine_postprocess_items = []
         spws = freq_setup.spws
         defaultfreq = freq_setup.defaultfreq
         freq = defaultfreq
@@ -2641,6 +2683,19 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             ## testing with segmented imaging for all bands for now with the npz calibration, will revert to the above after validation
             segmented_imaging[sidx] = True if sidx in [0, 1, 2, 3, 4, 5, 6] else False
             briggs[sidx] = briggs_[sidx]
+
+        if fine_spectral_imaging:
+            for sidx, spw in enumerate(spws):
+                if sidx not in spwidx2proc:
+                    continue
+                fine_spws = [
+                    fine_spw for fine_spw in _fine_spectral_spws_for_range(spw)
+                    if _spw_range_bounds(fine_spw) != _spw_range_bounds(spw)
+                ]
+                fine_imaging_spws[sidx] = fine_spws
+                for fine_spw in fine_spws:
+                    fine_postprocess_items.append(
+                        (f'fine:{format_spw(fine_spw)}', fine_spw, segmented_imaging[sidx]))
 
         dsize, fdens = calc_diskmodel(tmid_msfile, nbands, freq)
         fdens = fdens / 2.0  # convert Stokes I to single-linear-pol flux density
@@ -2852,28 +2907,50 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     if not segmented_imaging[sidx] and len(synfitsfiles) > 0:
                         outfits_all[sidx] = synfitsfiles[0]
 
+                    # --- Step 4b: Optional finer spectral final imaging ---
+                    if fine_spectral_imaging:
+                        fine_spws = fine_imaging_spws.get(sidx, [])
+                        if fine_spws:
+                            log_print('INFO',
+                                      f"Running fine spectral imaging for SPW {spws[sidx]}: {fine_spws}")
+                        for fine_spw in fine_spws:
+                            fine_spwstr = format_spw(fine_spw)
+                            fine_sp_index = _spw_indices_for_range(fine_spw)
+                            _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
+                            fine_key = f'fine:{fine_spwstr}'
+                            _, imaging_objs = _run_final_imaging(
+                                msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
+                                msname, ri_final, briggs[sidx], fine_bmsize, pols,
+                                reftime_daily, viz_timerange, date_str,
+                                segmented_imaging[sidx], imaging_objs, freq_setup,
+                                tr_series_time=tr_series_time, fits_tag=fits_tag)
+
                     elapsed_total = (datetime.now() - run_start_time).total_seconds() / 60
                     log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_total:.1f} minutes")
 
         # --- Post-processing: merge FITS, add disk, move caltables ---
         post_tag = f'.{fits_tag}' if fits_tag else ''
-        for sidx, spw in enumerate(spws):
+        postprocess_items = [
+            (sidx, spw, segmented_imaging.get(sidx, False))
+            for sidx, spw in enumerate(spws)
+        ] + fine_postprocess_items
+        for out_key, spw, is_segmented in postprocess_items:
             spwstr = format_spw(spw)
-            sp_st, sp_ed = spws[sidx].split('~')
-            dszs = [float(dsize[int(sp)].rstrip('arcsec')) for sp in range(int(sp_st), int(sp_ed) + 1)]
-            fdns = [fdens[int(sp)] for sp in range(int(sp_st), int(sp_ed) + 1)]
-            reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
+            sp_st, sp_ed = _spw_range_bounds(spw)
+            dszs = [float(dsize[sp].rstrip('arcsec')) for sp in range(sp_st, sp_ed + 1)]
+            fdns = [fdens[sp] for sp in range(sp_st, sp_ed + 1)]
+            reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spw, return_bmsize=True)
             outfits = os.path.join(imgoutdir,
                                    f'eovsa.synoptic_daily{post_tag}.{date_str}T200000Z.s{spwstr}.tb.fits')
             outfits_disk = outfits.replace('.tb.fits', '.tb.disk.fits')
-            if segmented_imaging.get(sidx, False):
+            if is_segmented:
                 synfitsfiles = sorted(glob(os.path.join(imgoutdir,
                                                         f"eovsa.synoptic{post_tag}.{date_str[:-1]}?T??????Z.s{spwstr}.tb.fits")))
                 snr_threshold = 3
                 if len(synfitsfiles) > 0:
                     log_print('INFO', f"Merging synoptic images for SPW {spwstr} to {outfits} ...")
                     merge_FITSfiles(synfitsfiles, outfits, overwrite=True, snr_threshold=snr_threshold)
-                    outfits_all[sidx] = outfits
+                    outfits_all[out_key] = outfits
                     synfitsfiles_disk = [l.replace('.tb.fits', '.tb.disk.fits') for l in synfitsfiles]
                     try:
                         add_convolved_disk_to_fits(synfitsfiles + [outfits], synfitsfiles_disk + [outfits_disk],
@@ -2890,7 +2967,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             else:
                 if os.path.exists(outfits):
                     log_print('INFO', f"Add disk to synoptic image {outfits} ...")
-                    outfits_all[sidx] = outfits
+                    outfits_all[out_key] = outfits
                     add_convolved_disk_to_fits([outfits], [outfits_disk], dszs, fdns,
                                                ignore_data=False, toTb=True,
                                                rfreq=reffreq, bmaj=bmsize / 3600.)
@@ -2982,7 +3059,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             else:
                 log_print('WARNING', f"Tar archive {tar_path} appears empty or missing. Keeping {msfile}.")
 
-        log_step('INFO', 'pipeline_run', 'completed', processed_spws=sorted(outfits_all.keys()))
+        log_step('INFO', 'pipeline_run', 'completed',
+                 processed_spws=sorted(str(key) for key in outfits_all.keys()))
         return outfits_all
 
 
@@ -3012,6 +3090,8 @@ if __name__ == '__main__':
     parser.add_argument('--spws_imaging', nargs='*', help='Spectral windows selected for imaging.')
     parser.add_argument('--fits_tag', type=str, default='',
                         help='Optional tag inserted into synoptic FITS filenames.')
+    parser.add_argument('--fine-spectral-imaging', action='store_true',
+                        help='Run an additional final-imaging pass on finer SPW chunks.')
     parser.add_argument('--hanning', action='store_true', help='Applies Hanning smoothing to the data.')
     parser.add_argument('--do_sbdcal', action='store_true', help='Perform single-band delay calibration.')
     parser.add_argument('--debug_mode', action='store_true', help='Enables debug mode with finer control over parameters.')
@@ -3039,6 +3119,7 @@ if __name__ == '__main__':
         tr_series_imaging=args.tr_series_imaging,
         spws_imaging=args.spws_imaging,
         fits_tag=args.fits_tag,
+        fine_spectral_imaging=args.fine_spectral_imaging,
         hanning=args.hanning,
         do_sbdcal=args.do_sbdcal,
     )

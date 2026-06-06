@@ -493,7 +493,7 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
 def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearcache=False, verbose=False, pols='XX',
                    version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
-                   secondary_npz=None):
+                   secondary_npz=None, fine_spectral_imaging=False):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -515,6 +515,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
        secondary_npz: optional secondary calwidget_v2 calibeovsa NPZ. In
                 ``bph_sbd`` runs, finite/unflagged secondary BPH fills missing
                 primary BPH slots while primary SBD remains authoritative.
+       fine_spectral_imaging: run an additional WSClean final-imaging pass on
+                finer SPW chunks after the standard final-imaging pass.
     '''
 
     cal_tag = get_default_cal_tag(version, cal_tag) if cal_npz else ''
@@ -674,7 +676,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'figoutdir': figoutdir,
                'overwrite': overwrite,
                'clearcache': clearcache,
-               'pols': pols, 'ncpu': ncpu})
+               'pols': pols, 'ncpu': ncpu,
+               'fine_spectral_imaging': fine_spectral_imaging})
     overwrite_pipeline = overwrite or force_imaging_rerun
     if force_imaging_rerun and version in WSCLEAN_PIPELINE_VERSIONS:
         print(f'Cron recovery mode enabled for {tdate.strftime("%Y-%m-%d")}: rerunning imaging despite existing outputvis.')
@@ -697,7 +700,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 workdir=workdir,
                                 slfcaltbdir=slfcaltbdir_path,
                                 imgoutdir=imgoutdir, pols=pols, overwrite=overwrite_pipeline,
-                                fits_tag=cal_tag)
+                                fits_tag=cal_tag,
+                                fine_spectral_imaging=fine_spectral_imaging)
         if clearcache:
             os.system(f'rm -rf {workdir}/*')
     else:
@@ -1081,7 +1085,7 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
 def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrite=False, doimport=True, pols='XX',
              version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
-             secondary_npz=None):
+             secondary_npz=None, fine_spectral_imaging=False):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1139,6 +1143,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param secondary_npz: optional secondary calwidget_v2 calibeovsa NPZ for
         BPH fill in ``bph_sbd`` runs.
     :type secondary_npz: str, optional
+    :param fine_spectral_imaging: run an additional WSClean final-imaging pass
+        on finer SPW chunks after the standard final-imaging pass.
+    :type fine_spectral_imaging: bool, optional
 
     :raises ValueError: Raises an exception if the date parameters are out of the valid Gregorian calendar range.
 
@@ -1256,7 +1263,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            caltype=caltype, interp=interp,
                                            force_imaging_rerun=smart_cal_check and is_wsclean_version,
                                            cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
-                                           secondary_npz=secondary_npz)
+                                           secondary_npz=secondary_npz,
+                                           fine_spectral_imaging=fine_spectral_imaging)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
@@ -1264,7 +1272,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                caltype=caltype, interp=interp,
                                                force_imaging_rerun=smart_cal_check and is_wsclean_version,
                                                cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
-                                               secondary_npz=secondary_npz)
+                                               secondary_npz=secondary_npz,
+                                               fine_spectral_imaging=fine_spectral_imaging)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1367,6 +1376,8 @@ if __name__ == '__main__':
                         help='Refcal apply mode for calwidget_v2 NPZ runs. '
                              'triplet preserves ph+sbd+mbd; smooth_model uses sampled smooth phase plus sbd only; '
                              'bph_sbd uses saved band phase plus sbd only.')
+    parser.add_argument('--fine-spectral-imaging', action='store_true', default=False,
+                        help='For WSClean versions, run an additional final-imaging pass on finer SPW chunks.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1380,4 +1391,5 @@ if __name__ == '__main__':
     # Run the main pipeline function
     pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
              args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
-             args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz)
+             args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz,
+             args.fine_spectral_imaging)
