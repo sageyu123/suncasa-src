@@ -493,7 +493,7 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
 def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearcache=False, verbose=False, pols='XX',
                    version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
-                   secondary_npz=None, fine_spectral_imaging=False):
+                   secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -517,14 +517,77 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 primary BPH slots while primary SBD remains authoritative.
        fine_spectral_imaging: run an additional WSClean final-imaging pass on
                 finer SPW chunks after the standard final-imaging pass.
+       fine_spectral_only: run only the finer WSClean final-imaging pass from
+                an existing selfcal'd MS product for this date/version/tag.
     '''
 
-    cal_tag = get_default_cal_tag(version, cal_tag) if cal_npz else ''
+    if cal_npz:
+        cal_tag = get_default_cal_tag(version, cal_tag)
+    elif not fine_spectral_only:
+        cal_tag = ''
+    if fine_spectral_only:
+        fine_spectral_imaging = True
     use_imported_scan_ms = bool(cal_npz)
 
     if workdir is None:
         workdir = workdir_default
     os.chdir(workdir)
+
+    tdate = trange.datetime
+    udbmspath = udbmsslfcaleddir
+    outpath = os.path.join(udbmspath, tdate.strftime('%Y%m')) + '/'
+    if not os.path.exists(outpath):
+        os.makedirs(outpath)
+    imgoutdir = get_synoptic_product_output_dir(Time(tdate), version)
+    if not os.path.exists(imgoutdir):
+        os.makedirs(imgoutdir)
+    figoutdir = os.path.join(synopticfigdir, tdate.strftime("%Y/"))
+    if not os.path.exists(figoutdir):
+        os.makedirs(figoutdir)
+
+    ms_tag = f'.{cal_tag}' if cal_tag else ''
+    if version == 'v1.0':
+        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'{ms_tag}.ms')
+    else:
+        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'.{version}{ms_tag}.ms')
+    slfcaltbdir_path = os.path.join(slfcaltbdir, tdate.strftime('%Y%m')) + '/'
+
+    if fine_spectral_only:
+        slfcaled_vis = None
+        for candidate in (output_file_path, output_file_path + '.tar.gz'):
+            if os.path.exists(candidate):
+                slfcaled_vis = candidate
+                break
+        if slfcaled_vis is None:
+            print('WARNING: fine_spectral_only requested, but no selfcal MS product was found.')
+            print(f'Checked: {output_file_path} and {output_file_path}.tar.gz')
+            return None
+        if version not in WSCLEAN_PIPELINE_VERSIONS:
+            print(f'fine_spectral_only is only supported for WSClean versions: {WSCLEAN_PIPELINE_VERSIONS}')
+            return None
+        from suncasa.eovsa import eovsa_synoptic_imaging_pipeline_wsclean as esip
+        if verbose:
+            print('input of fine-only pipeline_run:')
+            print({'vis': slfcaled_vis,
+                   'outputvis': '',
+                   'workdir': workdir,
+                   'slfcaltbdir': slfcaltbdir_path,
+                   'imgoutdir': imgoutdir,
+                   'figoutdir': figoutdir,
+                   'overwrite': overwrite,
+                   'clearcache': clearcache,
+                   'pols': pols, 'ncpu': ncpu,
+                   'fine_spectral_only': fine_spectral_only,
+                   'fine_spectral_imaging': fine_spectral_imaging})
+        return esip.pipeline_run(slfcaled_vis, outputvis='',
+                                 workdir=workdir,
+                                 slfcaltbdir=slfcaltbdir_path,
+                                 imgoutdir=imgoutdir, pols=pols,
+                                 overwrite=overwrite,
+                                 fits_tag=cal_tag,
+                                 fine_spectral_imaging=True,
+                                 fine_spectral_only=True)
+
     if isinstance(trange, Time):
         mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
         invis = mslist['ms']
@@ -540,7 +603,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
 
     fileexist = False
 
-    tdate = trange.datetime
     vispath = os.path.join(udbmsdir, tdate.strftime('%Y%m'))
     vis = os.path.join(vispath, tdate.strftime('UDB%Y%m%d') + '.ms')
     if use_imported_scan_ms:
@@ -648,24 +710,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
     # tdate = mstl.get_trange(vis)[0]
     tdate = get_tdate_from_basename(vis)
 
-    udbmspath = udbmsslfcaleddir
-    outpath = os.path.join(udbmspath, tdate.strftime('%Y%m')) + '/'
-    if not os.path.exists(outpath):
-        os.makedirs(outpath)
-    imgoutdir = get_synoptic_product_output_dir(Time(tdate), version)
-    if not os.path.exists(imgoutdir):
-        os.makedirs(imgoutdir)
-    figoutdir = os.path.join(synopticfigdir, tdate.strftime("%Y/"))
-    if not os.path.exists(figoutdir):
-        os.makedirs(figoutdir)
-
-    ms_tag = f'.{cal_tag}' if cal_tag else ''
-    if version == 'v1.0':
-        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'{ms_tag}.ms')
-    else:
-        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'.{version}{ms_tag}.ms')
-    slfcaltbdir_path = os.path.join(slfcaltbdir, tdate.strftime('%Y%m')) + '/'
-
     if verbose:
         print('input of pipeline_run:')
         print({'vis': vis,
@@ -677,7 +721,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'overwrite': overwrite,
                'clearcache': clearcache,
                'pols': pols, 'ncpu': ncpu,
-               'fine_spectral_imaging': fine_spectral_imaging})
+               'fine_spectral_imaging': fine_spectral_imaging,
+               'fine_spectral_only': fine_spectral_only})
     overwrite_pipeline = overwrite or force_imaging_rerun
     if force_imaging_rerun and version in WSCLEAN_PIPELINE_VERSIONS:
         print(f'Cron recovery mode enabled for {tdate.strftime("%Y-%m-%d")}: rerunning imaging despite existing outputvis.')
@@ -701,7 +746,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 slfcaltbdir=slfcaltbdir_path,
                                 imgoutdir=imgoutdir, pols=pols, overwrite=overwrite_pipeline,
                                 fits_tag=cal_tag,
-                                fine_spectral_imaging=fine_spectral_imaging)
+                                fine_spectral_imaging=fine_spectral_imaging,
+                                fine_spectral_only=fine_spectral_only)
         if clearcache:
             os.system(f'rm -rf {workdir}/*')
     else:
@@ -1085,7 +1131,7 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
 def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrite=False, doimport=True, pols='XX',
              version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
-             secondary_npz=None, fine_spectral_imaging=False):
+             secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1146,6 +1192,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param fine_spectral_imaging: run an additional WSClean final-imaging pass
         on finer SPW chunks after the standard final-imaging pass.
     :type fine_spectral_imaging: bool, optional
+    :param fine_spectral_only: run only the finer WSClean final-imaging pass
+        from an existing selfcal'd MS product for this date/version/tag.
+    :type fine_spectral_only: bool, optional
 
     :raises ValueError: Raises an exception if the date parameters are out of the valid Gregorian calendar range.
 
@@ -1264,7 +1313,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            force_imaging_rerun=smart_cal_check and is_wsclean_version,
                                            cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
                                            secondary_npz=secondary_npz,
-                                           fine_spectral_imaging=fine_spectral_imaging)
+                                           fine_spectral_imaging=fine_spectral_imaging,
+                                           fine_spectral_only=fine_spectral_only)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
@@ -1273,7 +1323,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                force_imaging_rerun=smart_cal_check and is_wsclean_version,
                                                cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
                                                secondary_npz=secondary_npz,
-                                               fine_spectral_imaging=fine_spectral_imaging)
+                                               fine_spectral_imaging=fine_spectral_imaging,
+                                               fine_spectral_only=fine_spectral_only)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1378,6 +1429,8 @@ if __name__ == '__main__':
                              'bph_sbd uses saved band phase plus sbd only.')
     parser.add_argument('--fine-spectral-imaging', action='store_true', default=False,
                         help='For WSClean versions, run an additional final-imaging pass on finer SPW chunks.')
+    parser.add_argument('--fine-spectral-only', action='store_true', default=False,
+                        help='For WSClean versions, run only finer imaging from the existing selfcal MS product.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1392,4 +1445,4 @@ if __name__ == '__main__':
     pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
              args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
              args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz,
-             args.fine_spectral_imaging)
+             args.fine_spectral_imaging, args.fine_spectral_only)

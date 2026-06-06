@@ -2263,6 +2263,14 @@ def _prepare_yy_as_xx_ms(msfile, workdir, msname, pols, overwrite=False):
     return pol_msfile, pol_msname
 
 
+def _ms_has_column(msfile, column):
+    tb.open(msfile)
+    try:
+        return column in tb.colnames()
+    finally:
+        tb.close()
+
+
 def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
                       caltbs, slfcal_init_obj, imname_init_disk_strlist,
                       freq_setup, dsize, fdens, ri_init,
@@ -2362,7 +2370,7 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                        msname, ri_final, briggs_val, bmsize, pols,
                        reftime_daily, viz_timerange, date_str,
                        is_segmented, imaging_objs, freq_setup,
-                       tr_series_time=None, fits_tag=''):
+                       tr_series_time=None, fits_tag='', data_column='CORRECTED_DATA'):
     """Run final imaging (segmented or non-segmented) and return output FITS paths.
 
     :param tr_series_time: List of (start_Time, end_Time) tuples to filter imaging intervals.
@@ -2383,7 +2391,7 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
             clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
                             weight_briggs=briggs_val,
                             niter=20000, mgain=0.85, gain=gain,
-                            data_column='CORRECTED_DATA',
+                            data_column=data_column,
                             name=os.path.join(workdir, imname),
                             multiscale=True, multiscale_gain=0.3,
                             multiscale_scale_bias=0.6,
@@ -2420,7 +2428,7 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                                     niter=10000, briggs=briggs_val, gain=gain,
                                     minuv_l=200,
                                     auto_mask=2, auto_threshold=1,
-                                    data_column="CORRECTED_DATA", pols=pols,
+                                    data_column=data_column, pols=pols,
                                     no_negative=False, circular_beam=False,
                                     theoretic_beam=True,
                                     reftime_daily=reftime_daily)
@@ -2446,7 +2454,7 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
             clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
                             weight_briggs=briggs_val,
                             niter=20000, mgain=0.85, gain=gain,
-                            data_column='CORRECTED_DATA',
+                            data_column=data_column,
                             name=os.path.join(workdir, imname),
                             multiscale=True, multiscale_gain=0.3,
                             multiscale_scale_bias=0.6,
@@ -2503,7 +2511,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  pols='XX', verbose=True, hanning=False, do_sbdcal=False,
                  overwrite=False, overwrite_caltb=True, mergeFITSonly=False,
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
-                 spws_imaging=None, fits_tag='', fine_spectral_imaging=False):
+                 spws_imaging=None, fits_tag='', fine_spectral_imaging=False,
+                 fine_spectral_only=False):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -2551,9 +2560,15 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
     :param fine_spectral_imaging: If True, run an additional final-imaging pass
         on finer SPW chunks after the standard final-imaging pass.
     :type fine_spectral_imaging: bool, optional
+    :param fine_spectral_only: If True, skip preprocessing, self-calibration,
+        and coarse final imaging, and run only fine final-imaging chunks.
+    :type fine_spectral_only: bool, optional
     :return: Dictionary mapping coarse indexes and fine SPW keys to output FITS file paths.
     :rtype: dict
     """
+    if fine_spectral_only:
+        fine_spectral_imaging = True
+
     with pipeline_stage(
         "pipeline_run",
         vis=vis,
@@ -2566,8 +2581,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         ncpu=ncpu,
         spws_imaging=spws_imaging,
         fine_spectral_imaging=fine_spectral_imaging,
+        fine_spectral_only=fine_spectral_only,
     ):
-        if os.path.exists(outputvis) and not overwrite:
+        if outputvis and os.path.exists(outputvis) and not overwrite and not fine_spectral_only:
             log_print('INFO', f"Output MS file {outputvis} already exists. Skipping processing.")
             return outputvis
 
@@ -2637,6 +2653,11 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         if str(pols).upper().replace(',', '') in ('YY', 'YY_AS_XX'):
             log_print('INFO', "Using YY data swapped into the XX slot for downstream diagnostic imaging")
             pols = 'XX'
+        final_data_column = 'CORRECTED_DATA'
+        if fine_spectral_only:
+            final_data_column = 'CORRECTED_DATA' if _ms_has_column(msfile, 'CORRECTED_DATA') else 'DATA'
+            log_print('INFO',
+                      f"fine_spectral_only=True: using {final_data_column} for final imaging from {msfile}")
 
         viz_timerange = ant_trange(msfile)
         (tstart, tend) = viz_timerange.split('~')
@@ -2705,7 +2726,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         run_start_time = datetime.now()
 
         # --- Pre-processing: flagging, hanning smoothing ---
-        if os.path.isdir(msfile + '.flagversions'):
+        if fine_spectral_only:
+            log_print('INFO', "fine_spectral_only=True: skipping preprocessing flag edits.")
+        elif os.path.isdir(msfile + '.flagversions'):
             if verbose:
                 log_print('INFO', f'Flagversion of {msfile} already exists. Skipped...')
         else:
@@ -2717,7 +2740,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                          timecutoff=3.0, freqcutoff=2.0, maxnpieces=2, flagbackup=False)
                 flagmanager(msfile, mode='save', versionname='pipeline_remove_RFI-and-BURSTS')
 
-        if hanning:
+        if hanning and not fine_spectral_only:
             msfile_hanning = msfile + '.hanning'
             if not os.path.exists(msfile_hanning):
                 if verbose:
@@ -2752,7 +2775,28 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 else:
                     log_print('WARNING', f"Ignoring invalid time range '{tr}'. Expected format: 'start~end'.")
 
-        if mergeFITSonly:
+        if fine_spectral_only:
+            log_print('INFO', "fine_spectral_only=True: running fine final imaging from existing selfcal MS.")
+            for sidx, fine_spws in fine_imaging_spws.items():
+                if not fine_spws:
+                    continue
+                mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(sidx, 1)
+                ri_final = _compute_round_intervals(wsclean_intervals, mult)
+                log_print('INFO',
+                          f"Running fine spectral imaging for SPW {spws[sidx]}: {fine_spws}")
+                for fine_spw in fine_spws:
+                    fine_spwstr = format_spw(fine_spw)
+                    fine_sp_index = _spw_indices_for_range(fine_spw)
+                    _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
+                    fine_key = f'fine:{fine_spwstr}'
+                    _, imaging_objs = _run_final_imaging(
+                        msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
+                        msname, ri_final, briggs[sidx], fine_bmsize, pols,
+                        reftime_daily, viz_timerange, date_str,
+                        segmented_imaging[sidx], imaging_objs, freq_setup,
+                        tr_series_time=tr_series_time, fits_tag=fits_tag,
+                        data_column=final_data_column)
+        elif mergeFITSonly:
             log_print('INFO', "mergeFITSonly=True: skipping self-calibration and imaging, proceeding to merge.")
         else:
             # --- Main loop over spectral windows ---
@@ -2930,10 +2974,11 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
 
         # --- Post-processing: merge FITS, add disk, move caltables ---
         post_tag = f'.{fits_tag}' if fits_tag else ''
-        postprocess_items = [
+        postprocess_items = [] if fine_spectral_only else [
             (sidx, spw, segmented_imaging.get(sidx, False))
             for sidx, spw in enumerate(spws)
-        ] + fine_postprocess_items
+        ]
+        postprocess_items += fine_postprocess_items
         for out_key, spw, is_segmented in postprocess_items:
             spwstr = format_spw(spw)
             sp_st, sp_ed = _spw_range_bounds(spw)
@@ -3014,7 +3059,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         os.remove(f)
 
         # --- Assemble selfcal'd outputvis from per-spw splits via concat ---
-        if outputvis and not os.path.exists(outputvis):
+        if outputvis and not fine_spectral_only and not os.path.exists(outputvis):
             log_print('INFO', f"Building selfcal'd outputvis {outputvis} from per-spw splits ...")
             os.makedirs(os.path.dirname(outputvis) or '.', exist_ok=True)
             slfcaled_spw_ms_list = []
@@ -3048,7 +3093,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 log_print('WARNING', "No per-spw slfcaled MS files produced; outputvis not created.")
 
         # --- Tar the source UDB*.ms working copy and remove it ---
-        if os.path.isdir(msfile):
+        if fine_spectral_only:
+            log_print('INFO', f"fine_spectral_only=True: retaining working MS {msfile}.")
+        elif os.path.isdir(msfile):
             tar_path = msfile + '.tar.gz'
             log_print('INFO', f"Archiving {msfile} to {tar_path} ...")
             with tarfile.open(tar_path, 'w:gz') as tar:
@@ -3092,6 +3139,8 @@ if __name__ == '__main__':
                         help='Optional tag inserted into synoptic FITS filenames.')
     parser.add_argument('--fine-spectral-imaging', action='store_true',
                         help='Run an additional final-imaging pass on finer SPW chunks.')
+    parser.add_argument('--fine-spectral-only', action='store_true',
+                        help='Run only fine final imaging from an existing selfcal MS.')
     parser.add_argument('--hanning', action='store_true', help='Applies Hanning smoothing to the data.')
     parser.add_argument('--do_sbdcal', action='store_true', help='Perform single-band delay calibration.')
     parser.add_argument('--debug_mode', action='store_true', help='Enables debug mode with finer control over parameters.')
@@ -3120,6 +3169,7 @@ if __name__ == '__main__':
         spws_imaging=args.spws_imaging,
         fits_tag=args.fits_tag,
         fine_spectral_imaging=args.fine_spectral_imaging,
+        fine_spectral_only=args.fine_spectral_only,
         hanning=args.hanning,
         do_sbdcal=args.do_sbdcal,
     )
