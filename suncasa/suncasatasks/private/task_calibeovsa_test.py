@@ -393,6 +393,22 @@ def _bph_candidate_for_band(refcal, band_phase, band_flag, ant_i, pol_i, band_i,
                 False,
                 source_prefix + 'lo_model',
             )
+        # HI smooth/extrapolated model on LO grid: the HI gencal triplet stores the
+        # smooth model evaluated at every band center (including LO bands) via
+        # require_model_mask=False during NPZ export.  Use it when the LO triplet
+        # is absent or fully flagged — SBD stays hi_sbd_ns per the bph_sbd contract.
+        hi_triplet = (
+            (refcal.get('gencal_triplets') or {}).get('hi')
+            or refcal.get('gencal_triplet')
+        )
+        hi_lo_phase, _ = _triplet_bph_sbd_terms_for_band(hi_triplet, ant_i, pol_i, band_i)
+        if np.isfinite(hi_lo_phase) and np.isfinite(hi_sbd_ns):
+            return (
+                float(hi_lo_phase),
+                float(hi_sbd_ns),
+                False,
+                source_prefix + 'hi_smooth_extrap',
+            )
     phase = _array_value_3d(band_phase, ant_i, pol_i, band_i, default=np.nan)
     if np.isfinite(phase) and not _array_flagged_3d(band_flag, ant_i, pol_i, band_i):
         return float(phase), float(hi_sbd_ns), False, source_prefix + 'band_phase'
@@ -400,9 +416,8 @@ def _bph_candidate_for_band(refcal, band_phase, band_flag, ant_i, pol_i, band_i,
 
 
 def _bph_sbd_phase_base_for_band(
-        refcal, band_phase, band_flag, smooth_phase, smooth_flag,
+        refcal, band_phase, band_flag, smooth_model_pha,
         ant_i, pol_i, band_i, freq_ghz, hi_sbd_ns):
-    del smooth_phase, smooth_flag
     phase, sbd_ns, flagged, source = _bph_candidate_for_band(
         refcal, band_phase, band_flag, ant_i, pol_i, band_i, freq_ghz, hi_sbd_ns, 'primary'
     )
@@ -423,6 +438,20 @@ def _bph_sbd_phase_base_for_band(
         )
         if not flagged and source:
             return phase, sbd_ns, False, source
+    # HI smooth/extrapolated model on LO grid when both primary and secondary
+    # candidates fail.  ``smooth_model_pha`` holds the NaN-preserving
+    # refcal__model_pha from the NPZ, which carries HI smooth-model values at LO
+    # band centers when the NPZ was saved with require_model_mask=False.  This
+    # fallback fires precisely *because* no valid LO phase exists for the slot
+    # (LO absent or LO-flagged), so it is gated only on a finite model value and
+    # the operator flag -- NOT on the raw LO data flag, which is the trigger
+    # condition itself.  A bad HI model is excluded via the operator flag.  SBD
+    # stays hi_sbd_ns per the bph_sbd contract.
+    lo_band = np.isfinite(freq_ghz) and float(freq_ghz) <= 3.0
+    if lo_band and not _operator_flagged(refcal, ant_i, pol_i, band_i):
+        hi_phase = _array_value_3d(smooth_model_pha, ant_i, pol_i, band_i, default=np.nan)
+        if np.isfinite(hi_phase):
+            return float(hi_phase), float(hi_sbd_ns), False, 'hi_smooth_extrap'
     return 0.0, np.nan, True, 'bph_missing'
 
 
@@ -460,9 +489,15 @@ def load_calwidget_v2_npz(npz_path):
             pha = np.where(fitted, model_pha, 0.0)
             flag = np.where(fitted, flag, 1).astype(flag.dtype)
             pha_source = 'refcal__model_pha'
+            # NaN-preserving copy of the exported smooth model. The bph_sbd LO
+            # HI-extrapolation fallback reads this (not the zero-filled, raw-flag
+            # gated ``pha``) so HI smooth-model values at LO band centers survive
+            # for slots whose raw LO flag is 1 because no LO refcal was saved.
+            model_pha_raw = model_pha
         else:
             pha = np.angle(vis)
             pha_source = 'angle(refcal__vis)'
+            model_pha_raw = np.full(np.asarray(pha).shape, np.nan, dtype=np.float64)
         promoted = _merge_npz_promoted_anchor_arrays(
             data,
             _npz_json_scalar(data, 'refcal__promoted_antennas_json', {}),
@@ -478,6 +513,7 @@ def load_calwidget_v2_npz(npz_path):
             't_ed': Time(float(data['refcal__t_ed_lv']), format='lv'),
             'promoted_antennas': promoted,
             'pha_source': pha_source,
+            'model_pha_raw': model_pha_raw,
             'band_phase_rad': np.angle(vis),
             'band_phase_flag': np.asarray(raw_flag).copy(),
         }
@@ -769,6 +805,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 selected_npz_models = set()
                 band_phase = np.asarray(refcal.get('band_phase_rad', []), dtype=np.float64)
                 band_phase_flag = np.asarray(refcal.get('band_phase_flag', []), dtype=np.int32)
+                # NaN-preserving smooth model for the bph_sbd LO HI-extrapolation
+                # fallback; carries HI smooth values at LO band centers (finite)
+                # and NaN where the widget produced no model.
+                model_pha_lo_fallback = np.asarray(refcal.get('model_pha_raw', []), dtype=np.float64)
 
                 def phase_is_flagged(ant_i, pol_i, band_i):
                     return (
@@ -838,8 +878,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                     refcal,
                                     band_phase,
                                     band_phase_flag,
-                                    pha,
-                                    phase_flag,
+                                    model_pha_lo_fallback,
                                     n,
                                     p,
                                     band_i,
