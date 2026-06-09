@@ -393,22 +393,6 @@ def _bph_candidate_for_band(refcal, band_phase, band_flag, ant_i, pol_i, band_i,
                 False,
                 source_prefix + 'lo_model',
             )
-        # HI smooth/extrapolated model on LO grid: the HI gencal triplet stores the
-        # smooth model evaluated at every band center (including LO bands) via
-        # require_model_mask=False during NPZ export.  Use it when the LO triplet
-        # is absent or fully flagged — SBD stays hi_sbd_ns per the bph_sbd contract.
-        hi_triplet = (
-            (refcal.get('gencal_triplets') or {}).get('hi')
-            or refcal.get('gencal_triplet')
-        )
-        hi_lo_phase, _ = _triplet_bph_sbd_terms_for_band(hi_triplet, ant_i, pol_i, band_i)
-        if np.isfinite(hi_lo_phase) and np.isfinite(hi_sbd_ns):
-            return (
-                float(hi_lo_phase),
-                float(hi_sbd_ns),
-                False,
-                source_prefix + 'hi_smooth_extrap',
-            )
     phase = _array_value_3d(band_phase, ant_i, pol_i, band_i, default=np.nan)
     if np.isfinite(phase) and not _array_flagged_3d(band_flag, ant_i, pol_i, band_i):
         return float(phase), float(hi_sbd_ns), False, source_prefix + 'band_phase'
