@@ -10,6 +10,7 @@ import matplotlib.colorbar as colorbar
 import matplotlib.patches as patches
 from datetime import timedelta
 from datetime import datetime
+from eovsapy.spw_config import SPWS_34BAND, SPWS_52BAND, SPWS_52BAND_ALT, SPW_EPOCH_SPLIT_DATE
 from glob import glob
 import numpy as np
 from astropy.time import Time
@@ -58,6 +59,31 @@ def fits_tag_infix(fits_tag):
 def eovsa_preview_filename(size, band_number, fits_tag=''):
     # fits_tag selects the input FITS product; browser previews are canonical per version folder.
     return '{}_eovsa_bd{:02d}.jpg'.format(size, band_number)
+
+
+def eovsa_preview_label(eomap):
+    label = 'EOVSA {:.1f} GHz  {}'.format(
+        eomap.meta['CRVAL3'] / 1e9,
+        eomap.date.strftime('%d-%b-%Y 20:00 UT'))
+    nant_img = eomap.meta.get('NANTIMG')
+    nant_total = eomap.meta.get('NANTTOT')
+    if nant_img is None or nant_total is None:
+        return label
+    try:
+        return '{}   Ants used: {}/{}'.format(label, int(nant_img), int(nant_total))
+    except (TypeError, ValueError):
+        return label
+
+
+def eovsa_preview_warning_label(eomap):
+    cal_date = eomap.meta.get('CALDATE')
+    cal_mode = str(eomap.meta.get('CALMODE', '')).strip().upper()
+    cal_warn = eomap.meta.get('CALWARN')
+    if isinstance(cal_warn, str):
+        cal_warn = cal_warn.strip().upper() in ('T', 'TRUE', '1', 'YES')
+    if not cal_date or not (cal_warn or cal_mode == 'FALLBACK'):
+        return ''
+    return 'Provisional cal: {}'.format(str(cal_date).strip())
 
 
 def synoptic_daily_product_filename(dateobj, spwstr, version='v3.0', fits_tag=''):
@@ -204,8 +230,13 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
                 ax.set_ylabel('')
                 ax.set_xticklabels([])
                 ax.set_yticklabels([])
+                warning_label = eovsa_preview_warning_label(eomap)
+                if warning_label:
+                    ax.text(0.02, 0.98, warning_label,
+                            transform=ax.transAxes, color='#ffd166', ha='left', va='top', fontsize=9,
+                            bbox=dict(facecolor='black', alpha=0.45, edgecolor='none', pad=2.0))
                 ax.text(0.02, 0.02,
-                        'EOVSA {:.1f} GHz  {}'.format(eomap.meta['CRVAL3'] / 1e9, eomap.date.strftime('%d-%b-%Y 20:00 UT')),
+                        eovsa_preview_label(eomap),
                         transform=ax.transAxes, color='w', ha='left', va='bottom', fontsize=9)
                 ax.text(0.98, 0.02, 'Max Tb {:.0f} K'.format(np.nanmax(eomap.data)),
                         transform=ax.transAxes, color='w', ha='right', va='bottom', fontsize=9)
@@ -278,8 +309,13 @@ def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None
                 ax.set_ylabel('')
                 ax.set_xticklabels([])
                 ax.set_yticklabels([])
+                warning_label = eovsa_preview_warning_label(eomap)
+                if warning_label:
+                    ax.text(0.02, 0.98, warning_label,
+                            transform=ax.transAxes, color='#ffd166', ha='left', va='top', fontsize=9,
+                            bbox=dict(facecolor='black', alpha=0.45, edgecolor='none', pad=2.0))
                 ax.text(0.02, 0.02,
-                        'EOVSA {:.1f} GHz  {}'.format(eomap.meta['CRVAL3'] / 1e9, eomap.date.strftime('%d-%b-%Y 20:00 UT')),
+                        eovsa_preview_label(eomap),
                         transform=ax.transAxes, color='w', ha='left', va='bottom', fontsize=9)
                 ax.text(0.98, 0.02, 'Max Tb {:.0f} K'.format(np.nanmax(eomap.data)),
                         transform=ax.transAxes, color='w', ha='right', va='bottom', fontsize=9)
@@ -580,7 +616,7 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
     ted = dateobj if dateobj is not None else (datetime.now() - timedelta(days=2))
     # Calculate the start date based on ndays.
     tst = Time(np.fix(Time(ted).mjd) - ndays, format='mjd').datetime
-    tsep = datetime.strptime('2019-02-22', "%Y-%m-%d")
+    tsep = datetime.strptime(SPW_EPOCH_SPLIT_DATE, "%Y-%m-%d")
 
     # vmaxs = [22.0e4, 8.0e4, 5.4e4, 3.5e4, 2.3e4, 1.8e4, 1.5e4]
     # vmins = [-9.0e3, -5.5e3, -3.4e3, -2.5e3, -2.5e3, -2.5e3, -2.5e3]
@@ -602,10 +638,10 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
     while dateobs < ted:
         # Determine spectral window settings based on the observation date.
         if dateobs > tsep:
-            spws = ['0~1', '2~5', '6~10', '11~20', '21~30', '31~43', '44~49']
-            spws_v3 = ['0~1', '2~4', '5~10', '11~20', '21~30', '31~43', '44~49']
+            spws = list(SPWS_52BAND_ALT)
+            spws_v3 = list(SPWS_52BAND)
         else:
-            spws = ['1~3', '4~9', '10~16', '17~24', '25~30']
+            spws = list(SPWS_34BAND)
             spws_v3 = spws
 
         datestr = dateobs.strftime("%Y-%m-%d")

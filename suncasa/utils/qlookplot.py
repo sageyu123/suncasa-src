@@ -36,6 +36,36 @@ data_sources_aia = {
     335: DataSource.AIA_335
 }
 
+HMI_PRODUCTS = {
+    'continuum': {
+        'title': 'HMI Continuum',
+        'series': 'hmi.Ic_45s',
+        'segment': 'continuum',
+        'tokens': ('ic_45s', 'continuum', 'hmicont'),
+    },
+    'magnetogram': {
+        'title': 'HMI Magnetogram',
+        'series': 'hmi.M_45s',
+        'segment': 'magnetogram',
+        'tokens': ('m_45s', 'magnetogram', 'hmimag'),
+    },
+}
+
+HMI_WAVE_ALIASES = {
+    'hmicontinuum': 'continuum',
+    'hmicont': 'continuum',
+    'hmiic': 'continuum',
+    'continuum': 'continuum',
+    'cont': 'continuum',
+    'ic': 'continuum',
+    'hmimagnetogram': 'magnetogram',
+    'hmimag': 'magnetogram',
+    'hmim': 'magnetogram',
+    'magnetogram': 'magnetogram',
+    'mag': 'magnetogram',
+    'losmagnetogram': 'magnetogram',
+}
+
 systemname = platform.system()
 
 sunpy1 = sunpy.version.major >= 1
@@ -68,6 +98,7 @@ qa = qatool()
 c_external = False
 from matplotlib.dates import DateFormatter
 from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
 import matplotlib as mpl
 
 import matplotlib.colors as colors
@@ -80,8 +111,10 @@ from tqdm import tqdm
 
 sunpy1 = sunpy.version.major >= 1
 if sunpy1:
-    from sunpy.coordinates import sun
+    from sunpy.coordinates import Helioprojective, propagate_with_solar_surface, sun
 else:
+    Helioprojective = None
+    propagate_with_solar_surface = None
     from sunpy import sun
     import sunpy.cm.cm as cm_sunpy
 
@@ -397,6 +430,9 @@ def download_aia_data(trange, wavelengths=[171], cadence=None, outdir='./'):
     :return: List of downloaded files.
     :rtype: list
     """
+    if _is_hmi_wave(wavelengths):
+        return download_hmi_data(trange, _normalize_hmi_wave(wavelengths), cadence=cadence, outdir=outdir)
+
     trange = Time(trange) if not isinstance(trange, Time) else trange
     outdir = Path(outdir).expanduser()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -405,6 +441,8 @@ def download_aia_data(trange, wavelengths=[171], cadence=None, outdir='./'):
         wavelengths = [wavelengths]
     elif isinstance(wavelengths, str) and wavelengths.lower() == 'all':
         wavelengths = [94, 131, 171, 193, 211, 304, 335, 1600, 1700]
+    elif isinstance(wavelengths, str):
+        wavelengths = [wavelengths]
 
     print(f"{len(wavelengths)} passbands to download")
     downloaded_files = []
@@ -594,30 +632,381 @@ def download_using_fido(tst, ted, wavelengths, cadence, outdir):
     return downloaded_files
 
 
+def _as_aia_file_list(aiafiles):
+    """Return non-empty AIA file paths as a list."""
+    if aiafiles is None:
+        return []
+    if isinstance(aiafiles, (str, Path)):
+        return [str(aiafiles)] if str(aiafiles) else []
+    return [str(aiafile) for aiafile in aiafiles if aiafile]
+
+
+def _normalize_hmi_wave(aiawave):
+    """Return the HMI product key for a supported HMI ``aiawave`` alias."""
+
+    if not isinstance(aiawave, str):
+        return None
+    token = re.sub(r'[^a-z0-9]', '', aiawave.lower())
+    return HMI_WAVE_ALIASES.get(token)
+
+
+def _is_hmi_wave(aiawave):
+    return _normalize_hmi_wave(aiawave) is not None
+
+
+def _is_hmi_map(sdomap):
+    meta = getattr(sdomap, 'meta', {})
+    values = [
+        getattr(sdomap, 'detector', None),
+        getattr(sdomap, 'instrument', None),
+        meta.get('detector'),
+        meta.get('instrume'),
+        meta.get('telescop'),
+    ]
+    return any('hmi' in str(value).lower() for value in values if value is not None)
+
+
+def _hmi_product_from_map(sdomap):
+    meta = getattr(sdomap, 'meta', {})
+    text = ' '.join(str(value).lower() for value in [
+        getattr(sdomap, 'measurement', ''),
+        meta.get('content', ''),
+        meta.get('bunit', ''),
+        meta.get('segment', ''),
+        meta.get('t_rec', ''),
+    ])
+    if 'magnet' in text or 'gauss' in text:
+        return 'magnetogram'
+    if 'continuum' in text or 'intensity' in text:
+        return 'continuum'
+    return None
+
+
+def _is_hmi_file_for_product(path, hmi_product):
+    name = os.path.basename(str(path)).lower()
+    if 'hmi' not in name:
+        return False
+    tokens = HMI_PRODUCTS[hmi_product]['tokens']
+    return any(token in name for token in tokens)
+
+
+def _time_from_hmi_filename(path):
+    name = os.path.basename(str(path))
+    match = re.search(r'(\d{4})[.\-]?(\d{2})[.\-]?(\d{2})[_T](\d{2}):?(\d{2}):?(\d{2})', name)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    try:
+        return Time('{0}-{1}-{2} {3}:{4}:{5}'.format(year, month, day, hour, minute, second),
+                    format='iso', scale='utc')
+    except Exception:
+        return None
+
+
+def _find_local_hmi_files(trange, hmi_product, aiadir):
+    dirs = []
+    for directory in (aiadir, './'):
+        directory = './' if directory is None else directory
+        path = Path(directory).expanduser()
+        if path not in dirs:
+            dirs.append(path)
+
+    files = []
+    for directory in dirs:
+        if not directory.exists():
+            continue
+        for path in directory.glob('hmi*'):
+            if _is_hmi_file_for_product(path, hmi_product):
+                file_time = _time_from_hmi_filename(path)
+                if file_time is not None:
+                    files.append((file_time.jd, str(path)))
+
+    if not files:
+        return []
+
+    tst, ted = parse_trange(trange)
+    if tst.jd <= ted.jd:
+        in_range = [(jd, path) for jd, path in files if tst.jd <= jd <= ted.jd]
+    else:
+        in_range = []
+    if in_range:
+        return [path for jd, path in sorted(in_range)]
+
+    mid_jd = np.mean([tst.jd, ted.jd])
+    nearest = min(files, key=lambda item: abs(item[0] - mid_jd))
+    return [nearest[1]]
+
+
+def _jsoc_hmi_time(time_obj):
+    return Time(time_obj).strftime('%Y.%m.%d_%H:%M:%S_TAI')
+
+
+def download_hmi_data(trange, hmi_product, cadence=None, outdir='./'):
+    """Download HMI continuum or magnetogram FITS files from JSOC."""
+
+    tst, ted = parse_trange(trange)
+    product = HMI_PRODUCTS[hmi_product]
+    outdir = Path(outdir).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    if (ted - tst).to_value(u.second) < 90:
+        mid = Time(np.mean([tst.jd, ted.jd]), format='jd')
+        tst, ted = Time(mid.jd + np.array([-90.0, 90.0]) / 86400.0, format='jd')
+    cadence_str = ''
+    if cadence is not None:
+        cadence_str = '@{0:.0f}s'.format(cadence.to(u.second).value)
+    query_str = '{series}[{start}-{end}{cadence}]{{{segment}}}'.format(
+        series=product['series'],
+        start=_jsoc_hmi_time(tst),
+        end=_jsoc_hmi_time(ted),
+        cadence=cadence_str,
+        segment=product['segment'],
+    )
+    print('JSOC HMI query: {}'.format(query_str))
+    client = drms.Client(email=os.environ.get("JSOC_EMAIL"))
+    result = client.export(query_str, method='url', protocol='fits', email='suncasa-group@njit.edu')
+    return [str(path) for path in result.download(outdir.as_posix())]
+
+
+def trange2hmifits(trange, aiawave, aiadir):
+    hmi_product = _normalize_hmi_wave(aiawave)
+    if hmi_product is None:
+        return []
+    if aiadir is None:
+        aiadir = './'
+    files = _find_local_hmi_files(trange, hmi_product, aiadir)
+    if not files:
+        try:
+            files = download_hmi_data(trange, hmi_product, outdir=aiadir)
+        except Exception as exc:
+            print('Error in downloading HMI {0}: {1}'.format(hmi_product, exc))
+            files = []
+    if files:
+        local = _find_local_hmi_files(trange, hmi_product, aiadir)
+        return local or files
+    return []
+
+
+def _prepare_context_map(sdo_file, aiawave, target_time=None, verbose=False):
+    sdomap = smap.Map(sdo_file)
+    if target_time is not None:
+        sdomap = _derotate_aiamap_to_time(sdomap, target_time, fallback_wave=aiawave, verbose=verbose)
+    is_jp2 = str(sdo_file).endswith('.jp2')
+    is_hmi = _is_hmi_wave(aiawave) or _is_hmi_map(sdomap)
+    if not is_jp2 and not is_hmi:
+        sdomap = DButil.normalize_aiamap(sdomap)
+        data = sdomap.data
+        data[data < 1.0] = 1.0
+        sdomap = smap.Map(data, sdomap.meta)
+    return sdomap, is_jp2, is_hmi
+
+
+def _hmi_display_limits(sdomap, aiawave):
+    data = np.asarray(sdomap.data, dtype=float)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    hmi_product = _normalize_hmi_wave(aiawave) or _hmi_product_from_map(sdomap)
+    if hmi_product == 'magnetogram':
+        limit = np.nanpercentile(np.abs(finite), 99.0)
+        if not np.isfinite(limit) or limit <= 0:
+            limit = np.nanmax(np.abs(finite))
+        if not np.isfinite(limit) or limit <= 0:
+            limit = 1.0
+        return -limit, limit
+    lower, upper = np.nanpercentile(finite, [1.0, 99.5])
+    if not np.isfinite(lower):
+        lower = np.nanmin(finite)
+    if not np.isfinite(upper):
+        upper = np.nanmax(finite)
+    if lower == upper:
+        upper = lower + 1.0
+    return lower, upper
+
+
+def _context_map_norm(sdomap, aiawave, is_jp2, amin, amax, anorm):
+    if is_jp2:
+        return get_normalization(0, 255, 'linear')
+    if _is_hmi_wave(aiawave) or _is_hmi_map(sdomap):
+        default_min, default_max = _hmi_display_limits(sdomap, aiawave)
+        return get_normalization(
+            default_min if amin is None else amin,
+            default_max if amax is None else amax,
+            'linear',
+        )
+    if amax is None:
+        amax = np.nanmax(sdomap.data)
+    if amin is None:
+        amin = 1.0
+    return get_normalization(amin, amax, anorm)
+
+
+def _context_cmap(aiawave, acmap):
+    if acmap is not None:
+        return plt.get_cmap(acmap)
+    if _is_hmi_wave(aiawave):
+        return plt.get_cmap('gray')
+    if sunpy1:
+        return plt.get_cmap('sdoaia{}'.format(aiawave))
+    return cm_sunpy.get_cmap('sdoaia{}'.format(aiawave))
+
+
+def _aia_title(aiamap, fallback_wave=None):
+    """Return a display title for an AIA map.
+
+    Some locally cached or downloaded AIA files are read by SunPy as
+    ``GenericMap`` objects with no wavelength metadata. In that case, use the
+    requested ``aiawave`` value so plotting can continue.
+
+    :param aiamap: AIA map to label.
+    :type aiamap: sunpy.map.GenericMap
+    :param fallback_wave: Requested AIA wavelength.
+    :type fallback_wave: int or float or None
+    :returns: AIA title string.
+    :rtype: str
+    """
+
+    hmi_product = _normalize_hmi_wave(fallback_wave)
+    if hmi_product is None and _is_hmi_map(aiamap):
+        hmi_product = _hmi_product_from_map(aiamap)
+    if hmi_product in HMI_PRODUCTS:
+        return HMI_PRODUCTS[hmi_product]['title']
+    if _is_hmi_map(aiamap):
+        return 'HMI'
+
+    candidates = [
+        getattr(getattr(aiamap, 'wavelength', None), 'value', None),
+        fallback_wave,
+    ]
+    meta = getattr(aiamap, 'meta', {})
+    for key in ('wavelnth', 'wavelength', 'wave_len'):
+        candidates.append(meta.get(key))
+
+    for candidate in candidates:
+        try:
+            wave = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(wave):
+            return 'AIA {0:.0f} Å'.format(wave)
+
+    return 'AIA'
+
+
+def _derotate_aiamap_to_time(aiamap, target_time, time_threshold=10 * u.min, fallback_wave=None, verbose=False):
+    """Differentially rotate an AIA map to a target observation time.
+
+    :param aiamap: Input AIA map.
+    :type aiamap: sunpy.map.GenericMap
+    :param target_time: Target time for differential rotation.
+    :type target_time: astropy.time.Time or str
+    :param time_threshold: Minimum absolute time offset that triggers derotation.
+    :type time_threshold: astropy.units.Quantity
+    :param fallback_wave: Requested AIA wavelength to use when the input map
+        lacks wavelength metadata.
+    :type fallback_wave: int or float or None
+    :param verbose: If True, print derotation diagnostics.
+    :type verbose: bool
+    :returns: The original map when the time offset is within the threshold,
+        otherwise a map reprojected to ``target_time``.
+    :rtype: sunpy.map.GenericMap
+    """
+    target_time = Time(target_time)
+    input_meta = aiamap.meta.copy()
+    if fallback_wave is not None and not _is_hmi_wave(fallback_wave):
+        if input_meta.get('wavelnth') is None and input_meta.get('wavelength') is None:
+            input_meta['wavelnth'] = fallback_wave
+            aiamap.meta['wavelnth'] = fallback_wave
+        if input_meta.get('waveunit') is None:
+            input_meta['waveunit'] = 'angstrom'
+            aiamap.meta['waveunit'] = 'angstrom'
+
+    map_time = Time(aiamap.date)
+    time_offset = target_time - map_time
+    if np.abs(time_offset.to(u.min).value) <= time_threshold.to(u.min).value:
+        return aiamap
+
+    if verbose:
+        print('SDO map time differs from radio time by {:.2f} min. Applying solar differential rotation.'.format(
+            time_offset.to(u.min).value))
+
+    if Helioprojective is None or propagate_with_solar_surface is None:
+        raise ImportError('SunPy differential rotation requires sunpy.coordinates.propagate_with_solar_surface.')
+
+    out_frame = Helioprojective(observer=aiamap.observer_coordinate,
+                                obstime=target_time,
+                                rsun=aiamap.coordinate_frame.rsun)
+    out_center = SkyCoord(0 * u.arcsec, 0 * u.arcsec, frame=out_frame)
+    out_ref_pixel = [aiamap.reference_pixel.x.value,
+                     aiamap.reference_pixel.y.value] * aiamap.reference_pixel.x.unit
+
+    out_header = smap.make_fitswcs_header(aiamap.data.shape,
+                                          out_center,
+                                          reference_pixel=out_ref_pixel,
+                                          scale=u.Quantity(aiamap.scale))
+    out_wcs = WCS(out_header)
+
+    with propagate_with_solar_surface():
+        out_map, footprint = aiamap.reproject_to(out_wcs, return_footprint=True)
+
+    out_data = np.array(out_map.data, copy=True)
+    out_data[footprint == 0] = aiamap.data[footprint == 0]
+    out_data[np.isnan(out_data)] = 0
+
+    preserved_keys = (
+        'wavelnth', 'wavelength', 'waveunit', 'telescop', 'instrume',
+        'detector', 'obsrvtry', 'exptime', 'p_angle'
+    )
+    out_meta = input_meta.copy()
+    out_meta.update(out_map.meta)
+    for key in preserved_keys:
+        if input_meta.get(key) is not None:
+            out_meta[key] = input_meta[key]
+    out_meta['date-obs'] = target_time.isot
+    out_meta['date'] = target_time.isot
+    out_map = smap.Map(out_data, out_meta)
+    return out_map
+
+
 def trange2aiafits(trange, aiawave, aiadir):
     """
     Retrieve or download AIA FITS files for the specified time range and wavelength.
 
     :param trange: Time range for the query.
     :type trange: list or astropy.time.Time
-    :param aiawave: Wavelength of the AIA data.
-    :type aiawave: int
+    :param aiawave: Wavelength of the AIA data, or an HMI alias such as
+        ``'hmi_continuum'`` or ``'hmi_magnetogram'``.
+    :type aiawave: int or str
     :param aiadir: Directory to search for the data.
     :type aiadir: str
-    :return: Path to the AIA FITS files.
-    :rtype: str or None
+    :return: Paths to the AIA FITS or JP2 files.
+    :rtype: list of str
     """
-    trange = parse_trange(trange)
+    if _is_hmi_wave(aiawave):
+        return trange2hmifits(trange, aiawave, aiadir)
+
+    if aiadir is None:
+        aiadir = './'
+    tst, ted = parse_trange(trange)
+    trange = Time([tst.jd, ted.jd], format='jd')
     if (trange[1] - trange[0]).jd < 12.0 / 24.0 / 3600.0:
         trange = Time(np.mean(trange.jd) + np.array([-1.0, 1.0]) * 6.0 / 24.0 / 3600.0, format='jd')
-    aiafits = DButil.readsdofile(datadir=aiadir_default, wavelength=aiawave, trange=trange, isexists=True)
+    aiafits = _as_aia_file_list(
+        DButil.readsdofile(datadir=aiadir_default, wavelength=aiawave, trange=trange, isexists=True)
+    )
     if not aiafits:
-        aiafits = DButil.readsdofileX(datadir='./', wavelength=aiawave, trange=trange, isexists=True)
+        aiafits = _as_aia_file_list(
+            DButil.readsdofileX(datadir='./', wavelength=aiawave, trange=trange, isexists=True)
+        )
     if not aiafits:
-        aiafits = DButil.readsdofileX(datadir=aiadir, wavelength=aiawave, trange=trange, isexists=True)
+        aiafits = _as_aia_file_list(
+            DButil.readsdofileX(datadir=aiadir, wavelength=aiawave, trange=trange, isexists=True)
+        )
     if not aiafits:
-        download_aia_data(trange, wavelengths=[aiawave])
-        aiafits = DButil.readsdofileX(datadir='./', wavelength=aiawave, trange=trange, isexists=True)
+        aiafits = _as_aia_file_list(download_aia_data(trange, wavelengths=[aiawave], outdir=aiadir))
+    if not aiafits:
+        aiafits = _as_aia_file_list(
+            DButil.readsdofileX(datadir=aiadir, wavelength=aiawave, trange=trange, isexists=True)
+        )
     return aiafits
 
 
@@ -1149,8 +1538,9 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
     :type aiafits: str, optional
     :param aiadir: Directory to search for AIA FITS files, defaults to None.
     :type aiadir: str, optional
-    :param aiawave: AIA wavelength to use, defaults to 171.
-    :type aiawave: int, optional
+    :param aiawave: AIA wavelength to use, or an HMI alias such as
+        ``'hmi_continuum'`` or ``'hmi_magnetogram'``. Defaults to 171.
+    :type aiawave: int or str, optional
     :param plotaia: If True, plot AIA data, defaults to True.
     :type plotaia: bool, optional
     :param freqbounds: Frequency bounds for plotting, defaults to None.
@@ -1403,19 +1793,25 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                 aiafiles = []
                 for i in tqdm(range(ntime)):
                     plttime = btimes[i]
-                    aiafile = DButil.readsdofileX(datadir=aiadir, wavelength=aiawave, trange=plttime, isexists=True,
-                                                  timtol=timtol)
-                    if not aiafile:
-                        aiafile = DButil.readsdofile(datadir=aiadir_default, wavelength=aiawave, trange=plttime,
-                                                     isexists=True,
-                                                     timtol=timtol)
-                    if not aiafile:
-                        aiafile = DButil.readsdofileX(datadir='./', wavelength=aiawave, trange=plttime, isexists=True,
-                                                      timtol=timtol)
+                    if _is_hmi_wave(aiawave):
+                        aiafile_list = trange2aiafits(plttime, aiawave, aiadir)
+                        aiafile = aiafile_list[0] if aiafile_list else []
+                    else:
+                        aiafile = DButil.readsdofileX(datadir=aiadir, wavelength=aiawave, trange=plttime,
+                                                      isexists=True, timtol=timtol)
+                        if not aiafile:
+                            aiafile = DButil.readsdofile(datadir=aiadir_default, wavelength=aiawave, trange=plttime,
+                                                         isexists=True,
+                                                         timtol=timtol)
+                        if not aiafile:
+                            aiafile = DButil.readsdofileX(datadir='./', wavelength=aiawave, trange=plttime,
+                                                          isexists=True,
+                                                          timtol=timtol)
                     if aiafile == []:
                         if verbose:
-                            print('No AIA fits files found. Downloading AIA data...')
-                        aiafile = download_aia_data(trange=plttime, wavelengths=aiawave, cadence=dt * u.second)[0]
+                            print('No SDO fits files found. Downloading SDO data...')
+                        downloaded = download_aia_data(trange=plttime, wavelengths=aiawave, cadence=dt * u.second)
+                        aiafile = downloaded[0] if downloaded else []
                         # print(f'download jp2: {aiafile}')
                     aiafiles.append(aiafile)
                     # print(i, aiafile)
@@ -1534,15 +1930,8 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                 try:
                     aiafits = aiafiles[i]
                     if verbose:
-                        print(f'plotting AIA image at {plttime.iso}: {aiafits}')
-                    aiamap = smap.Map(aiafits)
-                    if aiafits.endswith('.jp2'):
-                        aia_jp2 = True
-                    if not aia_jp2:
-                        aiamap = DButil.normalize_aiamap(aiamap)
-                        data = aiamap.data
-                        data[data < 1.0] = 1.0
-                        aiamap = smap.Map(data, aiamap.meta)
+                        print(f'plotting SDO image at {plttime.iso}: {aiafits}')
+                    aiamap, aia_jp2, _ = _prepare_context_map(aiafits, aiawave, verbose=verbose)
                 except Exception as e:
                     aiamap = None
                     if verbose:
@@ -1665,29 +2054,21 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
 
                 if plotaia:
                     if aiamap:
-                        if amax is None:
-                            amax = np.nanmax(aiamap.data)
-                        if amin is None:
-                            amin = 1.0
-                        if aia_jp2:
-                            _anorm = get_normalization(0, 255, 'linear')
-                        else:
-                            _anorm = get_normalization(amin, amax, anorm)
-                        if acmap is None:
-                            acmap = 'gray_r'
+                        _anorm = _context_map_norm(aiamap, aiawave, aia_jp2, amin, amax, anorm)
+                        cmap_context = _context_cmap(aiawave, acmap or 'gray_r')
 
                         if nspw > 1:
                             # print(f'adding radio images at s: {s}, sp: {sp}: spwpltCounts: {spwpltCounts}')
                             if spwpltCounts == 0:
                                 aiamap_ = pmX.Sunmap(aiamap)
-                                aiamap_.imshow(axes=ax, cmap=acmap,
+                                aiamap_.imshow(axes=ax, cmap=cmap_context,
                                                norm=_anorm,
                                                interpolation='nearest')
                                 # print(
                                 #     f'radio image at sp:{sp} pol:{pol} at {plttime.iso} aiamap.data.max: {np.nanmax(aiamap.data)}')
                         else:
                             aiamap_ = pmX.Sunmap(aiamap)
-                            aiamap_.imshow(axes=ax, cmap=acmap,
+                            aiamap_.imshow(axes=ax, cmap=cmap_context,
                                            norm=_anorm,
                                            interpolation='nearest')
                     else:
@@ -1959,9 +2340,9 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                 dnorm: Normalization method (string or Normalize object), overriding dmax and dmin.
 
             SDO/AIA image plotting parameters:
-                plotaia: Boolean. Downloads and plots AIA image at specified aiawave if True.
-                aiawave: AIA image passband to download and display.
-                aiafits: Directly plots AIA image from provided FITS file, skipping download. (note: users can provide any solar image FITS file for plotting).
+                plotaia: Boolean. Downloads and plots SDO context image at specified aiawave if True.
+                aiawave: AIA image passband or HMI alias to download and display.
+                aiafits: Directly plots SDO image from provided FITS file, skipping download. (note: users can provide any solar image FITS file for plotting).
                 aiadir: Searches this directory for AIA image files to skip download.
                 acmap: Color map (string or Colormap object) for AIA images.
                 amin, amax: Color scale range for AIA image normalization before color mapping.
@@ -2445,40 +2826,39 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
             # third part
             # start to download the fits files
             if plotaia:
-                if acmap is None:
-                    if sunpy1:
-                        cmap_aia = plt.get_cmap('sdoaia{}'.format(aiawave))
-                    else:
-                        cmap_aia = cm_sunpy.get_cmap('sdoaia{}'.format(aiawave))
-                else:
-                    cmap_aia = plt.get_cmap(acmap)
+                cmap_aia = _context_cmap(aiawave, acmap)
                 cmap_aia.set_bad(cmap_aia(0.0))
                 if not aiafits:
                     try:
-                        if int(aiawave) in [171, 131, 94, 335, 304, 211, 193]:
+                        if _is_hmi_wave(aiawave):
+                            tdf = 90. / 24 / 3600
+                        elif int(aiawave) in [171, 131, 94, 335, 304, 211, 193]:
                             tdf = 6. / 24 / 3600
                         else:
                             tdf = 12. / 24 / 3600
                         newlist = trange2aiafits(Time([midtime_mjd - tdf, midtime_mjd + tdf], format='mjd'), aiawave,
                                                  aiadir)
-                    except:
-                        newlist = [-1]
+                    except Exception as e:
+                        if verbose:
+                            print(f'Error in retrieving SDO data: {e}')
+                        newlist = []
                 else:
                     newlist = [aiafits]
 
                 try:
-                    aiafits = newlist[0]
-                    aiamap = smap.Map(aiafits)
-                    aia_jp2 = False
-                    if aiafits.endswith('.jp2'):
-                        aia_jp2 = True
-                    if not aia_jp2:
-                        aiamap = DButil.normalize_aiamap(aiamap)
-                        data = aiamap.data
-                        data[data < 1.0] = 1.0
-                        aiamap = smap.Map(data, aiamap.meta)
+                    if newlist:
+                        aiafits = newlist[0]
+                        if verbose:
+                            print('plotting SDO image at {0}: {1}'.format(
+                                Time(midtime_mjd, format='mjd').iso, aiafits))
+                        aiamap, aia_jp2, _ = _prepare_context_map(
+                            aiafits, aiawave, target_time=Time(midtime_mjd, format='mjd'), verbose=verbose)
+                    else:
+                        aiamap = None
+                        if verbose:
+                            print('No SDO files found. Proceed without SDO context image.')
                 except:
-                    print('error in reading aiafits. Proceed without AIA')
+                    print('error in reading aiafits. Proceed without SDO context image')
 
         if (os.path.exists(outfits)) and (not overwrite):
             pass
@@ -2744,18 +3124,10 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                         else:
                             clvls[pol] = np.array(clevels)
 
-            if 'aiamap' in vars():
-                if amax is None:
-                    amax = np.nanmax(aiamap.data)
-                if amin is None:
-                    amin = 1.0
+            if 'aiamap' in vars() and aiamap is not None:
+                _anorm = _context_map_norm(aiamap, aiawave, aia_jp2, amin, amax, anorm)
 
-                if aia_jp2:
-                    _anorm = get_normalization(0, 255, 'linear')
-                else:
-                    _anorm = get_normalization(amin, amax, anorm)
-
-                title0 = 'AIA {0:.0f} Å'.format(aiamap.wavelength.value)
+                title0 = _aia_title(aiamap, aiawave)
                 aiamap_ = pmX.Sunmap(aiamap)
 
                 axs = [ax4, ax6]
@@ -2815,10 +3187,10 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                                                          facecolor='none')
                             axs[pidx][0].add_patch(rect)
 
-                ax4.text(0.02, 0.02, 'AIA {0:.0f} '.format(aiamap.wavelength.value) + aiamap.date.strftime('%H:%M:%S'),
+                ax4.text(0.02, 0.02, title0 + ' ' + aiamap.date.strftime('%H:%M:%S'),
                          verticalalignment='bottom',
                          horizontalalignment='left', transform=ax4.transAxes, color='w', fontsize=9)
-                ax6.text(0.02, 0.02, 'AIA {0:.0f} '.format(aiamap.wavelength.value) + aiamap.date.strftime('%H:%M:%S'),
+                ax6.text(0.02, 0.02, title0 + ' ' + aiamap.date.strftime('%H:%M:%S'),
                          verticalalignment='bottom',
                          horizontalalignment='left', transform=ax6.transAxes, color='w', fontsize=9)
             else:

@@ -1,5 +1,5 @@
 from suncasa.suncasatasks import importeovsa
-from suncasa.suncasatasks import calibeovsa
+from suncasa.suncasatasks.private.task_calibeovsa import calibeovsa
 import sys
 # import importeovsa
 # import calibeovsa

@@ -9,7 +9,6 @@ if platform.system() == 'Linux':
     matplotlib.use('Agg')
 import os
 import shutil
-import json
 import numpy as np
 
 from eovsapy.util import extract as eoextract
@@ -17,13 +16,40 @@ from eovsapy.util import Time
 from eovsapy import cal_header as ch
 from eovsapy import dbutil as db
 from eovsapy import pipeline_cal as pc
-from eovsapy.sqlutil import sql2refcalX, sql2phacalX
+from eovsapy.sqlutil import sql2refcalX, sql2phacalX, sql2refcal_bphsbdX
 from .. import concateovsa
 from suncasa.eovsa.update_log import EOVSA15_UPGRADE_DATE, DCM_IF_FILTER_UPGRADE_DATE
 
 from ...casa_compat import import_casatools, import_casatasks
 
-REFCAL_NPZ_MODES = ('triplet', 'smooth_model', 'bph_sbd')
+from eovsapy.calibeovsa_bph_sbd import (
+    _normalize_refcal_npz_mode,
+    _refcal_npz_mode_label,
+    _npz_json_scalar,
+    _merge_npz_promoted_anchor_arrays,
+    _promoted_source_antennas_for_phacal,
+    _apply_promoted_source_phacal_self_anchor,
+    _load_npz_triplet,
+    _triplet_has_band,
+    _triplet_value,
+    _triplet_flagged,
+    _triplet_slot_usable,
+    _operator_flagged,
+    _array_value_3d,
+    _array_flagged_3d,
+    _lo_data_ignored_for_ant,
+    _npz_triplet_for_band,
+    _apply_promoted_active_sbd,
+    _smooth_refcal_active_sbd,
+    _smooth_refcal_sbd_for_band,
+    _gencal_sbd_phase_at_spw_reference,
+    _triplet_bph_sbd_terms_for_band,
+    _bph_candidate_for_band,
+    _bph_sbd_phase_base_for_band,
+    load_calwidget_v2_npz,
+    _attach_secondary_bph_refcal,
+    REFCAL_NPZ_MODES,
+)
 
 tasks = import_casatasks('split', 'tclean', 'gencal', 'clearcal', 'applycal', 'flagdata', 'casalog', 'bandpass')
 split = tasks.get('split')
@@ -47,535 +73,49 @@ qa = qatool()
 ia = iatool()
 
 
-def _normalize_refcal_npz_mode(mode):
-    mode = str(mode or 'smooth_model').strip().lower().replace('-', '_')
-    if mode not in REFCAL_NPZ_MODES:
-        raise ValueError(
-            "refcal_npz_mode must be one of {0}; got {1!r}".format(
-                ", ".join(REFCAL_NPZ_MODES),
-                mode,
-            )
-        )
-    return mode
-
-
-def _refcal_npz_mode_label(mode):
-    if mode == 'smooth_model':
-        return 'smooth-model refcal mode'
-    if mode == 'bph_sbd':
-        return 'saved band-phase + SBD refcal mode'
-    return 'legacy triplet refcal mode'
-
-
-def _npz_json_scalar(data, key, default):
-    if key not in data.files:
-        return default
+def _valid_sql_bphsbd_arrays(record):
+    if not isinstance(record, dict):
+        return None, "record missing"
+    missing = [key for key in ("bph_rad", "sbd_ns", "flag") if key not in record]
+    if missing:
+        return None, "missing {0}".format(",".join(missing))
     try:
-        return json.loads(str(np.asarray(data[key]).item()))
-    except Exception:
-        return default
+        bph = np.asarray(record["bph_rad"], dtype=np.float64)
+        sbd = np.asarray(record["sbd_ns"], dtype=np.float64)
+        flag = np.asarray(record["flag"], dtype=np.float64)
+    except Exception as exc:
+        return None, "array conversion failed: {0}".format(exc)
+    if bph.ndim != 3 or sbd.ndim != 3 or flag.ndim != 3:
+        return None, "expected 3-D bph/sbd/flag arrays"
+    if bph.shape != sbd.shape or bph.shape != flag.shape:
+        return None, "shape mismatch bph={0} sbd={1} flag={2}".format(bph.shape, sbd.shape, flag.shape)
+    usable = np.isfinite(bph) & np.isfinite(sbd) & (flag == 0)
+    if not np.any(usable):
+        return None, "no finite unflagged BPH+SBD slots"
+    return (bph, sbd, flag), None
 
 
-def _merge_npz_promoted_anchor_arrays(data, promoted):
-    if 'refcal__promoted_anchor_antennas' not in data.files:
-        return promoted if isinstance(promoted, dict) else {}
-    out = dict(promoted) if isinstance(promoted, dict) else {}
-    antennas = np.asarray(data['refcal__promoted_anchor_antennas'], dtype=np.int32).reshape(-1)
-    scan_ids = np.asarray(
-        data['refcal__promoted_anchor_scan_ids'] if 'refcal__promoted_anchor_scan_ids' in data.files else [],
-        dtype=np.int32,
-    ).reshape(-1)
-    timestamps = np.asarray(
-        data['refcal__promoted_anchor_timestamp_lv'] if 'refcal__promoted_anchor_timestamp_lv' in data.files else [],
-        dtype=np.float64,
-    ).reshape(-1)
-    active_ns = np.asarray(
-        data['refcal__promoted_anchor_active_ns'] if 'refcal__promoted_anchor_active_ns' in data.files else [],
-        dtype=np.float64,
-    )
-    for idx, ant_i in enumerate(antennas.tolist()):
-        entry = dict(out.get(str(int(ant_i))) or {})
-        if idx < scan_ids.size and int(scan_ids[idx]) >= 0:
-            entry['from_phacal_scan_id'] = int(scan_ids[idx])
-        if idx < timestamps.size and np.isfinite(timestamps[idx]):
-            entry['from_phacal_timestamp_lv'] = float(timestamps[idx])
-            try:
-                entry.setdefault('from_phacal_timestamp_iso', Time(float(timestamps[idx]), format='lv').iso[:19])
-            except Exception:
-                pass
-        if active_ns.ndim == 2 and idx < active_ns.shape[0]:
-            row = np.asarray(active_ns[idx, :2], dtype=np.float64)
-            if np.any(np.isfinite(row)):
-                entry['anchor_active_ns'] = row.tolist()
-        out[str(int(ant_i))] = entry
-    return out
-
-
-def _promoted_source_antennas_for_phacal(refcal, scan_id, nant):
-    promoted = refcal.get('promoted_antennas') or {}
-    if not isinstance(promoted, dict):
-        return []
-    out = []
-    for ant_key, meta in promoted.items():
-        if not isinstance(meta, dict):
-            continue
-        try:
-            ant_i = int(ant_key)
-            source_scan_id = int(meta.get('from_phacal_scan_id'))
-        except (TypeError, ValueError):
-            continue
-        if source_scan_id == int(scan_id) and 0 <= ant_i < int(nant):
-            out.append(ant_i)
-    return sorted(set(out))
-
-
-def _apply_promoted_source_phacal_self_anchor(refcal, phacal, scan_id):
-    pslope = np.asarray(phacal.get('pslope', []), dtype=np.float64)
-    poff = np.asarray(phacal.get('poff', []), dtype=np.float64)
-    if pslope.ndim != 2 or poff.ndim != 2 or pslope.shape[0] == 0:
-        return []
-    updated = []
-    for ant_i in _promoted_source_antennas_for_phacal(refcal, scan_id, pslope.shape[0]):
-        if ant_i >= poff.shape[0]:
-            continue
-        pslope[ant_i, :min(2, pslope.shape[1])] = pslope[0, :min(2, pslope.shape[1])]
-        poff[ant_i, :min(2, poff.shape[1])] = poff[0, :min(2, poff.shape[1])]
-        updated.append(int(ant_i))
-    return updated
-
-
-def _load_npz_triplet(data, prefix, fallback_flag):
-    keys = [
-        prefix + 'model_phi_band_rad',
-        prefix + 'model_tau_ib_ns',
-        prefix + 'model_tau_mb_eff_ns',
-        prefix + 'model_band_ref_freq_ghz',
-    ]
-    if not all(key in data.files for key in keys):
-        return None
-    phi = np.asarray(data[prefix + 'model_phi_band_rad'], dtype=np.float64)
-    if prefix + 'model_flag' in data.files:
-        model_flag = np.asarray(data[prefix + 'model_flag'])
-    elif fallback_flag is not None and np.asarray(fallback_flag).shape == phi.shape:
-        model_flag = np.asarray(fallback_flag)
-    else:
-        model_flag = np.zeros(phi.shape, dtype=np.int32)
-    return {
-        'phi_band_rad': phi,
-        'tau_ib_ns': np.asarray(data[prefix + 'model_tau_ib_ns'], dtype=np.float64),
-        'tau_mb_eff_ns': np.asarray(data[prefix + 'model_tau_mb_eff_ns'], dtype=np.float64),
-        'band_ref_freq_ghz': np.asarray(data[prefix + 'model_band_ref_freq_ghz'], dtype=np.float64),
-        'flag': model_flag,
-    }
-
-
-def _triplet_has_band(triplet, band_i):
-    if not triplet or band_i < 0:
-        return False
-    phi = np.asarray(triplet.get('phi_band_rad', []), dtype=np.float64)
-    tau_ib = np.asarray(triplet.get('tau_ib_ns', []), dtype=np.float64)
-    tau_mb = np.asarray(triplet.get('tau_mb_eff_ns', []), dtype=np.float64)
-    band_ref = np.asarray(triplet.get('band_ref_freq_ghz', []), dtype=np.float64)
-    flag = np.asarray(triplet.get('flag', []))
-    if (
-        phi.ndim != 3
-        or tau_ib.ndim not in (2, 3)
-        or tau_mb.ndim != 2
-        or band_i >= phi.shape[2]
-        or band_i >= band_ref.size
-        or not np.isfinite(band_ref[band_i])
-    ):
-        return False
-    valid = np.isfinite(phi[:, :, band_i]) & np.isfinite(tau_mb)
-    if tau_ib.ndim == 3:
-        if band_i >= tau_ib.shape[2]:
-            return False
-        valid &= np.isfinite(tau_ib[:, :, band_i])
-    else:
-        valid &= np.isfinite(tau_ib)
-    if flag.ndim == 3 and band_i < flag.shape[2]:
-        valid &= flag[:, :, band_i] == 0
-    return bool(np.any(valid))
-
-
-def _triplet_value(triplet, key, ant_i, pol_i, band_i, default=np.nan):
-    arr = np.asarray(triplet.get(key, []), dtype=np.float64)
-    if arr.ndim == 3:
-        if ant_i < arr.shape[0] and pol_i < arr.shape[1] and band_i < arr.shape[2]:
-            return arr[ant_i, pol_i, band_i]
-    elif arr.ndim == 2:
-        if ant_i < arr.shape[0] and pol_i < arr.shape[1]:
-            return arr[ant_i, pol_i]
-    elif arr.ndim == 1:
-        if band_i < arr.size:
-            return arr[band_i]
-    return default
-
-
-def _triplet_flagged(triplet, ant_i, pol_i, band_i):
-    flag = np.asarray(triplet.get('flag', []))
-    return (
-        flag.ndim == 3
-        and ant_i < flag.shape[0]
-        and pol_i < flag.shape[1]
-        and band_i < flag.shape[2]
-        and flag[ant_i, pol_i, band_i] == 1
-    )
-
-
-def _triplet_slot_usable(triplet, ant_i, pol_i, band_i):
-    if not triplet or band_i < 0:
-        return False
-    phi = np.asarray(triplet.get('phi_band_rad', []), dtype=np.float64)
-    tau_ib = np.asarray(triplet.get('tau_ib_ns', []), dtype=np.float64)
-    tau_mb = np.asarray(triplet.get('tau_mb_eff_ns', []), dtype=np.float64)
-    band_ref = np.asarray(triplet.get('band_ref_freq_ghz', []), dtype=np.float64)
-    if (
-        phi.ndim != 3
-        or ant_i >= phi.shape[0]
-        or pol_i >= phi.shape[1]
-        or band_i >= phi.shape[2]
-        or band_i >= band_ref.size
-        or tau_mb.ndim != 2
-        or ant_i >= tau_mb.shape[0]
-        or pol_i >= tau_mb.shape[1]
-        or _triplet_flagged(triplet, ant_i, pol_i, band_i)
-    ):
-        return False
-    if tau_ib.ndim == 3:
-        if ant_i >= tau_ib.shape[0] or pol_i >= tau_ib.shape[1] or band_i >= tau_ib.shape[2]:
-            return False
-        ib_ns = tau_ib[ant_i, pol_i, band_i]
-    elif tau_ib.ndim == 2:
-        if ant_i >= tau_ib.shape[0] or pol_i >= tau_ib.shape[1]:
-            return False
-        ib_ns = tau_ib[ant_i, pol_i]
-    else:
-        return False
-    return bool(
-        np.isfinite(phi[ant_i, pol_i, band_i])
-        and np.isfinite(ib_ns)
-        and np.isfinite(tau_mb[ant_i, pol_i])
-        and np.isfinite(band_ref[band_i])
-    )
-
-
-def _operator_flagged(refcal, ant_i, pol_i, band_i):
-    flags = np.asarray(refcal.get('operator_band_flag', []), dtype=np.uint8)
-    return (
-        flags.ndim == 3
-        and ant_i < flags.shape[0]
-        and pol_i < flags.shape[1]
-        and band_i < flags.shape[2]
-        and flags[ant_i, pol_i, band_i] != 0
-    )
-
-
-def _array_value_3d(values, ant_i, pol_i, band_i, default=np.nan):
-    arr = np.asarray(values, dtype=np.float64)
-    if (
-        arr.ndim == 3
-        and ant_i < arr.shape[0]
-        and pol_i < arr.shape[1]
-        and band_i < arr.shape[2]
-    ):
-        return arr[ant_i, pol_i, band_i]
-    return default
-
-
-def _array_flagged_3d(values, ant_i, pol_i, band_i):
-    arr = np.asarray(values)
-    return (
-        arr.ndim == 3
-        and ant_i < arr.shape[0]
-        and pol_i < arr.shape[1]
-        and band_i < arr.shape[2]
-        and arr[ant_i, pol_i, band_i] != 0
-    )
-
-
-def _lo_data_ignored_for_ant(refcal, ant_i):
-    ignored = np.asarray(refcal.get('lo_data_ignored_antennas', []), dtype=np.uint8).reshape(-1)
-    return ant_i < ignored.size and ignored[ant_i] != 0
-
-
-def _npz_triplet_for_band(refcal, band_i):
-    triplets = refcal.get('gencal_triplets') or {}
-    lo = triplets.get('lo')
-    hi = triplets.get('hi') or triplets.get('legacy') or refcal.get('gencal_triplet')
-    if _triplet_has_band(hi, band_i):
-        return 'hi', hi
-    if _triplet_has_band(lo, band_i):
-        return 'lo', lo
-    return None, None
-
-
-def _apply_promoted_active_sbd(active_ns, promoted):
-    if active_ns.ndim != 2 or not isinstance(promoted, dict):
-        return 0
-    updated = 0
-    for ant_key, meta in promoted.items():
-        if not isinstance(meta, dict):
-            continue
-        try:
-            ant_i = int(ant_key)
-        except (TypeError, ValueError):
-            continue
-        if ant_i < 0 or ant_i >= active_ns.shape[0]:
-            continue
-        values = np.asarray(meta.get('anchor_active_ns', []), dtype=np.float64).reshape(-1)
-        if values.size == 0:
-            continue
-        npol = min(active_ns.shape[1], values.size, 2)
-        if npol <= 0 or not np.any(np.isfinite(values[:npol])):
-            continue
-        finite = np.isfinite(values[:npol])
-        active_ns[ant_i, :npol] = np.where(finite, values[:npol], active_ns[ant_i, :npol])
-        updated += 1
-    return updated
-
-
-def _smooth_refcal_active_sbd(refcal):
-    active = np.asarray(refcal.get('active_ns', []), dtype=np.float64)
-    if active.ndim != 2 or active.shape[1] < 2 or active.size == 0:
-        raise ValueError(
-            "smooth-model refcal mode cannot obtain a reliable SBD source from the NPZ; "
-            "missing refcal__active_ns/effective active in-band delay"
-        )
-    return active
-
-
-def _smooth_refcal_sbd_for_band(refcal, active_sbd, ant_i, pol_i, band_i):
-    triplets = refcal.get('gencal_triplets') or {}
-    for triplet in (triplets.get('hi'), triplets.get('legacy'), refcal.get('gencal_triplet')):
-        if not _triplet_has_band(triplet, band_i):
-            continue
-        if _triplet_flagged(triplet, ant_i, pol_i, band_i):
-            continue
-        ib_ns = _triplet_value(triplet, 'tau_ib_ns', ant_i, pol_i, band_i, default=np.nan)
-        mb_ns = _triplet_value(triplet, 'tau_mb_eff_ns', ant_i, pol_i, band_i, default=np.nan)
-        if np.isfinite(ib_ns) and np.isfinite(mb_ns):
-            return float(ib_ns + mb_ns)
-    if ant_i < active_sbd.shape[0] and pol_i < active_sbd.shape[1]:
-        return float(active_sbd[ant_i, pol_i])
-    return np.nan
-
-
-def _gencal_sbd_phase_at_spw_reference(freq_ghz, sbd_ns):
-    del freq_ghz, sbd_ns
-    return 0.0
-
-
-def _triplet_bph_sbd_terms_for_band(triplet, ant_i, pol_i, band_i):
-    if not _triplet_slot_usable(triplet, ant_i, pol_i, band_i):
-        return np.nan, np.nan
-    phase_rad = _triplet_value(triplet, 'phi_band_rad', ant_i, pol_i, band_i, default=np.nan)
-    ib_ns = _triplet_value(triplet, 'tau_ib_ns', ant_i, pol_i, band_i, default=np.nan)
-    mb_ns = _triplet_value(triplet, 'tau_mb_eff_ns', ant_i, pol_i, band_i, default=np.nan)
-    band_ref = _triplet_value(triplet, 'band_ref_freq_ghz', ant_i, pol_i, band_i, default=np.nan)
-    if not all(np.isfinite(value) for value in (phase_rad, ib_ns, mb_ns, band_ref)):
-        return np.nan, np.nan
-    return float(phase_rad + 2.0 * np.pi * float(band_ref) * float(mb_ns)), float(ib_ns + mb_ns)
-
-
-def _bph_candidate_for_band(refcal, band_phase, band_flag, ant_i, pol_i, band_i, freq_ghz, hi_sbd_ns, label):
-    if _operator_flagged(refcal, ant_i, pol_i, band_i):
-        return np.nan, np.nan, True, None
-    source_prefix = '' if label == 'primary' else label + '_'
-    lo_band = np.isfinite(freq_ghz) and float(freq_ghz) <= 3.0
-    if lo_band and not _lo_data_ignored_for_ant(refcal, ant_i):
-        lo_triplet = (refcal.get('gencal_triplets') or {}).get('lo')
-        lo_phase, lo_sbd_ns = _triplet_bph_sbd_terms_for_band(lo_triplet, ant_i, pol_i, band_i)
-        if np.isfinite(lo_phase) and np.isfinite(lo_sbd_ns):
-            return (
-                float(lo_phase),
-                float(lo_sbd_ns),
-                False,
-                source_prefix + 'lo_model',
-            )
-    phase = _array_value_3d(band_phase, ant_i, pol_i, band_i, default=np.nan)
-    if np.isfinite(phase) and not _array_flagged_3d(band_flag, ant_i, pol_i, band_i):
-        return float(phase), float(hi_sbd_ns), False, source_prefix + 'band_phase'
-    return np.nan, np.nan, True, None
-
-
-def _bph_sbd_phase_base_for_band(
-        refcal, band_phase, band_flag, smooth_model_pha,
-        ant_i, pol_i, band_i, freq_ghz, hi_sbd_ns):
-    phase, sbd_ns, flagged, source = _bph_candidate_for_band(
-        refcal, band_phase, band_flag, ant_i, pol_i, band_i, freq_ghz, hi_sbd_ns, 'primary'
-    )
-    if not flagged and source:
-        return phase, sbd_ns, False, source
-    secondary = refcal.get('secondary_bph_refcal')
-    if isinstance(secondary, dict):
-        phase, sbd_ns, flagged, source = _bph_candidate_for_band(
-            secondary,
-            secondary.get('band_phase_rad', []),
-            secondary.get('band_phase_flag', []),
-            ant_i,
-            pol_i,
-            band_i,
-            freq_ghz,
-            hi_sbd_ns,
-            'secondary',
-        )
-        if not flagged and source:
-            return phase, sbd_ns, False, source
-    # HI smooth/extrapolated model on LO grid when both primary and secondary
-    # candidates fail.  ``smooth_model_pha`` holds the NaN-preserving
-    # refcal__model_pha from the NPZ, which carries HI smooth-model values at LO
-    # band centers when the NPZ was saved with require_model_mask=False.  This
-    # fallback fires precisely *because* no valid LO phase exists for the slot
-    # (LO absent or LO-flagged), so it is gated only on a finite model value and
-    # the operator flag -- NOT on the raw LO data flag, which is the trigger
-    # condition itself.  A bad HI model is excluded via the operator flag.  SBD
-    # stays hi_sbd_ns per the bph_sbd contract.
-    lo_band = np.isfinite(freq_ghz) and float(freq_ghz) <= 3.0
-    if lo_band and not _operator_flagged(refcal, ant_i, pol_i, band_i):
-        hi_phase = _array_value_3d(smooth_model_pha, ant_i, pol_i, band_i, default=np.nan)
-        if np.isfinite(hi_phase):
-            return float(hi_phase), float(hi_sbd_ns), False, 'hi_smooth_extrap'
-    return 0.0, np.nan, True, 'bph_missing'
-
-
-def load_calwidget_v2_npz(npz_path):
-    '''Load refcal + phacals from a calwidget v2 calibeovsa-ready NPZ.
-
-    Returns a tuple ``(refcal, phacals)`` whose dict layout matches what
-    :func:`eovsapy.sqlutil.sql2refcalX` and :func:`sql2phacalX` produce, so the
-    rest of :func:`calibeovsa` can consume them unchanged.
-
-    Promoted-antenna metadata (the per-antenna source phacal timestamp written
-    by ``Promote to Refcal``) is attached to ``refcal['promoted_antennas']``.
-    Newer NPZs also carry per-antenna phacal anchor scan/time arrays.
-    '''
-    with np.load(npz_path, allow_pickle=False) as data:
-        kind = str(data['kind'])
-        if kind != 'calibeovsa_v1':
-            raise ValueError(
-                'Unrecognized calwidget v2 npz kind {0!r} in {1}'.format(kind, npz_path)
-            )
-        vis = data['refcal__vis_real'] + 1j * data['refcal__vis_imag']
-        raw_flag = np.asarray(data['refcal__flag'])
-        flag = np.asarray(raw_flag).copy()
-        # Prefer the widget's smooth analytic-fit phase (Chebyshev for Ant 1,
-        # polynomial for Ant 2+) as the calibration phase — that IS the
-        # calibration the widget intends to apply. Fall back to the raw
-        # band-averaged vis phase for older NPZs without refcal__model_pha.
-        # NaN entries in the model mark (ant, pol, band) combinations the
-        # widget did not fit (missing bands, masked antennas); promote those
-        # to flag=1 so downstream zeroing (pha[flag==1]=0) handles them.
-        has_model_pha = 'refcal__model_pha' in data.files and data['refcal__model_pha'].size > 0
-        if has_model_pha:
-            model_pha = np.asarray(data['refcal__model_pha'], dtype=np.float64)
-            fitted = np.isfinite(model_pha)
-            pha = np.where(fitted, model_pha, 0.0)
-            flag = np.where(fitted, flag, 1).astype(flag.dtype)
-            pha_source = 'refcal__model_pha'
-            # NaN-preserving copy of the exported smooth model. The bph_sbd LO
-            # HI-extrapolation fallback reads this (not the zero-filled, raw-flag
-            # gated ``pha``) so HI smooth-model values at LO band centers survive
-            # for slots whose raw LO flag is 1 because no LO refcal was saved.
-            model_pha_raw = model_pha
-        else:
-            pha = np.angle(vis)
-            pha_source = 'angle(refcal__vis)'
-            model_pha_raw = np.full(np.asarray(pha).shape, np.nan, dtype=np.float64)
-        promoted = _merge_npz_promoted_anchor_arrays(
-            data,
-            _npz_json_scalar(data, 'refcal__promoted_antennas_json', {}),
-        )
-        refcal = {
-            'pha': pha,
-            'amp': np.abs(vis),
-            'flag': flag,
-            'sigma': np.asarray(data['refcal__sigma']),
-            'fghz': np.asarray(data['refcal__fghz']),
-            'timestamp': Time(float(data['refcal__timestamp_lv']), format='lv'),
-            't_bg': Time(float(data['refcal__t_bg_lv']), format='lv'),
-            't_ed': Time(float(data['refcal__t_ed_lv']), format='lv'),
-            'promoted_antennas': promoted,
-            'pha_source': pha_source,
-            'model_pha_raw': model_pha_raw,
-            'band_phase_rad': np.angle(vis),
-            'band_phase_flag': np.asarray(raw_flag).copy(),
-        }
-        if 'refcal__active_ns' in data.files:
-            active_ns = np.asarray(data['refcal__active_ns'], dtype=np.float64).copy()
-            active_ns_source = 'refcal__active_ns'
-            if _apply_promoted_active_sbd(active_ns, promoted):
-                active_ns_source += '+refcal__promoted_anchor_active_ns'
-            refcal['active_ns'] = active_ns
-            refcal['active_ns_source'] = active_ns_source
-        legacy_triplet = _load_npz_triplet(data, 'refcal__', flag)
-        hi_triplet = _load_npz_triplet(data, 'refcal__hi_', flag) or legacy_triplet
-        lo_triplet = _load_npz_triplet(data, 'refcal__lo_', flag)
-        refcal['gencal_triplets'] = {
-            'legacy': legacy_triplet,
-            'hi': hi_triplet,
-            'lo': lo_triplet,
-        }
-        if hi_triplet is not None:
-            refcal['gencal_triplet'] = hi_triplet
-        if 'refcal__operator_band_flag' in data.files:
-            refcal['operator_band_flag'] = np.asarray(data['refcal__operator_band_flag'], dtype=np.uint8)
-        elif 'refcal__manual_ant_flag_override' in data.files and hi_triplet is not None:
-            manual = np.asarray(data['refcal__manual_ant_flag_override'], dtype=bool).reshape(-1)
-            op = np.zeros(np.asarray(hi_triplet['phi_band_rad']).shape, dtype=np.uint8)
-            limit = min(op.shape[0], manual.size)
-            if limit:
-                op[:limit, :, :] = manual[:limit, None, None]
-            refcal['operator_band_flag'] = op
-        if 'refcal__lo_data_ignored_antennas' in data.files:
-            refcal['lo_data_ignored_antennas'] = np.asarray(
-                data['refcal__lo_data_ignored_antennas'], dtype=np.uint8
-            )
-        phacal_ids = [int(v) for v in np.asarray(data['phacal_scan_ids']).tolist()]
-        phacals = []
-        for scan_id in phacal_ids:
-            prefix = 'phacal_{0}'.format(scan_id)
-            inner = {
-                'pha': np.asarray(data[prefix + '__phacal_pha']),
-                'amp': np.asarray(data[prefix + '__phacal_amp']),
-                'flag': np.asarray(data[prefix + '__phacal_flag']),
-                'sigma': np.asarray(data[prefix + '__phacal_sigma']),
-                'fghz': np.asarray(data[prefix + '__phacal_fghz']),
-                'timestamp': Time(float(data[prefix + '__t_pha_lv']), format='lv'),
-                't_bg': Time(float(data[prefix + '__phacal_t_bg_lv']), format='lv'),
-                't_ed': Time(float(data[prefix + '__phacal_t_ed_lv']), format='lv'),
-            }
-            phacal = {
-                'pslope': np.asarray(data[prefix + '__pslope'], dtype=np.float64).copy(),
-                't_pha': Time(float(data[prefix + '__t_pha_lv']), format='lv'),
-                'flag': np.asarray(data[prefix + '__flag']),
-                'poff': np.asarray(data[prefix + '__poff'], dtype=np.float64).copy(),
-                't_ref': Time(float(data[prefix + '__t_ref_lv']), format='lv'),
-                't_bg': Time(float(data[prefix + '__t_bg_lv']), format='lv'),
-                't_ed': Time(float(data[prefix + '__t_ed_lv']), format='lv'),
-                'phacal': inner,
-            }
-            if prefix + '__anchor_scan_id' in data.files:
-                phacal['anchor_scan_id'] = np.asarray(data[prefix + '__anchor_scan_id'], dtype=np.int32)
-            if prefix + '__anchor_timestamp_lv' in data.files:
-                phacal['anchor_timestamp'] = Time(
-                    np.asarray(data[prefix + '__anchor_timestamp_lv'], dtype=np.float64),
-                    format='lv',
-                )
-            if prefix + '__anchor_is_promoted' in data.files:
-                phacal['anchor_is_promoted'] = np.asarray(data[prefix + '__anchor_is_promoted'], dtype=np.uint8)
-            _apply_promoted_source_phacal_self_anchor(refcal, phacal, scan_id)
-            phacals.append(phacal)
-    return refcal, phacals
-
-
-def _attach_secondary_bph_refcal(refcal, secondary_npz):
-    if not secondary_npz:
-        return None
-    secondary_refcal, _secondary_phacals = load_calwidget_v2_npz(secondary_npz)
-    refcal['secondary_bph_refcal'] = secondary_refcal
-    refcal['secondary_npz'] = str(secondary_npz)
-    return secondary_refcal
+def _attach_sql_bphsbd_refcal(refcal, record, arrays):
+    bph, sbd, flag = arrays
+    if not isinstance(refcal, dict):
+        refcal = {}
+    refcal["resolved_bph_rad"] = bph
+    refcal["resolved_sbd_ns"] = sbd
+    refcal["resolved_flag"] = flag
+    refcal["sql_bphsbd_t_refcal"] = record.get("t_refcal")
+    if "timestamp" not in refcal:
+        refcal["timestamp"] = record.get("t_refcal") or record.get("timestamp")
+    if "t_bg" not in refcal:
+        refcal["t_bg"] = record.get("t_bg") or refcal.get("timestamp")
+    if "t_ed" not in refcal:
+        refcal["t_ed"] = record.get("t_ed") or refcal.get("timestamp")
+    if "pha" not in refcal:
+        refcal["pha"] = bph.copy()
+    if "amp" not in refcal:
+        refcal["amp"] = np.ones(bph.shape, dtype=np.float64)
+    if "flag" not in refcal:
+        refcal["flag"] = flag.copy()
+    return refcal
 
 
 def flag_phambd_by_spw(caltb, flagspw='0~1'):
@@ -606,7 +146,8 @@ def flag_phambd_by_spw(caltb, flagspw='0~1'):
 def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, doflag=True, flagant='',
                flagspw='', doimage=False, imagedir=None, antenna='', timerange=None, spw=None, stokes=None,
                dosplit=False, outputvis=None, doconcat=False, concatvis=None, keep_orig_ms=True,
-               keep_corrected_column=False, cal_npz=None, refcal_npz_mode='smooth_model', secondary_npz=None):
+               keep_corrected_column=False, cal_npz=None, refcal_npz_mode='bph_sbd', secondary_npz=None,
+               force_lo_hi_smooth_extrap=False):
     '''
 
     :param vis: EOVSA visibility dataset(s) to be calibrated 
@@ -636,6 +177,8 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
         print('Refcal NPZ apply mode selected: {0}'.format(_refcal_npz_mode_label(refcal_npz_mode)))
         if secondary_npz and refcal_npz_mode == 'bph_sbd':
             print('Secondary BPH NPZ selected: {0}'.format(secondary_npz))
+        if force_lo_hi_smooth_extrap and refcal_npz_mode == 'bph_sbd':
+            print('BPH+SBD LO phase base forced to HI smooth extrapolation for LO bands.')
 
     if type(vis) == str:
         vis = [vis]
@@ -728,7 +271,46 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 if cal_npz_refcal is not None:
                     refcal = cal_npz_refcal
                 else:
-                    refcal = sql2refcalX(btime)
+                    bphsbd_arrays = None
+                    try:
+                        bphsbd_rec = sql2refcal_bphsbdX(btime)
+                    except Exception as exc:
+                        bphsbd_rec = None
+                        bphsbd_reason = "query failed: {0}".format(exc)
+                    else:
+                        bphsbd_arrays, bphsbd_reason = _valid_sql_bphsbd_arrays(bphsbd_rec)
+                    if bphsbd_rec is not None and bphsbd_arrays is not None:
+                        try:
+                            refcal = sql2refcalX(btime)
+                            type8_time = refcal.get("timestamp")
+                            refcal = _attach_sql_bphsbd_refcal(refcal, bphsbd_rec, bphsbd_arrays)
+                            # Preserve the type-8 refcal time so the daily phacal time filter can
+                            # compare phacal t_ref against the refcal they were actually solved
+                            # against, rather than the superseding BPH+SBD t_refcal.
+                            refcal["type8_timestamp"] = type8_time
+                            msg_prompt = "SQL BPH+SBD refcal tables found; superseding type-8 phase calibration"
+                            if type8_time is not None:
+                                msg_prompt += " from type-8 refcal at {0}".format(type8_time.iso)
+                            t_refcal = bphsbd_rec.get("t_refcal")
+                            if t_refcal is not None:
+                                msg_prompt += " with BPH+SBD t_refcal {0}".format(t_refcal.iso)
+                            msg_prompt += "."
+                        except Exception as exc:
+                            refcal = _attach_sql_bphsbd_refcal({}, bphsbd_rec, bphsbd_arrays)
+                            msg_prompt = (
+                                "SQL BPH+SBD refcal tables found and used without type-8 metadata "
+                                "because sql2refcalX failed: {0}."
+                            ).format(exc)
+                        cal_src = "SQL BPH+SBD"
+                    else:
+                        refcal = sql2refcalX(btime)
+                        msg_prompt = (
+                            "SQL refcal BPH+SBD tables not usable ({0}); using SQL type-8 BPH only."
+                        ).format(
+                            bphsbd_reason or "record missing"
+                        )
+                    casalog.post(msg_prompt)
+                    print(msg_prompt)
                 # shape is 15 (nant) x 2 (npol) x 34 (nband)
                 # EOVSA15 upgrade-related Note:
                 # the number of antennas in refcal['pha'] is changed to 16 after EOVSA15 upgrade
@@ -739,6 +321,15 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 use_npz_triplets = bool(cal_npz_refcal is not None and refcal_npz_mode == 'triplet' and triplet)
                 use_npz_smooth_model = bool(cal_npz_refcal is not None and refcal_npz_mode == 'smooth_model')
                 use_npz_bph_sbd = bool(cal_npz_refcal is not None and refcal_npz_mode == 'bph_sbd')
+                resolved_bph = np.asarray(refcal.get('resolved_bph_rad', []), dtype=np.float64)
+                resolved_sbd = np.asarray(refcal.get('resolved_sbd_ns', []), dtype=np.float64)
+                resolved_flag = np.asarray(refcal.get('resolved_flag', []), dtype=np.float64)
+                use_resolved_tables = bool(
+                    not force_lo_hi_smooth_extrap
+                    and resolved_bph.ndim == 3
+                    and resolved_sbd.ndim == 3
+                    and resolved_flag.ndim == 3
+                )
                 smooth_sbd = None
                 if use_npz_smooth_model or use_npz_bph_sbd:
                     if refcal.get('pha_source') != 'refcal__model_pha':
@@ -747,7 +338,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                 'smooth-model refcal mode requires refcal__model_pha in the calwidget v2 NPZ'
                             )
                     smooth_sbd = _smooth_refcal_active_sbd(refcal)
-                if use_npz_smooth_model or use_npz_bph_sbd or not use_npz_triplets:
+                if use_npz_smooth_model or use_npz_bph_sbd or use_resolved_tables or not use_npz_triplets:
                     pha = np.asarray(refcal['pha'], dtype=np.float64).copy()
                     phase_flag = np.asarray(refcal['flag'])
                     pha[np.where(phase_flag == 1)] = 0.
@@ -813,7 +404,31 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                             selected_npz_models.add(band_triplet_name)
                     for n in range(nant - 1):
                         for p in range(2):
-                            if band_triplet:
+                            if use_resolved_tables:
+                                if (
+                                    n < resolved_bph.shape[0]
+                                    and p < resolved_bph.shape[1]
+                                    and band_i < resolved_bph.shape[2]
+                                    and n < resolved_sbd.shape[0]
+                                    and p < resolved_sbd.shape[1]
+                                    and band_i < resolved_sbd.shape[2]
+                                    and n < resolved_flag.shape[0]
+                                    and p < resolved_flag.shape[1]
+                                    and band_i < resolved_flag.shape[2]
+                                ):
+                                    ph = resolved_bph[n, p, band_i]
+                                    sb = resolved_sbd[n, p, band_i]
+                                    fl = resolved_flag[n, p, band_i]
+                                else:
+                                    ph = 0.0
+                                    sb = np.nan
+                                    fl = 1.0
+                                flagged = bool(fl) or not np.isfinite(sb)
+                                phase_flag_spw[n, p, s] = 1 if flagged else 0
+                                phase_rad = 0.0 if (flagged or not np.isfinite(ph)) else float(ph)
+                                para_sbd.append(0.0 if flagged else float(sb))
+                                selected_npz_models.add('resolved_tables')
+                            elif band_triplet:
                                 phase_rad = _triplet_value(
                                     band_triplet, 'phi_band_rad', n, p, band_i, default=np.nan
                                 )
@@ -863,11 +478,13 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                     band_phase,
                                     band_phase_flag,
                                     model_pha_lo_fallback,
+                                    None,
                                     n,
                                     p,
                                     band_i,
                                     float(cfreqs_spw[s]) * 1e-9,
                                     hi_sbd_ns,
+                                    force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
                                 )
                                 if not np.isfinite(sbd_ns):
                                     flagged = True
@@ -904,10 +521,15 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     print("NPZ refcal model namespaces selected by SPW: {0}".format(
                         ",".join(sorted(selected_npz_models)) if selected_npz_models else "none"
                     ))
-                if use_npz_bph_sbd:
+                if use_npz_bph_sbd and not use_resolved_tables:
                     print("BPH+SBD refcal sources selected by SPW: {0}; SBD source={1}".format(
                         ",".join(sorted(selected_npz_models)) if selected_npz_models else "none",
                         refcal.get('active_ns_source', 'unknown'),
+                    ))
+                if use_resolved_tables:
+                    print("{0} resolved BPH+SBD refcal tables selected by SPW: {1}".format(
+                        "NPZ" if cal_npz_refcal is not None else "SQL",
+                        ",".join(sorted(selected_npz_models)) if selected_npz_models else "none",
                     ))
                 if use_npz_smooth_model:
                     print("Smooth-model refcal mode selected; phase source={0}; SBD source={1}".format(
@@ -962,7 +584,9 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
             if ('refpha' in caltype) or ('refcal' in caltype):
                 # caltb_pha = os.path.basename(vis).replace('.ms', '.refpha')
                 # check if the calibration table already exists
-                if use_npz_triplets:
+                if use_resolved_tables:
+                    refcal_npz_suffix = '_npz_resolved_bph_sbd' if cal_npz_refcal is not None else '_sql_bph_sbd'
+                elif use_npz_triplets:
                     refcal_npz_suffix = '_npz_triplet'
                 elif use_npz_bph_sbd:
                     refcal_npz_suffix = '_npz_bph_sbd'
@@ -971,7 +595,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 else:
                     refcal_npz_suffix = ''
                 caltb_pha = dirname + t_ref.isot[:-4].replace(':', '').replace('-', '') + refcal_npz_suffix + '.refpha'
-                if (use_npz_triplets or use_npz_smooth_model or use_npz_bph_sbd) and os.path.exists(caltb_pha):
+                if (use_npz_triplets or use_npz_smooth_model or use_npz_bph_sbd or use_resolved_tables) and os.path.exists(caltb_pha):
                     shutil.rmtree(caltb_pha)
                 if not os.path.exists(caltb_pha):
                     gencal(vis=msfile, caltable=caltb_pha, caltype='ph', antenna=antennas, pol='X,Y',
@@ -1001,7 +625,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 refcal_gaintables = [caltb_pha]
                 gaintables.append(caltb_pha)
                 spwmaps.append([])
-                if use_npz_triplets or use_npz_smooth_model or use_npz_bph_sbd:
+                if use_npz_triplets or use_npz_smooth_model or use_npz_bph_sbd or use_resolved_tables:
                     delay_table_kinds = [('sbd', para_sbd, 'sbd', True)]
                     if use_npz_triplets:
                         delay_table_kinds.append(('mbd', para_mbd, 'mbd', False))
@@ -1032,8 +656,8 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                         gaintables.append(caltb_delay)
                         refcal_gaintables.append(caltb_delay)
                         spwmaps.append([])
-                    print("Refcal NPZ gaintables ({0}): {1}".format(
-                        refcal_npz_mode,
+                    print("Refcal model gaintables ({0}): {1}".format(
+                        'resolved_tables' if use_resolved_tables else refcal_npz_mode,
                         ", ".join(os.path.basename(path) for path in refcal_gaintables),
                     ))
             if ('refamp' in caltype) or ('refcal' in caltype):
@@ -1104,6 +728,22 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     phacals = np.array(cal_npz_phacals)
                 else:
                     phacals = np.array(sql2phacalX([bt, et], nrecords=0, neat=True, verbose=False))
+                # Drop phacals whose reference refcal time is >30 min after the refcal they were
+                # solved against. In the SQL BPH+SBD path refcal['timestamp'] is the BPH+SBD
+                # t_refcal, which can differ from the type-8 refcal the phacals reference, so
+                # compare against the captured type-8 time when available to avoid dropping every
+                # phacal. Build a keep mask -- `del` on a numpy/Time array raises
+                # "ValueError: cannot delete array elements".
+                if phacals.any() and len(phacals) > 0:
+                    phacal_ref_time = refcal.get('type8_timestamp') or refcal['timestamp']
+                    keep = np.array(
+                        [(phacal['t_ref'].jd - phacal_ref_time.jd) <= 30. / 1440. for phacal in phacals],
+                        dtype=bool,
+                    )
+                    if not np.all(keep):
+                        print("Filtered out {0} phacal(s) with reference time >30 min after refcal {1}".format(
+                            int(np.count_nonzero(~keep)), phacal_ref_time.iso))
+                    phacals = phacals[keep]
                 if not phacals.any() or len(phacals) == 0:
                     print(f"Found no phacal records in {cal_src}, will skip phase calibration")
                 else:
@@ -1116,40 +756,34 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     caltbs_phambd = []
                     caltbs_phambd_pha0 = []
                     for i, phacal in enumerate(phacals):
-                        # filter out phase cals with reference time stamp >30 min away from the provided refcal time
-                        if (phacal['t_ref'].jd - refcal['timestamp'].jd) > 30. / 1440.:
-                            del phacals[i]
-                            del t_phas[i]
-                            continue
-                        else:
-                            t_pha = phacal['t_pha']
-                            phambd_ns = phacal['pslope']
-                            for n in range(2):
-                                phambd_ns[:, n] -= phambd_ns[0, n]
-                            # set all flagged values to be zero
-                            phambd_ns[np.where(phacal['flag'] == 1)] = 0.
-                            caltb_phambd = dirname + t_pha.isot[:-4].replace(':', '').replace('-', '') + '.phambd'
-                            caltbs_phambd.append(caltb_phambd)
-                            if os.path.exists(caltb_phambd):
-                                os.system('rm -rf ' + caltb_phambd)
-                            # if not os.path.exists(caltb_phambd):
-                            gencal(vis=msfile, caltable=caltb_phambd, caltype='mbd', pol='X,Y', antenna=antennas,
-                                   parameter=phambd_ns[:nant-1,:].flatten().tolist())
-                            if flagspw != '':
-                                flag_phambd_by_spw(caltb_phambd, flagspw=flagspw)
+                        t_pha = phacal['t_pha']
+                        phambd_ns = phacal['pslope']
+                        for n in range(2):
+                            phambd_ns[:, n] -= phambd_ns[0, n]
+                        # set all flagged values to be zero
+                        phambd_ns[np.where(phacal['flag'] == 1)] = 0.
+                        caltb_phambd = dirname + t_pha.isot[:-4].replace(':', '').replace('-', '') + '.phambd'
+                        caltbs_phambd.append(caltb_phambd)
+                        if os.path.exists(caltb_phambd):
+                            os.system('rm -rf ' + caltb_phambd)
+                        # if not os.path.exists(caltb_phambd):
+                        gencal(vis=msfile, caltable=caltb_phambd, caltype='mbd', pol='X,Y', antenna=antennas,
+                               parameter=phambd_ns[:nant-1,:].flatten().tolist())
+                        if flagspw != '':
+                            flag_phambd_by_spw(caltb_phambd, flagspw=flagspw)
 
-                            # When applying the multi-band delays, they are referenced to the center of spw 0
-                            # Make a corresponding calibration table for the reference phase at the center of spw 0
-                            pha0 = np.degrees(phambd_ns * 1e-9 * cfreq_spw0 * 2. * np.pi)
-                            caltb_phambd_pha0 = dirname + t_pha.isot[:-4].replace(':', '').replace('-', '') + '.phambd_pha0'
-                            caltbs_phambd_pha0.append(caltb_phambd_pha0)
-                            if os.path.exists(caltb_phambd_pha0):
-                                os.system('rm -rf ' + caltb_phambd_pha0)
-                            # if not os.path.exists(caltb_phambd_pha0):
-                            gencal(vis=msfile, caltable=caltb_phambd_pha0, caltype='ph', pol='X,Y', antenna=antennas,
-                                   parameter=pha0[:nant-1,:].flatten().tolist())
-                            if flagspw != '':
-                                flag_phambd_by_spw(caltb_phambd_pha0, flagspw=flagspw)
+                        # When applying the multi-band delays, they are referenced to the center of spw 0
+                        # Make a corresponding calibration table for the reference phase at the center of spw 0
+                        pha0 = np.degrees(phambd_ns * 1e-9 * cfreq_spw0 * 2. * np.pi)
+                        caltb_phambd_pha0 = dirname + t_pha.isot[:-4].replace(':', '').replace('-', '') + '.phambd_pha0'
+                        caltbs_phambd_pha0.append(caltb_phambd_pha0)
+                        if os.path.exists(caltb_phambd_pha0):
+                            os.system('rm -rf ' + caltb_phambd_pha0)
+                        # if not os.path.exists(caltb_phambd_pha0):
+                        gencal(vis=msfile, caltable=caltb_phambd_pha0, caltype='ph', pol='X,Y', antenna=antennas,
+                               parameter=pha0[:nant-1,:].flatten().tolist())
+                        if flagspw != '':
+                            flag_phambd_by_spw(caltb_phambd_pha0, flagspw=flagspw)
 
                     # now decides which table to apply depending on the interpolation method ("nearest" or "linear")
                     dt = np.min(np.abs(t_phas.mjd - t_mid.mjd)) * 24.
@@ -1218,14 +852,14 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                 os.system('rm -rf ' + caltb_phambd_interp)
                             # if not os.path.exists(caltb_phambd_interp):
                             gencal(vis=msfile, caltable=caltb_phambd_interp, caltype='mbd', pol='X,Y', antenna=antennas,
-                                   parameter=phambd_ns.flatten().tolist())
+                                   parameter=phambd_ns[:nant-1, :].flatten().tolist())
                             if flagspw != '':
                                 flag_phambd_by_spw(caltb_phambd_interp, flagspw=flagspw)
                             if os.path.exists(caltb_phambd_interp_pha0):
                                 os.system('rm -rf ' + caltb_phambd_interp_pha0)
                             # if not os.path.exists(caltb_phambd_interp_pha0):
                             gencal(vis=msfile, caltable=caltb_phambd_interp_pha0, caltype='ph', pol='X,Y',
-                                   antenna=antennas, parameter=pha0.flatten().tolist())
+                                   antenna=antennas, parameter=pha0[:nant-1, :].flatten().tolist())
                             if flagspw != '':
                                 flag_phambd_by_spw(caltb_phambd_interp_pha0, flagspw=flagspw)
                             print("Using phase calibration table interpolated between records at " + bphacal[

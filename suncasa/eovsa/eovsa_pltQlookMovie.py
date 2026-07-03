@@ -8,6 +8,7 @@ import matplotlib.colorbar as colorbar
 import matplotlib.patches as patches
 from datetime import timedelta
 from datetime import datetime
+from eovsapy.spw_config import SPWS_34BAND, SPWS_52BAND_ALT, SPW_EPOCH_SPLIT_DATE
 from glob import glob
 import numpy as np
 from astropy.time import Time
@@ -202,7 +203,7 @@ def main(year, month, day=None, ndays=10, bd=3, show_warning=False):
         else:
             ted = datetime.now() - timedelta(days=2)
         tst = Time(np.fix(Time(ted).mjd) - ndays, format='mjd').datetime
-    tsep = datetime.strptime('2019-02-22', "%Y-%m-%d")
+    tsep = datetime.strptime(SPW_EPOCH_SPLIT_DATE, "%Y-%m-%d")
 
     vmaxs = [70.0e4, 35e4, 22e4, 16e4, 10e4, 8e4, 8e4]
     vmins = [-18.0e3, -8e3, -4.8e3, -3.4e3, -2.1e3, -1.6e3, -1.6e3]
@@ -223,9 +224,9 @@ def main(year, month, day=None, ndays=10, bd=3, show_warning=False):
         # dateobs = datetime.strptime("2019-12-21", "%Y-%m-%d")
 
         if dateobs > tsep:
-            spws = ['0~1', '2~5', '6~10', '11~20', '21~30', '31~43', '44~49']
+            spws = list(SPWS_52BAND_ALT)
         else:
-            spws = ['1~3', '4~9', '10~16', '17~24', '25~30']
+            spws = list(SPWS_34BAND)
         # spw = spws[bd:bd + 1]
         # vmax = vmaxs[bd:bd + 1]
         # vmin = vmins[bd:bd + 1]

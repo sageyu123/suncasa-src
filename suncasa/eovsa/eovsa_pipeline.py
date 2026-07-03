@@ -5,18 +5,19 @@ from datetime import datetime, timedelta
 import shutil
 import traceback
 import numpy as np
+from astropy.io import fits
 from suncasa.suncasatasks import ptclean6 as ptclean
-from suncasa.suncasatasks import calibeovsa
 from suncasa.suncasatasks import importeovsa
-from suncasa.suncasatasks.private.task_calibeovsa_test import (
-    calibeovsa as calibeovsa_npz,
-)
+# Import the private task directly (not the auto-generated CASA wrapper) so the
+# cal_npz / refcal_npz_mode / secondary_npz arguments are exposed.
+from suncasa.suncasatasks.private.task_calibeovsa import calibeovsa
 
 import re
 import sys
 from eovsapy.dump_tsys import findfiles
-from eovsapy.sqlutil import sql2phacalX, sql2refcalX
+from eovsapy.sqlutil import sql2phacalX, sql2refcalX, sql2refcal_bphsbdX
 from eovsapy.util import Time
+from eovsapy.spw_config import SPWS_52BAND_SELFCAL
 import os
 from suncasa.eovsa import eovsa_diskmodel as ed
 from suncasa.utils import mstools as mstl
@@ -166,14 +167,21 @@ SUPPORTED_PIPELINE_VERSIONS = (
     'v1.0',
     'v2.0',
     'v3.0',
+    'v3.0_alt',
     'v3.1',
     'v3.1_alt',
 )
 WSCLEAN_PIPELINE_VERSIONS = (
     'v3.0',
+    'v3.0_alt',
     'v3.1',
     'v3.1_alt',
 )
+PROVISIONAL_SUCCESS_STATE = 'provisional_success'
+FALLBACK_RUNNING_STATE = 'running_with_fallback_calibration'
+FALLBACK_PARTIAL_STATE = 'partial_with_fallback_calibration'
+PROVISIONAL_CALIBRATION_MODE = 'FALLBACK'
+SAME_DAY_CALIBRATION_MODE = 'SAME_DAY'
 
 
 def get_synoptic_day_output_dir(tim):
@@ -204,7 +212,10 @@ def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
     an infix so the alternate products sit alongside the production ones
     without collision.
     """
-    from suncasa.eovsa.eovsa_synoptic_imaging_pipeline_wsclean import FrequencySetup
+    from suncasa.eovsa.eovsa_synoptic_imaging_pipeline_wsclean import (
+        FrequencySetup,
+        format_spw,
+    )
 
     tim = Time(tim)
     date_str = tim.datetime.strftime('%Y%m%d')
@@ -214,7 +225,7 @@ def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
     freq_setup = FrequencySetup(tim)
     fitsfiles = []
     for spw in freq_setup.spws:
-        spwstr = spw.replace('~', '-')
+        spwstr = format_spw(spw)
         fitsfiles.append(os.path.join(
             imgoutdir,
             f'eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb.disk.fits'))
@@ -242,6 +253,47 @@ def summarize_synoptic_outputs(tim, version='v3.0', fits_tag=''):
         'fits_count': len(existing),
         'fits_expected_count': len(info['fitsfiles']),
     }
+
+
+def set_synoptic_calibration_warning(fitsfiles, calibration_date=None):
+    """Stamp or clear provisional calibration warning metadata in FITS files.
+
+    :param fitsfiles: FITS files whose image extension headers should be updated.
+    :type fitsfiles: list[str]
+    :param calibration_date: Calibration date used for provisional products. If
+        ``None``, any previous provisional warning state is cleared.
+    :type calibration_date: str or None
+    :returns: Number of files whose image extension header was updated.
+    :rtype: int
+    """
+    updated = 0
+    for fitsfile in fitsfiles:
+        if not os.path.exists(fitsfile):
+            continue
+        try:
+            with fits.open(fitsfile, mode='update') as hdul:
+                for hdu in hdul:
+                    if 'CDELT1' not in hdu.header:
+                        continue
+                    if calibration_date:
+                        hdu.header.set('CALMODE', PROVISIONAL_CALIBRATION_MODE,
+                                       'calibration provenance for preview warning')
+                        hdu.header.set('CALDATE', str(calibration_date),
+                                       'date of SQL calibration used for imaging')
+                        hdu.header.set('CALWARN', True,
+                                       'preview should warn about provisional calibration')
+                    else:
+                        hdu.header.set('CALMODE', SAME_DAY_CALIBRATION_MODE,
+                                       'calibration provenance for preview warning')
+                        hdu.header.set('CALWARN', False,
+                                       'preview should warn about provisional calibration')
+                        if 'CALDATE' in hdu.header:
+                            del hdu.header['CALDATE']
+                    updated += 1
+                    break
+        except Exception as exc:
+            print(f'WARNING: Failed to update calibration warning metadata for {fitsfile}: {exc}')
+    return updated
 
 
 def read_pipeline_status(statusfile):
@@ -302,10 +354,12 @@ def get_calibration_readiness(tim):
     }
 
     try:
-        # Match calibeovsa: the reference calibration only needs to be available
-        # by the start of the observing day and does not need to be written
-        # inside the same local-day window as the phacal products.
-        refcal = sql2refcalX(btime)
+        # Resolve the reference calibration the same way calibeovsa does at imaging
+        # time. SQL refcal records are locatored at a ~07 UT lookup timestamp that
+        # PRECEDES the day's observations, so querying at the day start (btime)
+        # resolves the PREVIOUS day's record. Query at the day end so the same-day
+        # refcal is selected.
+        refcal = sql2refcalX(etime)
     except Exception as exc:
         readiness['reason'] = f'refcal_query_failed: {exc}'
         return readiness
@@ -315,7 +369,22 @@ def get_calibration_readiness(tim):
         return readiness
 
     ref_ts = refcal['timestamp']
-    readiness['refcal_timestamp_utc'] = ref_ts.iso
+
+    # phacal['t_ref'] is the real refcal OBSERVATION time the phacal was solved
+    # against, not the ~07 UT SQL record locator in refcal['timestamp']. Anchor the
+    # >30-min gate to the refcal observation time: prefer the BPH+SBD t_refcal (what
+    # calibeovsa uses in bph_sbd mode), fall back to the type-8 T_beg, then the
+    # locator timestamp.
+    ref_obs = refcal.get('t_bg') or ref_ts
+    try:
+        bphsbd = sql2refcal_bphsbdX(etime)
+        if isinstance(bphsbd, list):
+            bphsbd = bphsbd[-1] if bphsbd else None
+        if bphsbd is not None and bphsbd.get('t_refcal') is not None:
+            ref_obs = bphsbd['t_refcal']
+    except Exception:
+        pass
+    readiness['refcal_timestamp_utc'] = ref_obs.iso
 
     try:
         phacals = sql2phacalX([btime, etime], nrecords=0, neat=True, verbose=False) or []
@@ -325,7 +394,7 @@ def get_calibration_readiness(tim):
 
     valid_phacals = []
     for phacal in phacals:
-        if abs(phacal['t_ref'].jd - ref_ts.jd) <= 30. / 1440.:
+        if abs(phacal['t_ref'].jd - ref_obs.jd) <= 30. / 1440.:
             valid_phacals.append(phacal)
 
     readiness['phacal_count'] = len(valid_phacals)
@@ -339,6 +408,66 @@ def get_calibration_readiness(tim):
     readiness['ready'] = True
     readiness['reason'] = 'ready'
     return readiness
+
+
+def get_fallback_calibration_lookback_days():
+    """Return how many previous observing days cron may use as provisional calibration."""
+    raw_value = os.getenv('EOVSA_PIPELINE_FALLBACK_CAL_LOOKBACK_DAYS', '3')
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 3
+
+
+def find_previous_ready_calibration(tim, max_lookback_days=None):
+    """Find the newest previous observing day with ready SQL refcal/phacal records."""
+    tim = Time(tim)
+    if max_lookback_days is None:
+        max_lookback_days = get_fallback_calibration_lookback_days()
+    for day_offset in range(1, max_lookback_days + 1):
+        cal_day = Time(tim.mjd - day_offset, format='mjd')
+        readiness = get_calibration_readiness(cal_day)
+        if not readiness.get('ready'):
+            continue
+        _, lookup_time = get_local_day_bounds(cal_day)
+        return {
+            'date': cal_day.iso[:10],
+            'lookup_time_utc': lookup_time.iso,
+            'lookback_days': day_offset,
+            'readiness': readiness,
+        }
+    return None
+
+
+def smart_cal_status_fields(readiness=None, fallback_calibration=None, sql_cal_time=None,
+                            message=None, ran_after_deadline=False,
+                            needs_same_day_calibration_rerun=False):
+    """Build stable status fields for cron calibration decisions."""
+    readiness = readiness or {}
+    fields = dict(readiness)
+    fields.update({
+        'calibration_ready': readiness.get('ready'),
+        'calibration_reason': readiness.get('reason'),
+        'same_day_calibration_ready': readiness.get('ready'),
+        'same_day_calibration_reason': readiness.get('reason'),
+        'using_fallback_calibration': fallback_calibration is not None,
+        'needs_same_day_calibration_rerun': bool(needs_same_day_calibration_rerun),
+        'ran_after_deadline': bool(ran_after_deadline),
+        'sql_cal_time_utc': Time(sql_cal_time).iso if sql_cal_time else None,
+    })
+    if fallback_calibration is not None:
+        fallback_readiness = fallback_calibration.get('readiness') or {}
+        fields.update({
+            'fallback_calibration_date': fallback_calibration.get('date'),
+            'fallback_calibration_lookup_time_utc': fallback_calibration.get('lookup_time_utc'),
+            'fallback_calibration_lookback_days': fallback_calibration.get('lookback_days'),
+            'fallback_refcal_timestamp_utc': fallback_readiness.get('refcal_timestamp_utc'),
+            'fallback_phacal_count': fallback_readiness.get('phacal_count'),
+            'fallback_latest_phacal_timestamp_utc': fallback_readiness.get('latest_phacal_timestamp_utc'),
+        })
+    if message:
+        fields['message'] = message
+    return fields
 
 
 def should_enable_smart_cal_check(enable_flag=None):
@@ -493,7 +622,9 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
 def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearcache=False, verbose=False, pols='XX',
                    version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
-                   secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False):
+                   secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
+                   custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
+                   sql_cal_time=None):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -503,7 +634,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
        cal_npz: optional path to a calwidget_v2 calibeovsa NPZ (e.g.
                 /common/webplots/phasecal/YYYYMMDD_calwidget_v2_calibeovsa.npz).
                 When provided and version is v3.0 or v3.1, calibration is read from the
-                NPZ via task_calibeovsa_test.calibeovsa instead of MySQL, and
+                NPZ via task_calibeovsa.calibeovsa instead of MySQL, and
                 outputs are tagged so they do not collide with the production
                 artefacts.
        cal_tag: required output filename tag for cal_npz runs.
@@ -515,10 +646,16 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
        secondary_npz: optional secondary calwidget_v2 calibeovsa NPZ. In
                 ``bph_sbd`` runs, finite/unflagged secondary BPH fills missing
                 primary BPH slots while primary SBD remains authoritative.
+       force_lo_hi_smooth_extrap: in ``bph_sbd`` runs, force LO bands to use
+                the HI smooth-model extrapolated phase base instead of LO BPH.
        fine_spectral_imaging: run an additional WSClean final-imaging pass on
                 finer SPW chunks after the standard final-imaging pass.
        fine_spectral_only: run only the finer WSClean final-imaging pass from
                 an existing selfcal'd MS product for this date/version/tag.
+       custom_spws: optional WSClean FrequencySetup SPW grouping override.
+       sql_cal_time: optional SQL lookup time override for no-NPZ refcal/phacal
+                selection. Used by cron provisional runs to image with a previous
+                ready calibration day while keeping the target observing date.
     '''
 
     if cal_npz:
@@ -578,7 +715,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    'clearcache': clearcache,
                    'pols': pols, 'ncpu': ncpu,
                    'fine_spectral_only': fine_spectral_only,
-                   'fine_spectral_imaging': fine_spectral_imaging})
+                   'fine_spectral_imaging': fine_spectral_imaging,
+                   'custom_spws': custom_spws})
         return esip.pipeline_run(slfcaled_vis, outputvis='',
                                  workdir=workdir,
                                  slfcaltbdir=slfcaltbdir_path,
@@ -586,7 +724,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  overwrite=overwrite,
                                  fits_tag=cal_tag,
                                  fine_spectral_imaging=True,
-                                 fine_spectral_only=True)
+                                 fine_spectral_only=True,
+                                 custom_spws=custom_spws)
 
     if isinstance(trange, Time):
         mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
@@ -686,22 +825,26 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
         tdate = get_tdate_from_basename(outputvis)
         flagant = '13~15' if Time(tdate).mjd >= EOVSA15_UPGRADE_DATE.mjd else '15'
         if cal_npz:
-            # Bypass the auto-generated CASA wrapper (which does not expose
-            # cal_npz) and call the private task module directly.
-            vis = calibeovsa_npz(cal_invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
-                                 doflag=True,
-                                 flagant=flagant,
-                                 doimage=False, doconcat=True,
-                                 concatvis=outputvis, keep_orig_ms=False,
-                                 keep_corrected_column=True,
-                                 cal_npz=cal_npz, refcal_npz_mode=refcal_npz_mode,
-                                 secondary_npz=secondary_npz)
+            # NPZ calibration path: same task as below, plus the NPZ-specific
+            # arguments (read calibration from the NPZ instead of MySQL).
+            vis = calibeovsa(cal_invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
+                             doflag=True,
+                             flagant=flagant,
+                             doimage=False, doconcat=True,
+                             concatvis=outputvis, keep_orig_ms=False,
+                             keep_corrected_column=True,
+                             cal_npz=cal_npz, refcal_npz_mode=refcal_npz_mode,
+                             secondary_npz=secondary_npz,
+                             force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
+                             refcal_sql_mode=refcal_sql_mode)
         else:
             vis = calibeovsa(cal_invis, caltype=caltype, caltbdir=caltbdir, interp=interp,
                              doflag=True,
                              flagant=flagant,
                              doimage=False, doconcat=True,
-                             concatvis=outputvis, keep_orig_ms=False)
+                             concatvis=outputvis, keep_orig_ms=False,
+                             refcal_sql_mode=refcal_sql_mode,
+                             sql_cal_time=sql_cal_time)
     else:
         if verbose:
             print(f'Using existing visibility file: {vis}')
@@ -722,7 +865,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'clearcache': clearcache,
                'pols': pols, 'ncpu': ncpu,
                'fine_spectral_imaging': fine_spectral_imaging,
-               'fine_spectral_only': fine_spectral_only})
+               'fine_spectral_only': fine_spectral_only,
+               'custom_spws': custom_spws})
     overwrite_pipeline = overwrite or force_imaging_rerun
     if force_imaging_rerun and version in WSCLEAN_PIPELINE_VERSIONS:
         print(f'Cron recovery mode enabled for {tdate.strftime("%Y-%m-%d")}: rerunning imaging despite existing outputvis.')
@@ -747,7 +891,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 imgoutdir=imgoutdir, pols=pols, overwrite=overwrite_pipeline,
                                 fits_tag=cal_tag,
                                 fine_spectral_imaging=fine_spectral_imaging,
-                                fine_spectral_only=fine_spectral_only)
+                                fine_spectral_only=fine_spectral_only,
+                                custom_spws=custom_spws)
         if clearcache:
             os.system(f'rm -rf {workdir}/*')
     else:
@@ -1092,10 +1237,12 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
         ## the last '' window is for fullBD synthesis image. Now obsolete.
         # spws = ['6~10', '11~20', '21~30', '31~43', '']
         # spws = ['6~10', '11~20', '21~30', '31~43']
-        spws = ['0~1', '2~5', '6~10', '11~20', '21~30', '31~49']
+        spws = list(SPWS_52BAND_SELFCAL)
     else:
         ## the last '' window is for fullBD synthesis image. Now obsolete.
         # spws = ['1~5', '6~10', '11~15', '16~25', '']
+        # NOTE: this legacy branch uses a one-off pre-2019 grouping (distinct
+        # from SPWS_34BAND); left inline as it is not part of the shared config.
         spws = ['1~3', '4~6', '7~10', '10~14', '15~20', '21~30']
 
     if docalib:
@@ -1131,7 +1278,9 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
 def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrite=False, doimport=True, pols='XX',
              version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
-             secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False):
+             secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
+             custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
+             sql_cal_time=None):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1175,10 +1324,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :type interp: str, optional
     :param smart_cal_check: When True, perform cron-oriented calibration readiness checks and
         track per-day status before processing, defaults to ``None``. If ``None``, the behavior
-        is enabled automatically when ``EOVSA_PIPELINE_CRON=1``. The gate waits for same
-        observing-day calibration records until the hard deadline at ``04:00 UTC`` two days
-        after the observing-day label, then allows the run to proceed with the latest
-        calibration records available in MySQL.
+        is enabled automatically when ``EOVSA_PIPELINE_CRON=1``. The gate prefers same
+        observing-day calibration records; if they are not ready but an older observing day
+        is ready, it runs provisionally with that older SQL calibration and marks the products
+        for replacement when same-day calibration becomes ready.
     :type smart_cal_check: bool, optional
     :param cal_npz: optional path to a calwidget_v2 calibeovsa NPZ.
     :type cal_npz: str, optional
@@ -1189,12 +1338,21 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param secondary_npz: optional secondary calwidget_v2 calibeovsa NPZ for
         BPH fill in ``bph_sbd`` runs.
     :type secondary_npz: str, optional
+    :param force_lo_hi_smooth_extrap: force LO bands to use the HI smooth-model
+        extrapolated phase base in ``bph_sbd`` runs.
+    :type force_lo_hi_smooth_extrap: bool, optional
     :param fine_spectral_imaging: run an additional WSClean final-imaging pass
         on finer SPW chunks after the standard final-imaging pass.
     :type fine_spectral_imaging: bool, optional
     :param fine_spectral_only: run only the finer WSClean final-imaging pass
         from an existing selfcal'd MS product for this date/version/tag.
     :type fine_spectral_only: bool, optional
+    :param custom_spws: optional WSClean FrequencySetup SPW grouping override.
+    :type custom_spws: list or str, optional
+    :param sql_cal_time: optional SQL calibration lookup timestamp override.
+        This is mainly for cron fallback runs that image the target date using
+        an older ready calibration day.
+    :type sql_cal_time: str, optional
 
     :raises ValueError: Raises an exception if the date parameters are out of the valid Gregorian calendar range.
 
@@ -1228,37 +1386,111 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         t = Time(Time(mjdnow, format='mjd').to_datetime().strftime('%Y-%m-%dT20:00'))
     else:
         t = Time('{}-{:02d}-{:02d} 20:00'.format(year, month, day))
+    failed_dates = []
     for d in range(ndays):
         t1 = Time(t.mjd - d, format='mjd')
         datestr = t1.iso[:10]
         synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
         statusfile = synoptic_info['statusfile']
         is_wsclean_version = version in WSCLEAN_PIPELINE_VERSIONS
+        readiness = {}
+        fallback_calibration = None
+        sql_cal_time_for_run = sql_cal_time
+        run_state = 'running'
+        run_message = ''
+        rerun_provisional_with_same_day_calibration = False
+        overwrite_for_run = overwrite or (sql_cal_time_for_run is not None)
         if smart_cal_check and is_wsclean_version:
-            readiness = {}
-            run_state = 'running'
+            previous_status = read_pipeline_status(statusfile)
+            previous_state = previous_status.get('state', '')
+            outputvis_root = os.path.join(
+                udbmsslfcaleddir,
+                t1.datetime.strftime('%Y%m'),
+                t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms'
+            )
+            outputvis_exists = os.path.exists(outputvis_root) or os.path.exists(f'{outputvis_root}.tar.gz')
             if synoptic_info['fits_complete']:
-                write_pipeline_status(
-                    statusfile,
-                    'success',
-                    date=datestr,
-                    fits_count=synoptic_info['fits_count'],
-                    fits_expected_count=synoptic_info['fits_expected_count'],
-                    fitsfiles=synoptic_info['existing_fitsfiles'],
-                    outputvis_exists=os.path.exists(
-                        os.path.join(udbmsslfcaleddir, t1.datetime.strftime('%Y%m'),
-                                     t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms')
-                    ) or os.path.exists(
-                        os.path.join(udbmsslfcaleddir, t1.datetime.strftime('%Y%m'),
-                                     t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms.tar.gz')
-                    ),
-                )
-                print(f'Synoptic FITS already complete for {datestr}. Skipping cron run.')
-                continue
+                if previous_state == PROVISIONAL_SUCCESS_STATE:
+                    readiness = get_calibration_readiness(t1)
+                    if not readiness['ready']:
+                        run_message = previous_status.get('message') or (
+                            f'Completed with fallback calibration; waiting for {datestr} '
+                            'same-day calibration before replacing products.'
+                        )
+                        status_extra = smart_cal_status_fields(
+                            readiness,
+                            sql_cal_time=previous_status.get('sql_cal_time_utc'),
+                            message=run_message,
+                            needs_same_day_calibration_rerun=True,
+                        )
+                        for key in (
+                            'fallback_calibration_date',
+                            'fallback_calibration_lookup_time_utc',
+                            'fallback_calibration_lookback_days',
+                            'fallback_refcal_timestamp_utc',
+                            'fallback_phacal_count',
+                            'fallback_latest_phacal_timestamp_utc',
+                        ):
+                            if key in previous_status:
+                                status_extra[key] = previous_status[key]
+                        status_extra['using_fallback_calibration'] = bool(
+                            previous_status.get('using_fallback_calibration', True)
+                        )
+                        write_pipeline_status(
+                            statusfile,
+                            PROVISIONAL_SUCCESS_STATE,
+                            date=datestr,
+                            fits_count=synoptic_info['fits_count'],
+                            fits_expected_count=synoptic_info['fits_expected_count'],
+                            fitsfiles=synoptic_info['existing_fitsfiles'],
+                            outputvis_exists=outputvis_exists,
+                            **status_extra,
+                        )
+                        print(
+                            f'Synoptic FITS are provisionally complete for {datestr}; '
+                            f'same-day calibration is not ready yet ({readiness["reason"]}).'
+                        )
+                        continue
+                    rerun_provisional_with_same_day_calibration = True
+                    run_message = (
+                        f'Same-day calibration is now ready for {datestr}; '
+                        'replacing provisional fallback-calibrated products.'
+                    )
+                    print(run_message)
+                else:
+                    write_pipeline_status(
+                        statusfile,
+                        'success',
+                        date=datestr,
+                        fits_count=synoptic_info['fits_count'],
+                        fits_expected_count=synoptic_info['fits_expected_count'],
+                        fitsfiles=synoptic_info['existing_fitsfiles'],
+                        outputvis_exists=outputvis_exists,
+                    )
+                    print(f'Synoptic FITS already complete for {datestr}. Skipping cron run.')
+                    continue
 
-            readiness = get_calibration_readiness(t1)
-            if not readiness['ready']:
-                if readiness.get('deadline_expired'):
+            if not readiness:
+                readiness = get_calibration_readiness(t1)
+
+            if sql_cal_time_for_run is not None:
+                run_state = 'running_with_sql_cal_time_override'
+                run_message = (
+                    f'Running {datestr} with explicit SQL calibration lookup time '
+                    f'{Time(sql_cal_time_for_run).iso}.'
+                )
+            elif not readiness['ready']:
+                fallback_calibration = find_previous_ready_calibration(t1)
+                if fallback_calibration is not None:
+                    sql_cal_time_for_run = fallback_calibration['lookup_time_utc']
+                    run_state = FALLBACK_RUNNING_STATE
+                    run_message = (
+                        f'Calibration is not ready for {datestr} ({readiness["reason"]}); '
+                        f'running provisionally with {fallback_calibration["date"]} '
+                        'SQL calibration. Products will be replaced once the same-day '
+                        'calibration is ready.'
+                    )
+                elif readiness.get('deadline_expired'):
                     run_state = 'running_after_deadline'
                     run_message = (
                         f'Calibration still not ready for {datestr} after hard deadline '
@@ -1273,20 +1505,21 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                         fits_count=synoptic_info['fits_count'],
                         fits_expected_count=synoptic_info['fits_expected_count'],
                         fitsfiles=synoptic_info['existing_fitsfiles'],
-                        outputvis_exists=os.path.exists(
-                            os.path.join(udbmsslfcaleddir, t1.datetime.strftime('%Y%m'),
-                                         t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms')
-                        ) or os.path.exists(
-                            os.path.join(udbmsslfcaleddir, t1.datetime.strftime('%Y%m'),
-                                         t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms.tar.gz')
-                        ),
-                        **readiness,
+                        outputvis_exists=outputvis_exists,
+                        **smart_cal_status_fields(readiness),
                     )
                     print(f'Skipping {datestr}: calibration not ready ({readiness["reason"]}).')
                     continue
 
+            if run_message:
                 print(run_message)
 
+            overwrite_for_run = (
+                overwrite
+                or bool(fallback_calibration)
+                or rerun_provisional_with_same_day_calibration
+                or (sql_cal_time_for_run is not None)
+            )
             write_pipeline_status(
                 statusfile,
                 run_state,
@@ -1294,40 +1527,57 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 fits_count=synoptic_info['fits_count'],
                 fits_expected_count=synoptic_info['fits_expected_count'],
                 fitsfiles=synoptic_info['existing_fitsfiles'],
-                **readiness,
+                outputvis_exists=outputvis_exists,
+                **smart_cal_status_fields(
+                    readiness,
+                    fallback_calibration=fallback_calibration,
+                    sql_cal_time=sql_cal_time_for_run,
+                    message=run_message,
+                    ran_after_deadline=run_state == 'running_after_deadline',
+                    needs_same_day_calibration_rerun=fallback_calibration is not None,
+                ),
             )
         subdir = os.path.join(workdir, t1.datetime.strftime('%Y%m%d/'))
         if not os.path.exists(subdir):
             os.makedirs(subdir)
         else:
-            if overwrite:
+            if overwrite_for_run:
                 os.system('rm -rf {}/*'.format(subdir))
         # ##debug
         # vis_corrected = calib_pipeline(datestr, overwrite=overwrite, doimport=doimport,
         #                                workdir=subdir, clearcache=False, pols=pols)
 
         if debugging:
-            vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
+            vis_corrected = calib_pipeline(t1, overwrite=overwrite_for_run, doimport=doimport,
                                            workdir=subdir, clearcache=False, pols=pols, version=version, ncpu=ncpu,
                                            caltype=caltype, interp=interp,
                                            force_imaging_rerun=smart_cal_check and is_wsclean_version,
                                            cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
                                            secondary_npz=secondary_npz,
                                            fine_spectral_imaging=fine_spectral_imaging,
-                                           fine_spectral_only=fine_spectral_only)
+                                           fine_spectral_only=fine_spectral_only,
+                                           custom_spws=custom_spws,
+                                           force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
+                                           refcal_sql_mode=refcal_sql_mode,
+                                           sql_cal_time=sql_cal_time_for_run)
         else:
             try:
-                vis_corrected = calib_pipeline(t1, overwrite=overwrite, doimport=doimport,
+                vis_corrected = calib_pipeline(t1, overwrite=overwrite_for_run, doimport=doimport,
                                                workdir=subdir, clearcache=False, pols=pols, version=version, ncpu=ncpu,
                                                caltype=caltype, interp=interp,
                                                force_imaging_rerun=smart_cal_check and is_wsclean_version,
                                                cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
                                                secondary_npz=secondary_npz,
                                                fine_spectral_imaging=fine_spectral_imaging,
-                                               fine_spectral_only=fine_spectral_only)
+                                               fine_spectral_only=fine_spectral_only,
+                                               custom_spws=custom_spws,
+                                               force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
+                                               refcal_sql_mode=refcal_sql_mode,
+                                               sql_cal_time=sql_cal_time_for_run)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
+                failed_dates.append(datestr)
                 if smart_cal_check and is_wsclean_version:
                     synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
                     write_pipeline_status(
@@ -1338,12 +1588,14 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                         fits_expected_count=synoptic_info['fits_expected_count'],
                         fitsfiles=synoptic_info['existing_fitsfiles'],
                         error=str(e),
-                        calibration_ready=readiness.get('ready'),
-                        calibration_reason=readiness.get('reason'),
-                        ran_after_deadline=run_state == 'running_after_deadline',
-                        hard_deadline_utc=readiness.get('hard_deadline_utc'),
-                        refcal_timestamp_utc=readiness.get('refcal_timestamp_utc'),
-                        latest_phacal_timestamp_utc=readiness.get('latest_phacal_timestamp_utc'),
+                        **smart_cal_status_fields(
+                            readiness,
+                            fallback_calibration=fallback_calibration,
+                            sql_cal_time=sql_cal_time_for_run,
+                            message=run_message,
+                            ran_after_deadline=run_state == 'running_after_deadline',
+                            needs_same_day_calibration_rerun=fallback_calibration is not None,
+                        ),
                     )
                 continue
         if smart_cal_check and is_wsclean_version:
@@ -1354,7 +1606,22 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms'
             )
             outputvis_exists = os.path.exists(outputvis_root) or os.path.exists(f'{outputvis_root}.tar.gz')
-            state = 'success' if synoptic_info['fits_complete'] else 'partial'
+            calibration_warning_updates = set_synoptic_calibration_warning(
+                synoptic_info['existing_fitsfiles'],
+                calibration_date=(fallback_calibration or {}).get('date')
+            )
+            if fallback_calibration is not None and synoptic_info['fits_complete']:
+                state = PROVISIONAL_SUCCESS_STATE
+                final_message = (
+                    f'Completed with {fallback_calibration["date"]} SQL calibration; '
+                    f'will be replaced once {datestr} same-day calibration is ready.'
+                )
+            elif fallback_calibration is not None:
+                state = FALLBACK_PARTIAL_STATE
+                final_message = run_message
+            else:
+                state = 'success' if synoptic_info['fits_complete'] else 'partial'
+                final_message = run_message
             write_pipeline_status(
                 statusfile,
                 state,
@@ -1363,17 +1630,25 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 fits_expected_count=synoptic_info['fits_expected_count'],
                 fitsfiles=synoptic_info['existing_fitsfiles'],
                 outputvis_exists=outputvis_exists,
+                calibration_warning_fits_count=calibration_warning_updates,
                 pipeline_result_type=type(vis_corrected).__name__,
-                calibration_ready=readiness.get('ready'),
-                calibration_reason=readiness.get('reason'),
-                ran_after_deadline=run_state == 'running_after_deadline',
-                hard_deadline_utc=readiness.get('hard_deadline_utc'),
-                refcal_timestamp_utc=readiness.get('refcal_timestamp_utc'),
-                latest_phacal_timestamp_utc=readiness.get('latest_phacal_timestamp_utc'),
+                **smart_cal_status_fields(
+                    readiness,
+                    fallback_calibration=fallback_calibration,
+                    sql_cal_time=sql_cal_time_for_run,
+                    message=final_message,
+                    ran_after_deadline=run_state == 'running_after_deadline',
+                    needs_same_day_calibration_rerun=fallback_calibration is not None,
+                ),
             )
         if clearcache:
             os.chdir(workdir)
             os.system('rm -rf {}'.format(subdir))
+
+    if failed_dates:
+        print('Pipeline finished with failures for {0} date(s): {1}'.format(
+            len(failed_dates), ', '.join(failed_dates)))
+    return {'failed_dates': failed_dates}
 
 
 if __name__ == '__main__':
@@ -1403,14 +1678,16 @@ if __name__ == '__main__':
                              'if the time difference between the observation and the phacal calibrations is less than 1 hour, it uses "nearest"; '
                              'otherwise, it uses "linear".')
     parser.add_argument('--smart-cal-check', action='store_true', default=False,
-                        help='For cron-style runs, wait for same-day observer-written refcal/phacal records until '
-                             '04:00 UTC two days later, then run with the latest MySQL calibrations; also track '
-                             'per-day status and allow imaging reruns when outputvis exists but daily FITS are incomplete.')
+                        help='For cron-style runs, use same-day observer-written refcal/phacal records when ready. '
+                             'If same-day calibration is not ready but a previous observing day has ready SQL '
+                             'calibration, run provisionally with that older calibration and mark the status for '
+                             'same-day replacement later. Also track per-day status and allow imaging reruns when '
+                             'outputvis exists but daily FITS are incomplete.')
     parser.add_argument('--cal-npz', type=str, default=None,
                         help='Path to a calwidget_v2 calibeovsa NPZ '
                              '(e.g. /common/webplots/phasecal/YYYYMMDD_calwidget_v2_calibeovsa.npz). '
                              'When provided, calibration is read from the NPZ instead of MySQL via '
-                             'suncasa.suncasatasks.private.task_calibeovsa_test, outputs are tagged with '
+                             'suncasa.suncasatasks.private.task_calibeovsa, outputs are tagged with '
                              '--cal-tag (required for cal-npz runs) '
                              'so they do not collide with production artefacts, '
                              'and --smart-cal-check is '
@@ -1423,14 +1700,31 @@ if __name__ == '__main__':
                         help='Tag for cal-npz test outputs. Required for cal-npz runs. '
                              'Used for both FITS and MS products.')
     parser.add_argument('--refcal-npz-mode', type=str, default='smooth_model',
-                        choices=['triplet', 'smooth_model', 'bph_sbd'],
+                        choices=['triplet', 'smooth_model', 'bph_sbd', 'smooth_bandpass'],
                         help='Refcal apply mode for calwidget_v2 NPZ runs. '
                              'triplet preserves ph+sbd+mbd; smooth_model uses sampled smooth phase plus sbd only; '
-                             'bph_sbd uses saved band phase plus sbd only.')
+                             'bph_sbd uses saved band phase plus sbd only; '
+                             'smooth_bandpass applies the per-channel smooth phase as a phase-only B table '
+                             '(subsumes the refcal sbd, no separate ph/sbd tables).')
+    parser.add_argument('--refcal-sql-mode', type=str, default='bph_sbd',
+                        choices=['bph_sbd', 'smb'],
+                        help='Refcal apply mode for the no-NPZ SQL path. '
+                             'bph_sbd uses the caltype-14 band phase + sbd tables (default); '
+                             'smb applies the caltype-15 smooth phase bandpass as a per-channel '
+                             'phase-only B table.')
+    parser.add_argument('--sql-cal-time', type=str, default=None,
+                        help='Optional SQL calibration lookup timestamp override for no-NPZ SQL runs. '
+                             'Cron fallback uses this internally to image a target date with an older '
+                             'ready calibration day.')
+    parser.add_argument('--force-lo-hi-smooth-extrap', action='store_true', default=False,
+                        help='For bph_sbd calwidget_v2 NPZ runs, force LO bands to use the '
+                             'HI smooth-model extrapolated phase base instead of LO BPH.')
     parser.add_argument('--fine-spectral-imaging', action='store_true', default=False,
                         help='For WSClean versions, run an additional final-imaging pass on finer SPW chunks.')
     parser.add_argument('--fine-spectral-only', action='store_true', default=False,
                         help='For WSClean versions, run only finer imaging from the existing selfcal MS product.')
+    parser.add_argument('--custom-spws', type=str, nargs='+', default=None,
+                        help='For WSClean versions, override FrequencySetup SPW groupings, e.g. 0~1 2~4 5~7.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1442,7 +1736,17 @@ if __name__ == '__main__':
     year, month, day = t.datetime.year, t.datetime.month, t.datetime.day
 
     # Run the main pipeline function
-    pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
-             args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
-             args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz,
-             args.fine_spectral_imaging, args.fine_spectral_only)
+    run_result = pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
+                          args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
+                          args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz,
+                          args.fine_spectral_imaging, args.fine_spectral_only, args.custom_spws,
+                          args.force_lo_hi_smooth_extrap, refcal_sql_mode=args.refcal_sql_mode,
+                          sql_cal_time=args.sql_cal_time)
+
+    # Exit nonzero if any date failed so wrappers (set -e) do not treat a core
+    # imaging/calibration failure as success and proceed to FITS/JP2/preview steps.
+    failed_dates = run_result.get('failed_dates') if isinstance(run_result, dict) else None
+    if failed_dates:
+        print('ERROR: EOVSA pipeline failed for {0} date(s): {1}'.format(
+            len(failed_dates), ', '.join(failed_dates)), file=sys.stderr)
+        sys.exit(1)

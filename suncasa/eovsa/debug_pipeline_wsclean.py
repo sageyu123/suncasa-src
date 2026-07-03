@@ -15,7 +15,8 @@ from glob import glob
 
 from eovsapy.util import Time
 from eovsapy.dump_tsys import findfiles
-from suncasa.suncasatasks import calibeovsa, importeovsa
+from suncasa.suncasatasks import importeovsa
+from suncasa.suncasatasks.private.task_calibeovsa import calibeovsa
 from suncasa.eovsa.update_log import EOVSA15_UPGRADE_DATE
 from suncasa.eovsa.eovsa_synoptic_imaging_pipeline_wsclean import pipeline_run
 

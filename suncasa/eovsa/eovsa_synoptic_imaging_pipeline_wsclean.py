@@ -35,7 +35,9 @@ from functools import wraps
 import matplotlib.pyplot as plt
 import pandas as pd
 from eovsapy.util import Time
+from eovsapy.spw_config import SPWS_34BAND, SPWS_52BAND, SPW_EPOCH_SPLIT_MJD
 from scipy import ndimage
+from scipy.interpolate import PchipInterpolator
 from sunpy import map as smap
 from typing import NamedTuple, List, Union
 from scipy.signal import fftconvolve
@@ -122,10 +124,45 @@ logging.info("Using wsclean executable: %s", WSCLEAN_BIN)
 
 PIPELINE_CONFIG = {
     'bright_thresh': [350, 900, 2000, 2800, 800, 150, 100],
+    'bright_thresh_freq_ghz': [1.42, 2.87, 4.33, 6.93, 10.18, 13.92, 17.01],
     'tb_ratio_thresh': [1.5, 5.0, 5.0, 3.0, 1.5, 1.5, 1.5],
     'briggs': [-1.0, -1.0, -1.0, -1.0, -1.0, -0.5, -0.5],
     'spwidx2proc': [0, 1, 2, 3, 4, 5, 6],
 }
+
+
+def feature_brightness_threshold(freq_ghz):
+    """Evaluate the smooth feature-routing brightness threshold.
+
+    The seven production spectral-window thresholds are used as anchor points
+    in frequency.  The interpolation is done in log-frequency/log-threshold
+    space with a shape-preserving cubic Hermite interpolator.  Frequencies
+    outside the anchored range are clamped to the nearest endpoint because the
+    production thresholds were not validated as an extrapolation.
+
+    :param freq_ghz: Frequency or frequencies at which to evaluate the threshold.
+    :type freq_ghz: float or array-like
+    :returns: Feature-routing threshold value(s) in the same metric units as
+        ``M_bright``.
+    :rtype: float or numpy.ndarray
+    :raises ValueError: If any input frequency is non-finite or non-positive.
+    """
+    freq_arr = np.asarray(freq_ghz, dtype=float)
+    scalar_input = freq_arr.ndim == 0
+    if np.any(~np.isfinite(freq_arr)) or np.any(freq_arr <= 0):
+        raise ValueError("freq_ghz must contain finite positive frequencies")
+
+    anchor_freq = np.asarray(PIPELINE_CONFIG['bright_thresh_freq_ghz'], dtype=float)
+    anchor_thresh = np.asarray(PIPELINE_CONFIG['bright_thresh'], dtype=float)
+    log_freq = np.log(anchor_freq)
+    log_thresh = np.log(anchor_thresh)
+    interp = PchipInterpolator(log_freq, log_thresh, extrapolate=False)
+
+    query = np.clip(np.log(freq_arr), log_freq[0], log_freq[-1])
+    thresh = np.exp(interp(query))
+    if scalar_input:
+        return float(thresh)
+    return thresh
 
 # Self-calibration round definitions (drives the loop in pipeline_run)
 SELFCAL_ROUNDS = [
@@ -287,6 +324,49 @@ def _compress_synoptic_fits_in_place(fitsfiles):
             _write_compressed_synoptic_fits(fitsfile, fitsfile)
 
 
+def _set_daily_reference_time_keywords(fitsfile, reftime):
+    """Stamp DATE-OBS/DATE-AVG with the daily reference epoch in place.
+
+    The synoptic_daily image content is aligned to the daily reference time,
+    so DATE-OBS must match it for time-based coalignment. The true acquisition
+    window is preserved in STARTOBS/ENDOBS before DATE-OBS is overwritten.
+    """
+    reftime_str = Time(reftime).isot
+    with fits.open(fitsfile, mode='update') as hdul:
+        for hdu in hdul:
+            if 'CDELT1' not in hdu.header:
+                continue
+            hd = hdu.header
+            orig = hd.get('DATE-OBS')
+            if 'STARTOBS' not in hd and orig:
+                hd.set('STARTOBS', Time(orig).isot, 'start of true observing window')
+                exptime = hd.get('EXPTIME')
+                if 'ENDOBS' not in hd and exptime:
+                    hd.set('ENDOBS', (Time(orig) + float(exptime) * u.s).isot,
+                           'end of true observing window')
+            hd.set('DATE-OBS', reftime_str, 'daily reference epoch; see STARTOBS/ENDOBS')
+            hd.set('DATE-AVG', reftime_str, 'daily reference epoch (WCS)')
+            hd.add_history('DATE-OBS set to daily reference epoch; acquisition window in STARTOBS/ENDOBS')
+            break
+    return fitsfile
+
+
+def _set_imaging_antenna_keywords(fitsfile, n_ant_img, n_ant_total):
+    """Stamp the solar antenna availability used for imaging into a FITS file."""
+    if n_ant_img is None or n_ant_total is None:
+        return fitsfile
+    with fits.open(fitsfile, mode='update') as hdul:
+        for hdu in hdul:
+            if 'CDELT1' not in hdu.header:
+                continue
+            hdu.header.set('NANTIMG', int(n_ant_img),
+                           'unflagged solar antennas available for imaging')
+            hdu.header.set('NANTTOT', int(n_ant_total),
+                           'total solar antennas for this observing epoch')
+            break
+    return fitsfile
+
+
 @contextmanager
 def pipeline_stage(step, **state):
     """Log start/end/failure for a pipeline stage with traceback on error."""
@@ -321,7 +401,11 @@ def detect_noisy_images(data_stack,
                         rsun_ratio=(1.2, 1.3),
                         rms_threshold=None,
                         snr_threshold=None,
-                        showplt=False):
+                        showplt=False,
+                        stripe_qa=True,
+                        stripe_threshold=50.0,
+                        grad_aniso_threshold=12.0,
+                        extreme_rms_factor=8.0):
     """
     Detect and reject noisy frames in a stack of solar images.
 
@@ -352,6 +436,25 @@ def detect_noisy_images(data_stack,
     :type snr_threshold: float or None
     :param showplt: If True, display a diagnostic plot of RMS and SNR with their cutoffs.
     :type showplt: bool
+    :param stripe_qa: If True, reject coherent directional stripe/artifact frames
+                      using disk-free image structure.
+    :type stripe_qa: bool
+    :param stripe_threshold: Absolute Fourier angular-concentration cutoff for
+                             stripe rejection. Frames are also rejected on a
+                             within-stack relative-outlier rule (see
+                             :func:`detect_stripe_artifacts`), so this only needs
+                             to catch uniformly artifact-dominated bands.
+    :type stripe_threshold: float
+    :param grad_aniso_threshold: Directional gradient anisotropy threshold for
+                                 stripe rejection (weak secondary check).
+    :type grad_aniso_threshold: float
+    :param extreme_rms_factor: Reject frames whose off-disk annulus RMS is this
+                               many times above the stack median, even if their
+                               formal SNR is high. This catches high-band
+                               stripe/artifact frames whose bright structured
+                               sidelobes otherwise bypass the ordinary RMS
+                               gate.
+    :type extreme_rms_factor: float
 
     :returns:
       - `select_indices` (bool array): True for images kept (not noisy).
@@ -360,7 +463,10 @@ def detect_noisy_images(data_stack,
     :rtype: tuple(np.ndarray, np.ndarray, np.ndarray)
     """
     # Prepare masks
-    images = np.squeeze(data_stack)
+    images = np.asarray(data_stack, dtype=float)
+    images = np.squeeze(images)
+    if images.ndim == 2:
+        images = images[np.newaxis, :, :]
     ny, nx = images.shape[1], images.shape[2]
     mask_ring, mask_disk = get_solar_radius_mask(rsun_pix, crpix1, crpix2, ny, nx, rsun_ratio=rsun_ratio)
 
@@ -370,30 +476,36 @@ def detect_noisy_images(data_stack,
     ring_rms_values = np.sqrt(np.nanmean(ring_pixels ** 2, axis=1))
     disk_rms_values = np.sqrt(np.nanmean(disk_pixels ** 2, axis=1))
     signals = np.nanpercentile(disk_pixels, 99.999, axis=1)
-    snr_values = signals / ring_rms_values
+    with np.errstate(divide='ignore', invalid='ignore'):
+        snr_values = signals / ring_rms_values
 
     # --- Automatic RMS threshold (knee detection) ---
-    sorted_rms = np.sort(ring_rms_values)
-    N = len(sorted_rms)
-
-    pts = np.vstack((np.arange(N), sorted_rms)).T
-    p0, pN = pts[0], pts[-1]
-    vec = pN - p0
-    length = np.linalg.norm(vec)
-
-    rel = pts - p0
-    proj = np.dot(rel, vec / length)
-    proj_vec = np.outer(proj, vec / length)
-    dists = np.linalg.norm(rel - proj_vec, axis=1)
-
-    knee = np.argmax(dists)
     fallback = np.nanmedian(ring_rms_values) + np.nanstd(ring_rms_values)
 
-    if knee in (0, N - 1):
-        rms_threshold = fallback
-    else:
-        thr = sorted_rms[knee]
-        rms_threshold = thr if np.sum(ring_rms_values > thr) > 0 else fallback
+    if rms_threshold is None:
+        sorted_rms = np.sort(ring_rms_values)
+        N = len(sorted_rms)
+
+        pts = np.vstack((np.arange(N), sorted_rms)).T
+        p0, pN = pts[0], pts[-1]
+        vec = pN - p0
+        length = np.linalg.norm(vec)
+
+        if N < 2 or length <= 0:
+            rms_threshold = fallback
+        else:
+            rel = pts - p0
+            proj = np.dot(rel, vec / length)
+            proj_vec = np.outer(proj, vec / length)
+            dists = np.linalg.norm(rel - proj_vec, axis=1)
+
+            knee = np.argmax(dists)
+
+            if knee in (0, N - 1):
+                rms_threshold = fallback
+            else:
+                thr = sorted_rms[knee]
+                rms_threshold = thr if np.sum(ring_rms_values > thr) > 0 else fallback
 
     # --- Automatic SNR threshold ---
     if snr_threshold is None:
@@ -401,16 +513,78 @@ def detect_noisy_images(data_stack,
         std_snr = np.sqrt(np.nanmean((snr_values - med_snr) ** 2))
         snr_threshold = med_snr - std_snr
 
-    # Flag noisy: low‐SNR or high‐RMS, but ignore very‐high‐SNR outliers
-    noisy = ((snr_values < snr_threshold) |
-             (ring_rms_values > rms_threshold)) & \
-            (snr_values <= 3 * snr_threshold)
+    # Flag noisy: low‐SNR or high‐RMS, but ignore ordinary high‐SNR outliers.
+    # A separate extreme off-disk RMS guard catches high-band artifact frames
+    # with coherent bright stripes that can look high-SNR yet ruin the merge.
+    snr_limited = snr_values <= 3 * snr_threshold
+    rms_bad = (ring_rms_values > rms_threshold) & snr_limited
+    finite_ring_rms = ring_rms_values[np.isfinite(ring_rms_values) & (ring_rms_values > 0)]
+    if finite_ring_rms.size > 0:
+        rms_median = np.nanmedian(finite_ring_rms)
+    else:
+        rms_median = np.nan
+    extreme_rms_bad = np.zeros_like(rms_bad, dtype=bool)
+    if np.isfinite(rms_median) and rms_median > 0 and extreme_rms_factor is not None:
+        extreme_rms_bad = ring_rms_values > (float(extreme_rms_factor) * rms_median)
+    snr_bad = (snr_values < snr_threshold) & snr_limited
+    noisy = rms_bad | extreme_rms_bad | snr_bad
+
+    stripe_bad = np.zeros(images.shape[0], dtype=bool)
+    stripe_scores = np.ones(images.shape[0], dtype=float)
+    grad_scores = np.ones(images.shape[0], dtype=float)
+
+    if stripe_qa:
+        stripe_bad, stripe_scores, grad_scores = detect_stripe_artifacts(
+            images,
+            stripe_threshold=stripe_threshold,
+            grad_aniso_threshold=grad_aniso_threshold)
+        noisy = noisy | stripe_bad
+        # Log the full per-frame score distribution so the real per-band scale
+        # is visible in the pipeline log and the thresholds can be calibrated.
+        with np.printoptions(precision=1, suppress=True, linewidth=200):
+            log_print('INFO',
+                      f"Stripe QA (n={images.shape[0]}): "
+                      f"stripe_scores={np.asarray(stripe_scores)}; "
+                      f"median={float(np.nanmedian(stripe_scores)):.2f}; "
+                      f"grad_scores={np.asarray(grad_scores)}; "
+                      f"abs_thr={stripe_threshold:.3g}; grad_thr={grad_aniso_threshold:.3g}; "
+                      f"n_flagged={int(np.count_nonzero(stripe_bad))}")
+        if stripe_bad.size > 0 and stripe_bad.all():
+            log_print('WARNING',
+                      'Stripe/artifact QA: artifact dominated band/day; all frames exceeded '
+                      'stripe thresholds. Keeping the 2 least-striped frames for merge stability.')
 
     # Ensure we keep at least two frames
     keep = ~noisy
-    if keep.sum() == 0:
-        top2 = np.argsort(snr_values)[-2:]
-        keep[top2] = True
+    min_keep = min(2, keep.size)
+    if keep.sum() < min_keep:
+        snr_rank = np.nan_to_num(snr_values, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+        if stripe_qa:
+            stripe_rank = np.nan_to_num(stripe_scores, nan=np.inf, posinf=np.inf, neginf=np.inf)
+            order = np.lexsort((-snr_rank, stripe_rank))
+        else:
+            order = np.argsort(-snr_rank)
+        needed = min_keep - keep.sum()
+        candidates = order[~keep[order]]
+        keep[candidates[:needed]] = True
+
+    for idx in np.where(~keep)[0]:
+        reasons = []
+        if rms_bad[idx]:
+            reasons.append('RMS')
+        if extreme_rms_bad[idx]:
+            reasons.append('EXTREME_RMS')
+        if snr_bad[idx]:
+            reasons.append('SNR')
+        if stripe_bad[idx]:
+            reasons.append('STRIPE')
+        reason_text = '+'.join(reasons) if reasons else 'UNKNOWN'
+        log_print('INFO',
+                  f"Rejected image index {idx}: reason={reason_text}; "
+                  f"stripe_score={stripe_scores[idx]:.3g}; "
+                  f"grad_aniso={grad_scores[idx]:.3g}; "
+                  f"stripe_thr={stripe_threshold:.3g}; "
+                  f"grad_thr={grad_aniso_threshold:.3g}")
 
     # Diagnostic plots: RMS on top, SNR below
     if showplt:
@@ -440,6 +614,160 @@ def detect_noisy_images(data_stack,
         plt.show()
 
     return keep, ring_rms_values, snr_values
+
+
+def detect_stripe_artifacts(data_stack,
+                            stripe_threshold=50.0,
+                            grad_aniso_threshold=12.0,
+                            stripe_rel_factor=8.0,
+                            stripe_rel_floor=30.0,
+                            bg_sigma=8.0,
+                            n_angle_bins=45,
+                            freq_inner_frac=0.06,
+                            freq_outer_frac=0.95):
+    """
+    Detect coherent directional stripe/artifact frames in a stack of
+    DISK-FREE solar images (pre-disk-addition synoptic arrays).
+
+    Band-agnostic: every metric is a scale-invariant ratio, so it works for
+    low, mid, and high band image scales without a solar-disk model.  Each
+    frame is high-pass filtered by subtracting a broad Gaussian background.
+    Frames with negligible high-pass residual structure retain neutral scores
+    to avoid classifying smooth radial emission as a stripe.  Remaining
+    residuals are apodized with a two-dimensional Hann window and scored by
+    the angular concentration of Fourier power in a mid-frequency annulus.
+    A companion directional-gradient ratio catches strong stripe-like
+    residuals in the image domain.
+
+    A frame is flagged when its Fourier stripe score clears EITHER an absolute
+    backstop (``stripe_threshold``, which catches uniformly artifact-dominated
+    bands such as the highest EOVSA spectral windows) OR a per-stack relative
+    cut (``stripe_rel_factor`` x the stack median, gated by ``stripe_rel_floor``
+    so an ordinary band of mildly anisotropic frames is never trimmed). Genuine
+    coherent stripes score one to several orders of magnitude above ordinary
+    dirty-beam anisotropy, so this two-sided rule rejects ruined frames while
+    leaving clean low/mid-band frames untouched. The gradient ratio is a weak
+    secondary check held at a high threshold to avoid false positives.
+
+    :param data_stack: Stack of disk-free image frames. Accepted shapes include
+                       ``(n_images, ny, nx)``, ``(n_images, 1, ny, nx)``, and a
+                       single ``(ny, nx)`` frame.
+    :type data_stack: numpy.ndarray
+    :param stripe_threshold: Absolute Fourier angular concentration ratio above
+                             which a frame is flagged regardless of the rest of
+                             the stack.
+    :type stripe_threshold: float
+    :param grad_aniso_threshold: Directional gradient anisotropy ratio above
+                                 which a frame is flagged.
+    :type grad_aniso_threshold: float
+    :param stripe_rel_factor: Multiple of the stack-median stripe score above
+                              which a frame is treated as a within-band outlier.
+    :type stripe_rel_factor: float
+    :param stripe_rel_floor: Minimum absolute stripe score for the relative
+                             outlier path to fire, so faint uniform anisotropy
+                             never trips it.
+    :type stripe_rel_floor: float
+    :param bg_sigma: Gaussian sigma, in pixels, for the broad background
+                     subtraction.
+    :type bg_sigma: float
+    :param n_angle_bins: Number of folded Fourier-angle bins over ``[0, pi)``.
+                         Kept deliberately coarse so a handful of compact bright
+                         sources (active regions) average out and do not mimic a
+                         stripe, while a single coherent stripe direction still
+                         dominates one bin.
+    :type n_angle_bins: int
+    :param freq_inner_frac: Inner normalized radius of the Fourier annulus.
+    :type freq_inner_frac: float
+    :param freq_outer_frac: Outer normalized radius of the Fourier annulus.
+    :type freq_outer_frac: float
+
+    :returns: Tuple containing the boolean stripe mask, Fourier stripe scores,
+              and gradient anisotropy scores.  A True stripe mask value means
+              the frame cleared the absolute or relative stripe cut, or the
+              gradient anisotropy threshold.
+    :rtype: tuple(numpy.ndarray, numpy.ndarray, numpy.ndarray)
+    """
+    stack = np.asarray(data_stack)
+    if stack.ndim == 2:
+        frames = stack[np.newaxis, :, :]
+    else:
+        frames = stack
+
+    n_images = frames.shape[0]
+    stripe_scores = np.ones(n_images, dtype=float)
+    grad_aniso_scores = np.ones(n_images, dtype=float)
+    n_bins = max(1, int(n_angle_bins))
+
+    for idx, frame in enumerate(frames):
+        img = np.asarray(np.squeeze(frame), dtype=float)
+        if img.ndim != 2:
+            continue
+
+        img = np.where(np.isfinite(img), img, 0.0)
+        ny, nx = img.shape
+        if ny == 0 or nx == 0:
+            continue
+
+        resid = img - ndimage.gaussian_filter(img, bg_sigma)
+        img_std = np.std(img)
+        resid_std = np.std(resid)
+        if resid_std <= 0 or not np.isfinite(resid_std):
+            continue
+        if img_std > 0 and resid_std / img_std < 0.2:
+            continue
+
+        window = np.outer(np.hanning(ny), np.hanning(nx))
+        resid_w = resid * window
+        power = np.abs(np.fft.fftshift(np.fft.fft2(resid_w))) ** 2
+
+        ky = np.arange(ny) - ny // 2
+        kx = np.arange(nx) - nx // 2
+        kx_grid, ky_grid = np.meshgrid(kx, ky)
+        half_short_axis = max(min(ny, nx) / 2.0, 1.0)
+        r_norm = np.sqrt(kx_grid ** 2 + ky_grid ** 2) / half_short_axis
+        annulus = (r_norm > freq_inner_frac) & (r_norm < freq_outer_frac)
+
+        annulus_power = power[annulus]
+        if annulus_power.size > 0:
+            theta = np.mod(np.arctan2(ky_grid[annulus], kx_grid[annulus]), np.pi)
+            bin_index = np.floor(theta / np.pi * n_bins).astype(int)
+            bin_index = np.clip(bin_index, 0, n_bins - 1)
+            angle_power = np.bincount(bin_index, weights=annulus_power, minlength=n_bins)
+            angle_count = np.bincount(bin_index, minlength=n_bins)
+            populated_power = angle_power[angle_count > 0]
+
+            if populated_power.size >= 2:
+                median_power = np.median(populated_power)
+                if median_power > 0:
+                    stripe_scores[idx] = np.max(populated_power) / median_power
+
+        gy, gx = np.gradient(resid)
+        diag1 = np.roll(np.roll(resid, -1, axis=0), -1, axis=1) - resid
+        diag2 = np.roll(np.roll(resid, -1, axis=0), 1, axis=1) - resid
+        dir_powers = np.array([
+            np.mean(gx ** 2),
+            np.mean(gy ** 2),
+            np.mean(diag1 ** 2),
+            np.mean(diag2 ** 2),
+        ], dtype=float)
+        dir_powers = np.where(np.isfinite(dir_powers), dir_powers, 0.0)
+        median_dir_power = np.median(dir_powers)
+        if median_dir_power > 0:
+            grad_aniso_scores[idx] = np.max(dir_powers) / median_dir_power
+
+    # Two-sided stripe decision: an absolute backstop catches uniformly
+    # artifact-dominated bands, while a within-stack relative-outlier cut
+    # (gated by an absolute floor) catches a bad frame inside an otherwise
+    # clean band without trimming a band of merely mildly anisotropic frames.
+    finite = np.isfinite(stripe_scores)
+    median_score = float(np.median(stripe_scores[finite])) if finite.any() else 1.0
+    if not np.isfinite(median_score) or median_score <= 0:
+        median_score = 1.0
+    relative_cut = max(stripe_rel_floor, stripe_rel_factor * median_score)
+    stripe_hit = (stripe_scores > stripe_threshold) | (stripe_scores > relative_cut)
+    grad_hit = grad_aniso_scores > grad_aniso_threshold
+    is_striped = stripe_hit | grad_hit
+    return is_striped, stripe_scores, grad_aniso_scores
 
 
 def extract_time_flags_from_ms(msfile, threshold=0.75, plotflag=False, return_flag=False, pols='XX'):
@@ -945,6 +1273,13 @@ def solar_diff_rot_heliofits(in_fits, newtime, out_fits, in_time=None, template_
     -------
     str
         Path to the output FITS file
+
+    Notes
+    -----
+    The output header's DATE-OBS/DATE record the reprojection target epoch
+    (the epoch of the output WCS), not the acquisition time. The true
+    acquisition window of the input image is preserved in STARTOBS/ENDOBS,
+    and EXPTIME is carried over unchanged.
     """
 
     # Convert FITS to SunPy Map
@@ -1023,6 +1358,18 @@ def solar_diff_rot_heliofits(in_fits, newtime, out_fits, in_time=None, template_
         'PC2_1': out_map.rotation_matrix[1, 0],
         'PC2_2': out_map.rotation_matrix[1, 1]
     })
+
+    # DATE-OBS above is the reprojection target epoch; keep the true
+    # acquisition window of the input image in STARTOBS/ENDOBS.
+    startobs = in_map.meta.get('startobs') or in_map.meta.get('date-obs')
+    if startobs:
+        template_header['startobs'] = Time(startobs).isot
+        endobs = in_map.meta.get('endobs')
+        exptime = in_map.meta.get('exptime')
+        if not endobs and exptime:
+            endobs = (Time(startobs) + float(exptime) * u.s).isot
+        if endobs:
+            template_header['endobs'] = Time(endobs).isot
 
     # Create new map with template header and save to FITS
     final_map = smap.Map(out_data, template_header)
@@ -1569,6 +1916,119 @@ def _fine_spectral_spws_for_range(spw):
     return chunks
 
 
+def _normalize_spw_list(spws):
+    """Return validated SPW range strings from CLI or Python inputs."""
+    if spws is None:
+        return None
+    if isinstance(spws, str):
+        tokens = spws.replace(',', ' ').split()
+    else:
+        tokens = [str(spw).strip() for spw in spws]
+    normalized = []
+    for token in tokens:
+        if not token:
+            continue
+        start, end = _spw_range_bounds(token)
+        normalized.append(f'{start}~{end}')
+    if not normalized:
+        raise ValueError("custom_spws was provided but no valid SPW ranges were found")
+    return normalized
+
+
+def _spw_id_list(spw_index):
+    """Return integer SPW ids from a comma-separated id list or range string."""
+    ids = []
+    for token in str(spw_index).replace(',', ' ').split():
+        start, end = _spw_range_bounds(token)
+        ids.extend(range(start, end + 1))
+    return sorted(set(ids))
+
+
+def _data_description_ids_for_spws(msfile, spw_ids):
+    """Return DATA_DESC_ID rows whose SPECTRAL_WINDOW_ID is in ``spw_ids``."""
+    spw_set = set(int(spw_id) for spw_id in spw_ids)
+    data_description_table = os.path.join(msfile, 'DATA_DESCRIPTION')
+    tb.open(data_description_table)
+    try:
+        spw_col = np.asarray(tb.getcol('SPECTRAL_WINDOW_ID')).astype(int).ravel()
+        return [ddid for ddid, spw_id in enumerate(spw_col) if int(spw_id) in spw_set]
+    finally:
+        tb.close()
+
+
+def _unflagged_row_mask(flag_values, nrow):
+    """Return rows with at least one unflagged correlation/channel sample."""
+    flags = np.asarray(flag_values, dtype=bool)
+    if flags.ndim == 0:
+        return np.full(nrow, not bool(flags), dtype=bool)
+    if flags.shape[-1] == nrow:
+        return np.any(~flags.reshape(-1, nrow), axis=0)
+    if flags.shape[0] == nrow:
+        return np.any(~flags.reshape(nrow, -1), axis=1)
+    if flags.size == nrow:
+        return ~flags.reshape(nrow)
+    return np.full(nrow, bool(np.any(~flags)), dtype=bool)
+
+
+def count_unflagged_solar_antennas(msfile, spw_index, n_ant_total, row_chunk=4096):
+    """Count solar antennas with at least one unflagged sample in the imaging SPWs.
+
+    Antenna indices are CASA zero-based.  Solar antennas are indices
+    ``0..n_ant_total-1``; the 27-m calibration antenna is intentionally excluded.
+    """
+    if n_ant_total is None:
+        return None
+    try:
+        ddids = _data_description_ids_for_spws(msfile, _spw_id_list(spw_index))
+        if not ddids:
+            return None
+
+        available = set()
+        tb.open(msfile)
+        try:
+            for ddid in ddids:
+                subtable = tb.query('DATA_DESC_ID == {}'.format(int(ddid)))
+                try:
+                    nrow = subtable.nrows()
+                    for startrow in range(0, nrow, row_chunk):
+                        nread = min(row_chunk, nrow - startrow)
+                        if nread <= 0:
+                            continue
+                        ant1 = np.asarray(subtable.getcol('ANTENNA1', startrow, nread), dtype=int)
+                        ant2 = np.asarray(subtable.getcol('ANTENNA2', startrow, nread), dtype=int)
+                        flags = subtable.getcol('FLAG', startrow, nread)
+                        unflagged_rows = _unflagged_row_mask(flags, nread)
+                        for ant in np.concatenate([ant1[unflagged_rows], ant2[unflagged_rows]]):
+                            ant = int(ant)
+                            if 0 <= ant < int(n_ant_total):
+                                available.add(ant)
+                finally:
+                    subtable.close()
+        finally:
+            tb.close()
+        return len(available)
+    except Exception:
+        log_print('WARNING',
+                  f"Unable to count unflagged solar antennas for imaging label: "
+                  f"{_format_log_state(msfile=msfile, spw_index=spw_index, n_ant_total=n_ant_total)}\n"
+                  f"{traceback.format_exc()}")
+        return None
+
+
+def _default_config_index_for_spw(spw, default_spws):
+    """Map a custom SPW range to the overlapping default coarse-band config."""
+    start, end = _spw_range_bounds(spw)
+    best_idx = 0
+    best_overlap = -1
+    for idx, default_spw in enumerate(default_spws):
+        default_start, default_end = _spw_range_bounds(default_spw)
+        overlap = max(0, min(end, default_end) - max(start, default_start) + 1)
+        if overlap > best_overlap:
+            best_idx = idx
+            best_overlap = overlap
+    return best_idx
+
+
 class FrequencySetup:
     """
     Manages frequency setup based on observation date for radio astronomy imaging.
@@ -1599,7 +2059,7 @@ class FrequencySetup:
     >>> print(crval, cdelt)
     """
 
-    def __init__(self, tim=None):
+    def __init__(self, tim=None, spws=None):
         if tim is None:
             tim = Time.now()
         self.tim = tim
@@ -1607,16 +2067,29 @@ class FrequencySetup:
         self.bandwidth = 0.325  # 325 MHz
         self.defaultfreq = 1.1 + self.bandwidth * (self.spw2band + 0.5)
 
-        if self.tim.mjd > 58536:
+        if self.tim.mjd > SPW_EPOCH_SPLIT_MJD:
             self.eofreq = self.defaultfreq
-            # self.spws = ['0~1', '2~4', '5~10', '11~20', '21~30', '31~40', '41~49']
-            self.spws = ['0~1', '2~4', '5~10', '11~20', '21~30', '31~43', '44~49']
+            self.spws = list(SPWS_52BAND)
             self.nbands = len(self.spw2band)
         else:
             self.bandwidth = 0.5  # 500 MHz
             self.nbands = 34
             self.eofreq = 1.419 + np.arange(self.nbands) * self.bandwidth
-            self.spws = ['1~3', '4~9', '10~16', '17~24', '25~30']
+            self.spws = list(SPWS_34BAND)
+
+        self.default_spws = list(self.spws)
+        custom_spws = _normalize_spw_list(spws)
+        if custom_spws is not None:
+            for spw in custom_spws:
+                start, end = _spw_range_bounds(spw)
+                if start < 0 or end >= self.nbands:
+                    raise ValueError(
+                        f"Custom SPW range {spw!r} is outside the valid 0~{self.nbands - 1} range")
+            self.spws = custom_spws
+        self.spw_config_indices = [
+            _default_config_index_for_spw(spw, self.default_spws)
+            for spw in self.spws
+        ]
 
         self.spws_indices = []
         for sp in self.spws:
@@ -1689,7 +2162,8 @@ class FrequencySetup:
 
 
 def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
-                    overwrite=True, snr_threshold=None, rms_threshold=None, showplt=False):
+                    overwrite=True, snr_threshold=None, rms_threshold=None, showplt=False,
+                    reftime=None, band_stripe_threshold=12.0):
     """
     Merges multiple FITS files into a single output file by calculating the mean of stacked data.
 
@@ -1712,6 +2186,19 @@ def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
         If True, the output file is overwritten if it already exists. Defaults to True.
     snr_threshold : float, optional
         SNR threshold for selecting images to be deselected. Defaults to 10.
+    reftime : astropy.time.Time or str, optional
+        Reference epoch stamped into the merged header's DATE-OBS/DATE-AVG.
+        If None, defaults to 20:00:00 UT on the observing date taken from the
+        first input header.
+    band_stripe_threshold : float, optional
+        Stripe score above which the *merged* daily diskless image is flagged as
+        artifact dominated. Per-frame stripe scores cannot separate a genuinely
+        ruined high band from a clean one (beam elongation inflates both), but
+        coherent striping reinforces in the merge while incoherent residuals
+        average down, so the merged image is the reliable band-level
+        discriminator. When exceeded, a WARNING is logged and the merged header
+        records ``STRPSCOR``/``STRPDOM``; disk addition is not changed.
+        Defaults to 12.0.
 
     Raises
     ------
@@ -1728,6 +2215,13 @@ def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
     of the disk brightness temperature, effectively reducing the contribution of residuals while preserving the overall
     structure.
 
+    Time convention: the input images have been differentially rotated to a
+    common daily reference epoch, so the merged header's DATE-OBS and DATE-AVG
+    are set to that epoch (``reftime``; default 20:00 UT on the observing
+    date) to keep the timestamp consistent with the WCS for coalignment.
+    The true observing window is preserved in STARTOBS/ENDOBS, and EXPTIME
+    records the total integration time summed over the merged images.
+
     Examples
     --------
     Merge three FITS files without exposure time weighting and with on-disk residual suppression:
@@ -1737,9 +2231,10 @@ def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
     """
     from astropy.io import fits
     from astropy.time import Time
-    from datetime import datetime, timedelta
 
     exptimes = []
+    startobs_list = []
+    endobs_list = []
     data = []
     for fidx, file in enumerate(fitsfilesin):
         with fits.open(file) as hdulist:
@@ -1748,6 +2243,13 @@ def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
                     header = hdu.header
                     data.append(np.squeeze(hdu.data))
                     exptimes.append(header['EXPTIME'])
+                    if 'STARTOBS' in header:
+                        startobs = Time(header['STARTOBS'])
+                        startobs_list.append(startobs)
+                        endobs = header.get('ENDOBS')
+                        if endobs is None:
+                            endobs = (startobs + float(header['EXPTIME']) * u.s).isot
+                        endobs_list.append(Time(endobs))
                     break
     data_stack = np.array(data)
     if deselect_index is None:
@@ -1769,13 +2271,55 @@ def merge_FITSfiles(fitsfilesin, outfits, snr_weight=None, deselect_index=None,
     date_merged = np.nansum(data_stack * weights, axis=0)
     newheader = header.copy()
     exptime = np.nansum(exptimes)
-    date_obs = Time(header['date-obs']).datetime.replace(hour=20, minute=0, second=0) - timedelta(
-        seconds=exptime / 2.0)
-    newheader.update({'EXPTIME': exptime, 'DATE-OBS': date_obs.strftime('%Y-%m-%dT%H:%M:%S')})
+    if reftime is None:
+        # Daily reference epoch: 20:00 UT on the observing date. The inputs
+        # were differentially rotated to this epoch, so DATE-OBS must match
+        # it (not the integration mid-point) for time-based coalignment.
+        reftime = Time(Time(header['date-obs']).datetime.replace(
+            hour=20, minute=0, second=0, microsecond=0))
+    reftime_str = Time(reftime).isot
+    newheader.set('EXPTIME', exptime, 'total integration time of merged images [s]')
+    newheader.set('DATE-OBS', reftime_str, 'daily reference epoch; see STARTOBS/ENDOBS')
+    newheader.set('DATE-AVG', reftime_str, 'daily reference epoch (WCS)')
+    if startobs_list:
+        newheader.set('STARTOBS', min(startobs_list).isot, 'start of true observing window')
+    if endobs_list:
+        newheader.set('ENDOBS', max(endobs_list).isot, 'end of true observing window')
     newheader['HISTORY'] = 'Merged from multiple images'
+    newheader['HISTORY'] = 'DATE-OBS set to daily reference epoch; acquisition window in STARTOBS/ENDOBS'
+
+    # Band-level artifact-dominated guard on the MERGED diskless image.
+    # Per-frame stripe scores overlap between ruined high bands and clean ones
+    # (dirty-beam elongation rises at track endpoints and toward high
+    # frequency), so they cannot separate the two. Coherent striping, however,
+    # reinforces under the merge while incoherent residuals average down, so the
+    # merged image is the reliable discriminator. This only flags/logs; it does
+    # not alter disk addition or delete the product.
+    try:
+        merged_stripe_score = float(detect_stripe_artifacts(date_merged[np.newaxis])[1][0])
+    except Exception:
+        merged_stripe_score = float('nan')
+    artifact_dominated = bool(np.isfinite(merged_stripe_score) and
+                              merged_stripe_score > band_stripe_threshold)
+    newheader.set('STRPSCOR', merged_stripe_score if np.isfinite(merged_stripe_score) else -1.0,
+                  'merged diskless directional stripe score')
+    newheader.set('STRPDOM', artifact_dominated,
+                  'merged image flagged artifact/stripe dominated')
+
     fits.writeto(outfits, date_merged, newheader, overwrite=overwrite)
     log_print('INFO',
               f'{np.count_nonzero(deselect_index)} out of {len(fitsfilesin)} images (index{np.where(deselect_index)}) are not selected for merging due to low SNR.')
+    if artifact_dominated:
+        log_print('WARNING',
+                  f'Merged daily image {os.path.basename(outfits)} is ARTIFACT/STRIPE DOMINATED: '
+                  f'merged stripe score={merged_stripe_score:.1f} > {band_stripe_threshold:.1f}. '
+                  f'This band/day daily synoptic is unreliable; coherent striping survives the '
+                  f'merge and per-frame deselection cannot recover it (likely upstream '
+                  f'high-band calibration/imaging quality).')
+    else:
+        log_print('INFO',
+                  f'Merged daily stripe score for {os.path.basename(outfits)}='
+                  f'{merged_stripe_score:.1f} (thr={band_stripe_threshold:.1f}).')
     return outfits
 
 
@@ -2370,7 +2914,8 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                        msname, ri_final, briggs_val, bmsize, pols,
                        reftime_daily, viz_timerange, date_str,
                        is_segmented, imaging_objs, freq_setup,
-                       tr_series_time=None, fits_tag='', data_column='CORRECTED_DATA'):
+                       tr_series_time=None, fits_tag='', data_column='CORRECTED_DATA',
+                       solar_antenna_total=None):
     """Run final imaging (segmented or non-segmented) and return output FITS paths.
 
     :param tr_series_time: List of (start_Time, end_Time) tuples to filter imaging intervals.
@@ -2382,6 +2927,11 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
     """
     gain = 0.2
     reffreq, cdelt4_real, _ = freq_setup.get_reffreq_and_cdelt(spw, return_bmsize=True)
+    n_ant_img = count_unflagged_solar_antennas(msfile, sp_index, solar_antenna_total)
+    if n_ant_img is not None and solar_antenna_total is not None:
+        log_print('INFO',
+                  f"SPW {spwstr}: {n_ant_img}/{int(solar_antenna_total)} solar antennas "
+                  f"have unflagged data available for final imaging.")
 
     with pipeline_stage("final_imaging", spw=spw, spwstr=spwstr, segmented=is_segmented):
         if is_segmented:
@@ -2404,6 +2954,10 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
             clean_obj.run(dryrun=False)
 
             fitsname = sorted(glob(os.path.join(workdir, imname + '-t*-image.fits')))
+            if not fitsname:
+                # wsclean omits the '-t????-' infix when intervals_out=1;
+                # fall back to the non-time-indexed output name.
+                fitsname = sorted(glob(os.path.join(workdir, imname + '-image.fits')))
             fitsname_helio = [f.replace('image.fits', 'image.helio.fits') for f in fitsname]
             fitsname_helio_ref_daily = [f.replace('image.fits', 'image.helio.ref_daily.fits') for f in fitsname]
             try:
@@ -2502,6 +3056,12 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
         # tiled-compressed FITS files written below, and moving compression
         # earlier in the model/imaging path breaks later WSClean predict runs.
         _write_compressed_synoptic_fits(eofile, synfitsfile)
+        _set_imaging_antenna_keywords(synfitsfile, n_ant_img, solar_antenna_total)
+        if not is_segmented:
+            # Non-segmented daily product: content is aligned to the daily
+            # reference epoch, but imreg stamps DATE-OBS with the timerange
+            # start. Restamp to the reference epoch.
+            _set_daily_reference_time_keywords(synfitsfile, reftime_daily)
 
     return synfitsfiles, imaging_objs
 
@@ -2512,7 +3072,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  overwrite=False, overwrite_caltb=True, mergeFITSonly=False,
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
                  spws_imaging=None, fits_tag='', fine_spectral_imaging=False,
-                 fine_spectral_only=False):
+                 fine_spectral_only=False, custom_spws=None):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -2557,6 +3117,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
     :type tr_series_imaging: list, optional
     :param spws_imaging: Spectral windows to process. If provided, overrides the default spwidx2proc.
     :type spws_imaging: list, optional
+    :param custom_spws: Override the default FrequencySetup SPW grouping with
+        explicit ranges such as ``['0~1', '2~4', '5~7']``.
+    :type custom_spws: list or str, optional
     :param fine_spectral_imaging: If True, run an additional final-imaging pass
         on finer SPW chunks after the standard final-imaging pass.
     :type fine_spectral_imaging: bool, optional
@@ -2568,6 +3131,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
     """
     if fine_spectral_only:
         fine_spectral_imaging = True
+    custom_spws = _normalize_spw_list(custom_spws)
 
     with pipeline_stage(
         "pipeline_run",
@@ -2580,6 +3144,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         overwrite=overwrite,
         ncpu=ncpu,
         spws_imaging=spws_imaging,
+        custom_spws=','.join(custom_spws) if custom_spws else None,
         fine_spectral_imaging=fine_spectral_imaging,
         fine_spectral_only=fine_spectral_only,
     ):
@@ -2608,6 +3173,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         # --- Override spwidx2proc if spws_imaging is specified ---
         if spws_imaging is not None:
             spwidx2proc = [int(s) for s in spws_imaging]
+        elif custom_spws is not None:
+            spwidx2proc = list(range(len(custom_spws)))
         else:
             spwidx2proc = PIPELINE_CONFIG['spwidx2proc']
 
@@ -2666,8 +3233,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         tmid_msfile = tbg_msfile + (ted_msfile - tbg_msfile) / 2
 
         antenna = '0~12'
+        solar_antenna_total = 13
         if tbg_msfile >= EOVSA15_UPGRADE_DATE.to_datetime():
             antenna = '0~14'
+            solar_antenna_total = 15
         ## date_str is set to the day 1 if the time is between 08:00 UT on day 1 to 08:00 UT(+1) on day 2
         if tbg_msfile.time() < time(8, 0):
             date_local = tbg_msfile.date() - timedelta(days=1)
@@ -2675,8 +3244,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             date_local = tbg_msfile.date()
         date_str = date_local.strftime('%Y%m%d')
         reftime_daily = Time(datetime.combine(date_local, time(20, 0)))
-        freq_setup = FrequencySetup(Time(tbg_msfile))
+        freq_setup = FrequencySetup(Time(tbg_msfile), spws=custom_spws)
         spws_indices = freq_setup.spws_indices
+        spw_config_indices = freq_setup.spw_config_indices
         tb_models = {}
         outfits_all = {}
         bright = {}
@@ -2684,6 +3254,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         tb_ratio_thresh = {}
         segmented_imaging = {}
         briggs = {}
+        bright_thresh_source = {}
         fits_mask = {}
         imaging_objs = {}
         fine_imaging_spws = {}
@@ -2694,16 +3265,24 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         nbands = freq_setup.nbands
 
         for sidx, sp_index in enumerate(spws_indices):
+            config_idx = spw_config_indices[sidx]
             tb_models[sidx] = None
             outfits_all[sidx] = None
             bright[sidx] = False
             imaging_objs[sidx] = None
-            bright_thresh[sidx] = bright_thresh_[sidx]
-            tb_ratio_thresh[sidx] = tb_ratio_thresh_[sidx]
+            reffreq, _ = freq_setup.get_reffreq_and_cdelt(spws[sidx])
+            reffreq_ghz = float(reffreq.rstrip('GHz'))
+            if custom_spws is None:
+                bright_thresh[sidx] = float(bright_thresh_[config_idx])
+                bright_thresh_source[sidx] = 'table-anchor'
+            else:
+                bright_thresh[sidx] = feature_brightness_threshold(reffreq_ghz)
+                bright_thresh_source[sidx] = 'smooth-log-pchip'
+            tb_ratio_thresh[sidx] = tb_ratio_thresh_[config_idx]
             # segmented_imaging[sidx] = True if sidx in [0, 1, 2, 3] else False
             ## testing with segmented imaging for all bands for now with the npz calibration, will revert to the above after validation
-            segmented_imaging[sidx] = True if sidx in [0, 1, 2, 3, 4, 5, 6] else False
-            briggs[sidx] = briggs_[sidx]
+            segmented_imaging[sidx] = True if config_idx in [0, 1, 2, 3, 4, 5, 6] else False
+            briggs[sidx] = briggs_[config_idx]
 
         if fine_spectral_imaging:
             for sidx, spw in enumerate(spws):
@@ -2780,7 +3359,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             for sidx, fine_spws in fine_imaging_spws.items():
                 if not fine_spws:
                     continue
-                mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(sidx, 1)
+                mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(spw_config_indices[sidx], 1)
                 ri_final = _compute_round_intervals(wsclean_intervals, mult)
                 log_print('INFO',
                           f"Running fine spectral imaging for SPW {spws[sidx]}: {fine_spws}")
@@ -2795,7 +3374,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         reftime_daily, viz_timerange, date_str,
                         segmented_imaging[sidx], imaging_objs, freq_setup,
                         tr_series_time=tr_series_time, fits_tag=fits_tag,
-                        data_column=final_data_column)
+                        data_column=final_data_column,
+                        solar_antenna_total=solar_antenna_total)
         elif mergeFITSonly:
             log_print('INFO', "mergeFITSonly=True: skipping self-calibration and imaging, proceeding to merge.")
         else:
@@ -2881,7 +3461,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     bright[sidx] = bright_ratio * snr > bright_thresh[sidx]
                     log_print('INFO',
                               f"SPW {spws[sidx]}: tb_image = {tb_image:.1f} kK, tb_model = {tb_model:.1f} kK, "
-                              f"Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]}, SNR = {snr:.1f}")
+                              f"Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]:.1f} "
+                              f"({bright_thresh_source[sidx]}), SNR = {snr:.1f}")
 
                     if sidx == 0 and snr >= 5:
                         bright[sidx] = True
@@ -2899,9 +3480,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     # --- Compute time intervals for all rounds ---
                     round_intervals = {}
                     for round_def in SELFCAL_ROUNDS:
-                        mult = round_def['interval_multipliers'].get(sidx, 1)
+                        mult = round_def['interval_multipliers'].get(spw_config_indices[sidx], 1)
                         round_intervals[round_def['name']] = _compute_round_intervals(wsclean_intervals, mult)
-                    mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(sidx, 1)
+                    mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(spw_config_indices[sidx], 1)
                     round_intervals['final'] = _compute_round_intervals(wsclean_intervals, mult)
 
                     # --- Step 2: Feature self-calibration (if bright) ---
@@ -2946,7 +3527,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         msname, ri_final, briggs[sidx], bmsize, pols,
                         reftime_daily, viz_timerange, date_str,
                         segmented_imaging[sidx], imaging_objs, freq_setup,
-                        tr_series_time=tr_series_time, fits_tag=fits_tag)
+                        tr_series_time=tr_series_time, fits_tag=fits_tag,
+                        solar_antenna_total=solar_antenna_total)
 
                     if not segmented_imaging[sidx] and len(synfitsfiles) > 0:
                         outfits_all[sidx] = synfitsfiles[0]
@@ -2967,7 +3549,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                 msname, ri_final, briggs[sidx], fine_bmsize, pols,
                                 reftime_daily, viz_timerange, date_str,
                                 segmented_imaging[sidx], imaging_objs, freq_setup,
-                                tr_series_time=tr_series_time, fits_tag=fits_tag)
+                                tr_series_time=tr_series_time, fits_tag=fits_tag,
+                                solar_antenna_total=solar_antenna_total)
 
                     elapsed_total = (datetime.now() - run_start_time).total_seconds() / 60
                     log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_total:.1f} minutes")
@@ -2994,7 +3577,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 snr_threshold = 3
                 if len(synfitsfiles) > 0:
                     log_print('INFO', f"Merging synoptic images for SPW {spwstr} to {outfits} ...")
-                    merge_FITSfiles(synfitsfiles, outfits, overwrite=True, snr_threshold=snr_threshold)
+                    merge_FITSfiles(synfitsfiles, outfits, overwrite=True, snr_threshold=snr_threshold,
+                                    reftime=reftime_daily)
                     outfits_all[out_key] = outfits
                     synfitsfiles_disk = [l.replace('.tb.fits', '.tb.disk.fits') for l in synfitsfiles]
                     try:
@@ -3135,6 +3719,8 @@ if __name__ == '__main__':
                         help="Specifies the number of CPUs for parallel processing.")
     parser.add_argument('--tr_series_imaging', nargs='*', help='Time ranges for imaging, expects a list of tuples.')
     parser.add_argument('--spws_imaging', nargs='*', help='Spectral windows selected for imaging.')
+    parser.add_argument('--custom-spws', nargs='+',
+                        help='Override default FrequencySetup SPW groupings, e.g. 0~1 2~4 5~7.')
     parser.add_argument('--fits_tag', type=str, default='',
                         help='Optional tag inserted into synoptic FITS filenames.')
     parser.add_argument('--fine-spectral-imaging', action='store_true',
@@ -3168,6 +3754,7 @@ if __name__ == '__main__':
         tr_series_imaging=args.tr_series_imaging,
         spws_imaging=args.spws_imaging,
         fits_tag=args.fits_tag,
+        custom_spws=args.custom_spws,
         fine_spectral_imaging=args.fine_spectral_imaging,
         fine_spectral_only=args.fine_spectral_only,
         hanning=args.hanning,
