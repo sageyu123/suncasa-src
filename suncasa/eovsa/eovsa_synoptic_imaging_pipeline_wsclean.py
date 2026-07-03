@@ -123,7 +123,15 @@ logging.info("Using wsclean executable: %s", WSCLEAN_BIN)
 # ============================================================
 
 PIPELINE_CONFIG = {
-    'bright_thresh': [350, 900, 2000, 2800, 800, 150, 100],
+    # bright_thresh anchors for s31-43 (13.92 GHz) and s44-49 (17.01 GHz) lowered
+    # 150->50 and 100->12 on 2026-07-03: a forced-feature-selfcal A/B on 2026-04-03
+    # showed feature selfcal doubles s31-43 coarse DR (195->446) and removes the
+    # dominant fringe artifact in s44-49. Anchors set from the per-date score
+    # distribution mined from 65 obs dates of pipeline logs: s31-43 scores are
+    # bimodal (faint days <=25, source days >=75; 50 sits in the gap); s44-49
+    # active-era median is 13 with a faint floor at 2-4 (12 admits the validated
+    # regime, excludes the floor). s44-49 anchor is provisional (one A/B sample).
+    'bright_thresh': [350, 900, 2000, 2800, 800, 50, 12],
     'bright_thresh_freq_ghz': [1.42, 2.87, 4.33, 6.93, 10.18, 13.92, 17.01],
     'tb_ratio_thresh': [1.5, 5.0, 5.0, 3.0, 1.5, 1.5, 1.5],
     'briggs': [-1.0, -1.0, -1.0, -1.0, -1.0, -0.5, -0.5],
