@@ -3231,7 +3231,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  overwrite=False, overwrite_caltb=True, mergeFITSonly=False,
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
                  spws_imaging=None, fits_tag='', fine_spectral_imaging=False,
-                 fine_spectral_only=False, custom_spws=None):
+                 fine_spectral_only=False, custom_spws=None, force_feature_selfcal=False):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -3646,6 +3646,11 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                               f"Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]:.1f} "
                               f"({bright_thresh_source[sidx]}), SNR = {snr:.1f}")
 
+                    if force_feature_selfcal and not bright[sidx]:
+                        bright[sidx] = True
+                        log_print('INFO', f"SPW {spws[sidx]}: force_feature_selfcal=True override. "
+                                          f"Setting bright to True (test mode).")
+
                     if sidx == 0 and snr >= 5:
                         bright[sidx] = True
                         log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
@@ -3913,6 +3918,9 @@ if __name__ == '__main__':
                         help='Run an additional final-imaging pass on finer SPW chunks.')
     parser.add_argument('--fine-spectral-only', action='store_true',
                         help='Run only fine final imaging from an existing selfcal MS.')
+    parser.add_argument('--force-feature-selfcal', action='store_true',
+                        help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
+                             'bypassing the brightness gate. Default off.')
     parser.add_argument('--hanning', action='store_true', help='Applies Hanning smoothing to the data.')
     parser.add_argument('--do_sbdcal', action='store_true', help='Perform single-band delay calibration.')
     parser.add_argument('--debug_mode', action='store_true', help='Enables debug mode with finer control over parameters.')
@@ -3943,6 +3951,7 @@ if __name__ == '__main__':
         custom_spws=args.custom_spws,
         fine_spectral_imaging=args.fine_spectral_imaging,
         fine_spectral_only=args.fine_spectral_only,
+        force_feature_selfcal=args.force_feature_selfcal,
         hanning=args.hanning,
         do_sbdcal=args.do_sbdcal,
     )

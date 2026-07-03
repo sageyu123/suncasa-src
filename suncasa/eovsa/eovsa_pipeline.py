@@ -624,7 +624,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
                    secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
                    custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
-                   sql_cal_time=None):
+                   sql_cal_time=None, force_feature_selfcal=False):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -656,6 +656,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
        sql_cal_time: optional SQL lookup time override for no-NPZ refcal/phacal
                 selection. Used by cron provisional runs to image with a previous
                 ready calibration day while keeping the target observing date.
+       force_feature_selfcal: TEST ONLY: force feature self-calibration for all
+                processed SPW groups, bypassing the brightness gate. Default off.
     '''
 
     if cal_npz:
@@ -716,7 +718,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    'pols': pols, 'ncpu': ncpu,
                    'fine_spectral_only': fine_spectral_only,
                    'fine_spectral_imaging': fine_spectral_imaging,
-                   'custom_spws': custom_spws})
+                   'custom_spws': custom_spws,
+                   'force_feature_selfcal': force_feature_selfcal})
         return esip.pipeline_run(slfcaled_vis, outputvis='',
                                  workdir=workdir,
                                  slfcaltbdir=slfcaltbdir_path,
@@ -725,7 +728,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  fits_tag=cal_tag,
                                  fine_spectral_imaging=True,
                                  fine_spectral_only=True,
-                                 custom_spws=custom_spws)
+                                 custom_spws=custom_spws,
+                                 force_feature_selfcal=force_feature_selfcal)
 
     if isinstance(trange, Time):
         mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
@@ -866,7 +870,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'pols': pols, 'ncpu': ncpu,
                'fine_spectral_imaging': fine_spectral_imaging,
                'fine_spectral_only': fine_spectral_only,
-               'custom_spws': custom_spws})
+               'custom_spws': custom_spws,
+               'force_feature_selfcal': force_feature_selfcal})
     overwrite_pipeline = overwrite or force_imaging_rerun
     if force_imaging_rerun and version in WSCLEAN_PIPELINE_VERSIONS:
         print(f'Cron recovery mode enabled for {tdate.strftime("%Y-%m-%d")}: rerunning imaging despite existing outputvis.')
@@ -892,7 +897,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 fits_tag=cal_tag,
                                 fine_spectral_imaging=fine_spectral_imaging,
                                 fine_spectral_only=fine_spectral_only,
-                                custom_spws=custom_spws)
+                                custom_spws=custom_spws,
+                                force_feature_selfcal=force_feature_selfcal)
         if clearcache:
             os.system(f'rm -rf {workdir}/*')
     else:
@@ -1280,7 +1286,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
              secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
              custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
-             sql_cal_time=None):
+             sql_cal_time=None, force_feature_selfcal=False):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1353,6 +1359,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         This is mainly for cron fallback runs that image the target date using
         an older ready calibration day.
     :type sql_cal_time: str, optional
+    :param force_feature_selfcal: TEST ONLY: force feature self-calibration for
+        all processed SPW groups, bypassing the brightness gate. Default off.
+    :type force_feature_selfcal: bool, optional
 
     :raises ValueError: Raises an exception if the date parameters are out of the valid Gregorian calendar range.
 
@@ -1559,7 +1568,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            custom_spws=custom_spws,
                                            force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
                                            refcal_sql_mode=refcal_sql_mode,
-                                           sql_cal_time=sql_cal_time_for_run)
+                                           sql_cal_time=sql_cal_time_for_run,
+                                           force_feature_selfcal=force_feature_selfcal)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite_for_run, doimport=doimport,
@@ -1573,7 +1583,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                custom_spws=custom_spws,
                                                force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
                                                refcal_sql_mode=refcal_sql_mode,
-                                               sql_cal_time=sql_cal_time_for_run)
+                                               sql_cal_time=sql_cal_time_for_run,
+                                               force_feature_selfcal=force_feature_selfcal)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1725,6 +1736,9 @@ if __name__ == '__main__':
                         help='For WSClean versions, run only finer imaging from the existing selfcal MS product.')
     parser.add_argument('--custom-spws', type=str, nargs='+', default=None,
                         help='For WSClean versions, override FrequencySetup SPW groupings, e.g. 0~1 2~4 5~7.')
+    parser.add_argument('--force-feature-selfcal', action='store_true', default=False,
+                        help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
+                             'bypassing the brightness gate. Default off.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1741,7 +1755,8 @@ if __name__ == '__main__':
                           args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz,
                           args.fine_spectral_imaging, args.fine_spectral_only, args.custom_spws,
                           args.force_lo_hi_smooth_extrap, refcal_sql_mode=args.refcal_sql_mode,
-                          sql_cal_time=args.sql_cal_time)
+                          sql_cal_time=args.sql_cal_time,
+                          force_feature_selfcal=args.force_feature_selfcal)
 
     # Exit nonzero if any date failed so wrappers (set -e) do not treat a core
     # imaging/calibration failure as success and proceed to FITS/JP2/preview steps.
