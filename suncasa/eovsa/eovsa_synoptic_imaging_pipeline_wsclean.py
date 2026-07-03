@@ -128,6 +128,17 @@ PIPELINE_CONFIG = {
     'tb_ratio_thresh': [1.5, 5.0, 5.0, 3.0, 1.5, 1.5, 1.5],
     'briggs': [-1.0, -1.0, -1.0, -1.0, -1.0, -0.5, -0.5],
     'spwidx2proc': [0, 1, 2, 3, 4, 5, 6],
+    # --- Fine-spectral quality gate ---
+    # At high frequency (faint Sun) the ~2-SPW fine-spectral sub-chunks can
+    # have too little SNR to converge, producing off-source noise/peaks far
+    # above the parent coarse-group image. When enabled, each fine-chunk
+    # product is compared against its parent coarse-group product and
+    # rejected (FITS deleted) if it looks diverged; the coarse product
+    # already covers that frequency range, so rejection has no coverage gap.
+    'fine_spectral_snr_gate': True,
+    'fine_spectral_noise_factor': 3.5,
+    'fine_spectral_dr_floor': 70.0,
+    'fine_spectral_peak_tb_max': 2.0e6,
 }
 
 
@@ -2910,6 +2921,154 @@ def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
     return caltbs
 
 
+def _fits_corner_noise_peak(fitsfile, corner_frac=0.15):
+    """Compute a cheap off-source-noise / peak estimate from an image's corners.
+
+    Reads the first HDU with image data, then measures the standard
+    deviation over the four corner boxes (a crude, WCS-free proxy for
+    off-source/off-disk noise) and the peak pixel value over the full image.
+
+    :param fitsfile: Path to a ``.tb.fits``-style image FITS file.
+    :type fitsfile: str
+    :param corner_frac: Fraction of each axis used for each corner box.
+    :type corner_frac: float
+    :returns: ``(noise, peak)`` in the same units as the FITS data (K for
+        ``.tb.fits`` brightness-temperature images).
+    :rtype: tuple(float, float)
+    """
+    with fits.open(fitsfile, memmap=False) as hdul:
+        data = None
+        for hdu in hdul:
+            if hdu.data is not None:
+                data = hdu.data
+                break
+        if data is None:
+            raise ValueError(f"No image data found in {fitsfile}")
+    arr = np.squeeze(np.asarray(data, dtype=float))
+    if arr.ndim != 2:
+        # Collapse any leading singleton/stokes/freq axes; keep the last two.
+        arr = arr.reshape(arr.shape[-2], arr.shape[-1]) if arr.ndim > 2 else arr
+    ny, nx = arr.shape[-2], arr.shape[-1]
+    cy = max(1, int(round(ny * corner_frac)))
+    cx = max(1, int(round(nx * corner_frac)))
+    corners = np.concatenate([
+        arr[:cy, :cx].ravel(),
+        arr[:cy, nx - cx:].ravel(),
+        arr[ny - cy:, :cx].ravel(),
+        arr[ny - cy:, nx - cx:].ravel(),
+    ])
+    noise = float(np.nanstd(corners))
+    peak = float(np.nanmax(arr))
+    return noise, peak
+
+
+def _fine_spectral_quality_gate(fine_fits, coarse_fits, cfg=None):
+    """Decide whether a fine-spectral image is good enough to keep.
+
+    Compares off-source noise / peak / dynamic-range of a fine-spectral
+    sub-chunk image against its parent coarse-group image (imaged from the
+    same visibility interval, just before this fine chunk, at the same
+    ``sidx``). The fine chunk is rejected when it looks diverged relative to
+    the coarse parent: the coarse product already covers the same frequency
+    range, so rejecting a diverged fine product does not lose sky coverage.
+
+    Any failure to read/compute metrics defaults to KEEP (returns
+    ``keep=True``) so a metrics-read problem never blocks the pipeline.
+
+    :param fine_fits: Path to the fine-chunk's ``.tb.fits`` image.
+    :type fine_fits: str
+    :param coarse_fits: Path to the parent coarse-group's ``.tb.fits`` image
+        for the same time interval, or None/missing if unavailable.
+    :type coarse_fits: str or None
+    :param cfg: Config dict with keys ``fine_spectral_noise_factor``,
+        ``fine_spectral_dr_floor``, ``fine_spectral_peak_tb_max``. Defaults
+        to :data:`PIPELINE_CONFIG` when None.
+    :type cfg: dict or None
+    :returns: ``(keep, metrics, reason)`` where ``metrics`` has keys
+        ``fine_noise``, ``fine_peak``, ``fine_dr``, ``coarse_noise`` (when
+        available), and ``reason`` is a human-readable string describing the
+        pass/fail criterion (empty when kept cleanly).
+    :rtype: tuple(bool, dict, str)
+    """
+    cfg = cfg or PIPELINE_CONFIG
+    noise_factor = cfg.get('fine_spectral_noise_factor', 5.0)
+    dr_floor = cfg.get('fine_spectral_dr_floor', 40.0)
+    peak_tb_max = cfg.get('fine_spectral_peak_tb_max', 3.0e6)
+
+    metrics = {'fine_noise': None, 'fine_peak': None, 'fine_dr': None, 'coarse_noise': None}
+    try:
+        fine_noise, fine_peak = _fits_corner_noise_peak(fine_fits)
+        fine_dr = fine_peak / fine_noise if fine_noise > 0 else float('inf')
+        metrics.update(fine_noise=fine_noise, fine_peak=fine_peak, fine_dr=fine_dr)
+
+        coarse_noise = None
+        if coarse_fits and os.path.exists(coarse_fits):
+            coarse_noise, _coarse_peak = _fits_corner_noise_peak(coarse_fits)
+            metrics['coarse_noise'] = coarse_noise
+
+        if coarse_noise is not None and coarse_noise > 0 and fine_noise > noise_factor * coarse_noise:
+            return False, metrics, (
+                f"fine_noise={fine_noise:.3g} > "
+                f"{noise_factor:g}*coarse_noise({coarse_noise:.3g})")
+        if fine_dr < dr_floor:
+            return False, metrics, f"fine_dr={fine_dr:.3g} < dr_floor({dr_floor:g})"
+        if fine_peak > peak_tb_max:
+            return False, metrics, f"fine_peak={fine_peak:.3g} > peak_tb_max({peak_tb_max:.3g})"
+        return True, metrics, ""
+    except Exception:
+        log_print('WARNING',
+                  f"[fine_spectral_snr_gate] metric computation failed for {fine_fits}; "
+                  f"defaulting to KEEP\n{traceback.format_exc()}")
+        return True, metrics, "metric-read-failed"
+
+
+def _apply_fine_spectral_quality_gate(fine_fitsfiles, coarse_fitsfiles, tag, cfg=None):
+    """Run the fine-spectral quality gate over a fine chunk's FITS outputs.
+
+    For each fine-chunk FITS file, finds the coarse-parent FITS for the same
+    imaging interval (matched by list position, since both lists are built
+    from the same ``ri_final`` time intervals in ``_run_final_imaging``),
+    evaluates :func:`_fine_spectral_quality_gate`, and deletes+drops any
+    rejected fine FITS file. Logs INFO on pass, WARNING on rejection.
+
+    :param fine_fitsfiles: FITS paths just written for the fine chunk.
+    :type fine_fitsfiles: list(str)
+    :param coarse_fitsfiles: FITS paths already written for the parent
+        coarse group (same ``sidx``, same time intervals).
+    :type coarse_fitsfiles: list(str)
+    :param tag: Short label (e.g. ``fine_key``) used in log messages.
+    :type tag: str
+    :param cfg: Config dict; defaults to :data:`PIPELINE_CONFIG` when None.
+    :type cfg: dict or None
+    :returns: The subset of ``fine_fitsfiles`` that passed the gate (or all
+        of them, unchanged, if gating could not run).
+    :rtype: list(str)
+    """
+    cfg = cfg or PIPELINE_CONFIG
+    kept = []
+    for idx, fine_fits in enumerate(fine_fitsfiles or []):
+        coarse_fits = coarse_fitsfiles[idx] if coarse_fitsfiles and idx < len(coarse_fitsfiles) else (
+            coarse_fitsfiles[0] if coarse_fitsfiles else None)
+        keep, metrics, reason = _fine_spectral_quality_gate(fine_fits, coarse_fits, cfg=cfg)
+        if keep:
+            log_print('INFO',
+                      f"[fine_spectral_snr_gate] KEEP {tag} {os.path.basename(fine_fits)} | "
+                      f"{_format_log_state(**metrics)}")
+            kept.append(fine_fits)
+        else:
+            log_print('WARNING',
+                      f"[fine_spectral_snr_gate] REJECT {tag} {os.path.basename(fine_fits)} | "
+                      f"{reason} | {_format_log_state(**metrics)}")
+            try:
+                if os.path.exists(fine_fits):
+                    os.remove(fine_fits)
+            except Exception:
+                log_print('WARNING',
+                          f"[fine_spectral_snr_gate] failed to remove rejected FITS {fine_fits}\n"
+                          f"{traceback.format_exc()}")
+    return kept
+
+
 def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                        msname, ri_final, briggs_val, bmsize, pols,
                        reftime_daily, viz_timerange, date_str,
@@ -3363,12 +3522,26 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 ri_final = _compute_round_intervals(wsclean_intervals, mult)
                 log_print('INFO',
                           f"Running fine spectral imaging for SPW {spws[sidx]}: {fine_spws}")
+                # Locate the parent coarse group's already-produced FITS (from
+                # a prior, non-fine-only pipeline_run) to compare against.
+                coarse_spwstr = format_spw(spws[sidx])
+                post_tag_fso = f'.{fits_tag}' if fits_tag else ''
+                if segmented_imaging[sidx]:
+                    coarse_fitsfiles = sorted(glob(os.path.join(
+                        imgoutdir,
+                        f"eovsa.synoptic{post_tag_fso}.{date_str[:-1]}?T??????Z.s{coarse_spwstr}.tb.fits")))
+                else:
+                    coarse_candidate = os.path.join(
+                        imgoutdir,
+                        f'eovsa.synoptic_daily{post_tag_fso}.{date_str}T200000Z.s{coarse_spwstr}.tb.fits')
+                    coarse_fitsfiles = [coarse_candidate] if os.path.exists(coarse_candidate) else []
+
                 for fine_spw in fine_spws:
                     fine_spwstr = format_spw(fine_spw)
                     fine_sp_index = _spw_indices_for_range(fine_spw)
                     _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
                     fine_key = f'fine:{fine_spwstr}'
-                    _, imaging_objs = _run_final_imaging(
+                    fine_synfitsfiles, imaging_objs = _run_final_imaging(
                         msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
                         msname, ri_final, briggs[sidx], fine_bmsize, pols,
                         reftime_daily, viz_timerange, date_str,
@@ -3376,6 +3549,15 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         tr_series_time=tr_series_time, fits_tag=fits_tag,
                         data_column=final_data_column,
                         solar_antenna_total=solar_antenna_total)
+
+                    if PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
+                        if not coarse_fitsfiles:
+                            log_print('WARNING',
+                                      f"[fine_spectral_snr_gate] no parent coarse FITS found for "
+                                      f"{fine_key} (sidx={sidx}, spw={coarse_spwstr}); "
+                                      f"skipping gate, keeping fine product(s).")
+                        _apply_fine_spectral_quality_gate(
+                            fine_synfitsfiles, coarse_fitsfiles, fine_key, cfg=PIPELINE_CONFIG)
         elif mergeFITSonly:
             log_print('INFO', "mergeFITSonly=True: skipping self-calibration and imaging, proceeding to merge.")
         else:
@@ -3544,13 +3726,17 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                             fine_sp_index = _spw_indices_for_range(fine_spw)
                             _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
                             fine_key = f'fine:{fine_spwstr}'
-                            _, imaging_objs = _run_final_imaging(
+                            fine_synfitsfiles, imaging_objs = _run_final_imaging(
                                 msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
                                 msname, ri_final, briggs[sidx], fine_bmsize, pols,
                                 reftime_daily, viz_timerange, date_str,
                                 segmented_imaging[sidx], imaging_objs, freq_setup,
                                 tr_series_time=tr_series_time, fits_tag=fits_tag,
                                 solar_antenna_total=solar_antenna_total)
+
+                            if fine_spectral_imaging and PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
+                                _apply_fine_spectral_quality_gate(
+                                    fine_synfitsfiles, synfitsfiles, fine_key, cfg=PIPELINE_CONFIG)
 
                     elapsed_total = (datetime.now() - run_start_time).total_seconds() / 60
                     log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_total:.1f} minutes")
