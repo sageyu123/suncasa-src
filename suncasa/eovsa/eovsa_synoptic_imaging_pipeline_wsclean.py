@@ -3651,10 +3651,14 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         log_print('INFO', f"SPW {spws[sidx]}: force_feature_selfcal=True override. "
                                           f"Setting bright to True (test mode).")
 
-                    if sidx == 0 and snr >= 5:
+                    # Key these band-specific SNR floors on the TRUE 7-band index
+                    # spw_config_indices[sidx] (recomputed per-band in this loop), not the
+                    # positional sidx, so they don't misfire under --custom-spws where
+                    # sidx != band index. (config_idx from the earlier setup loop is stale here.)
+                    if spw_config_indices[sidx] == 0 and snr >= 5:
                         bright[sidx] = True
                         log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
-                    if sidx == 1 and snr >= 30:
+                    if spw_config_indices[sidx] == 1 and snr >= 30:
                         bright[sidx] = True
                         log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
                     ## the bright threshold is commented out for npz calibration testing, will reinstate after validation
