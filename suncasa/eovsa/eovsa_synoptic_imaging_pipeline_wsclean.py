@@ -2021,10 +2021,11 @@ def _archive_spw_index_remap(msfile, freq_setup):
         (``bandwidth``, GHz).
     :type freq_setup: FrequencySetup
     :returns: Mapping ``{original_index: archive_row_index}``, or ``None`` if
-        no remapping is needed (identity map) or the mapping could not be
-        determined unambiguously (callers must then treat SPW indices as
-        already being archive-row indices, i.e. no-op).
+        no remapping is needed (identity map).
     :rtype: dict or None
+    :raises RuntimeError: If the mapping cannot be determined unambiguously.
+        Aborting is deliberate: falling back to identity on a scoped archive
+        would silently image the wrong SPW rows (all-NaN/garbage products).
     """
     spw_table = msfile + '/SPECTRAL_WINDOW'
     tb.open(spw_table)
@@ -2038,25 +2039,27 @@ def _archive_spw_index_remap(msfile, freq_setup):
 
     remap = {}
     for i, ref_freq_hz in enumerate(ref_freqs):
-        ref_freq_ghz = float(ref_freq_hz) / 1e9
-        diffs = np.abs(eofreq - ref_freq_ghz)
+        # EOVSA MS SPW REF_FREQUENCY is the band's LOWER EDGE (== CHAN_FREQ[0]),
+        # while FrequencySetup.eofreq holds band CENTERS — offset by exactly
+        # bandwidth/2 (verified on a real archive: eofreq lands midway between
+        # adjacent REF_FREQUENCY values, making raw nearest-match ambiguous).
+        row_center_ghz = float(ref_freq_hz) / 1e9 + bandwidth / 2.0
+        diffs = np.abs(eofreq - row_center_ghz)
         j = int(np.argmin(diffs))
         min_diff = float(diffs[j])
-        if min_diff >= bandwidth:
-            log_print('ERROR',
-                      f"[archive_spw_remap] archive row {i} (REF_FREQUENCY="
-                      f"{ref_freq_ghz:.4f} GHz) does not match any original band "
-                      f"center within the {bandwidth:.4f} GHz bandwidth tolerance "
-                      f"(closest: band {j} at {eofreq[j]:.4f} GHz, "
-                      f"diff={min_diff:.4f} GHz). Cannot determine archive SPW "
-                      f"remapping for {msfile!r}.")
-            return None
+        if min_diff >= bandwidth / 2.0:
+            raise RuntimeError(
+                f"[archive_spw_remap] archive row {i} (band center "
+                f"{row_center_ghz:.4f} GHz) does not match any original band "
+                f"center within {bandwidth / 2.0:.4f} GHz "
+                f"(closest: band {j} at {eofreq[j]:.4f} GHz, "
+                f"diff={min_diff:.4f} GHz) in {msfile!r}. Aborting resume: "
+                f"identity fallback would image the wrong SPW rows.")
         if j in remap:
-            log_print('ERROR',
-                      f"[archive_spw_remap] ambiguous remap for {msfile!r}: original "
-                      f"band {j} matches both archive row {remap[j]} and row {i}. "
-                      f"Cannot determine archive SPW remapping.")
-            return None
+            raise RuntimeError(
+                f"[archive_spw_remap] ambiguous remap for {msfile!r}: original "
+                f"band {j} matches both archive row {remap[j]} and row {i}. "
+                f"Aborting resume: identity fallback would image the wrong SPW rows.")
         remap[j] = i
 
     n_rows = len(ref_freqs)
