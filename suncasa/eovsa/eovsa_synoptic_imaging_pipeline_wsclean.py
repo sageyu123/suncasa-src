@@ -4265,6 +4265,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                 reftime_daily, viz_timerange, date_str,
                                 segmented_imaging[sidx], freq_setup,
                                 tr_series_time=tr_series_time, fits_tag=fits_tag,
+                                data_column=final_data_column,
                                 solar_antenna_total=solar_antenna_total)
                             if joint_result is _FINE_JOINT_FALLBACK:
                                 log_print('WARNING',
@@ -4292,6 +4293,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                     reftime_daily, viz_timerange, date_str,
                                     segmented_imaging[sidx], imaging_objs, freq_setup,
                                     tr_series_time=tr_series_time, fits_tag=fits_tag,
+                                    data_column=final_data_column,
                                     solar_antenna_total=solar_antenna_total)
 
                                 if fine_spectral_imaging and PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
