@@ -624,7 +624,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
                    secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
                    custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
-                   sql_cal_time=None, force_feature_selfcal=False):
+                   sql_cal_time=None, force_feature_selfcal=False, imaging_only=False):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -652,6 +652,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 finer SPW chunks after the standard final-imaging pass.
        fine_spectral_only: run only the finer WSClean final-imaging pass from
                 an existing selfcal'd MS product for this date/version/tag.
+       imaging_only: rerun final (coarse + fine if fine_spectral_imaging) WSClean
+                imaging from an existing selfcal'd MS product for this
+                date/version/tag, skipping preprocessing and self-calibration.
        custom_spws: optional WSClean FrequencySetup SPW grouping override.
        sql_cal_time: optional SQL lookup time override for no-NPZ refcal/phacal
                 selection. Used by cron provisional runs to image with a previous
@@ -662,7 +665,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
 
     if cal_npz:
         cal_tag = get_default_cal_tag(version, cal_tag)
-    elif not fine_spectral_only:
+    elif not fine_spectral_only and not imaging_only:
         cal_tag = ''
     if fine_spectral_only:
         fine_spectral_imaging = True
@@ -730,6 +733,47 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  fine_spectral_only=True,
                                  custom_spws=custom_spws,
                                  force_feature_selfcal=force_feature_selfcal)
+
+    if imaging_only:
+        slfcaled_vis = None
+        for candidate in (output_file_path, output_file_path + '.tar.gz'):
+            if os.path.exists(candidate):
+                slfcaled_vis = candidate
+                break
+        if slfcaled_vis is None:
+            print('WARNING: imaging_only requested, but no selfcal MS product was found.')
+            print(f'Checked: {output_file_path} and {output_file_path}.tar.gz')
+            return None
+        if version not in WSCLEAN_PIPELINE_VERSIONS:
+            print(f'imaging_only is only supported for WSClean versions: {WSCLEAN_PIPELINE_VERSIONS}')
+            return None
+        from suncasa.eovsa import eovsa_synoptic_imaging_pipeline_wsclean as esip
+        if verbose:
+            print('input of imaging-only pipeline_run:')
+            print({'vis': slfcaled_vis,
+                   'outputvis': '',
+                   'workdir': workdir,
+                   'slfcaltbdir': slfcaltbdir_path,
+                   'imgoutdir': imgoutdir,
+                   'figoutdir': figoutdir,
+                   'overwrite': overwrite,
+                   'clearcache': clearcache,
+                   'pols': pols, 'ncpu': ncpu,
+                   'fine_spectral_imaging': fine_spectral_imaging,
+                   'fine_spectral_only': False,
+                   'imaging_only': imaging_only,
+                   'custom_spws': custom_spws,
+                   'force_feature_selfcal': force_feature_selfcal})
+        return esip.pipeline_run(slfcaled_vis, outputvis='',
+                                 workdir=workdir,
+                                 slfcaltbdir=slfcaltbdir_path,
+                                 imgoutdir=imgoutdir, pols=pols,
+                                 overwrite=overwrite,
+                                 fits_tag=cal_tag,
+                                 fine_spectral_imaging=fine_spectral_imaging,
+                                 custom_spws=custom_spws,
+                                 force_feature_selfcal=force_feature_selfcal,
+                                 imaging_only=True)
 
     if isinstance(trange, Time):
         mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
@@ -1286,7 +1330,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
              secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
              custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
-             sql_cal_time=None, force_feature_selfcal=False):
+             sql_cal_time=None, force_feature_selfcal=False, imaging_only=False):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1353,6 +1397,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param fine_spectral_only: run only the finer WSClean final-imaging pass
         from an existing selfcal'd MS product for this date/version/tag.
     :type fine_spectral_only: bool, optional
+    :param imaging_only: rerun final (coarse + fine if fine_spectral_imaging)
+        WSClean imaging from an existing selfcal'd MS product for this
+        date/version/tag, skipping preprocessing and self-calibration.
+    :type imaging_only: bool, optional
     :param custom_spws: optional WSClean FrequencySetup SPW grouping override.
     :type custom_spws: list or str, optional
     :param sql_cal_time: optional SQL calibration lookup timestamp override.
@@ -1569,7 +1617,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
                                            refcal_sql_mode=refcal_sql_mode,
                                            sql_cal_time=sql_cal_time_for_run,
-                                           force_feature_selfcal=force_feature_selfcal)
+                                           force_feature_selfcal=force_feature_selfcal,
+                                           imaging_only=imaging_only)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite_for_run, doimport=doimport,
@@ -1584,7 +1633,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
                                                refcal_sql_mode=refcal_sql_mode,
                                                sql_cal_time=sql_cal_time_for_run,
-                                               force_feature_selfcal=force_feature_selfcal)
+                                               force_feature_selfcal=force_feature_selfcal,
+                                               imaging_only=imaging_only)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1734,6 +1784,10 @@ if __name__ == '__main__':
                         help='For WSClean versions, run an additional final-imaging pass on finer SPW chunks.')
     parser.add_argument('--fine-spectral-only', action='store_true', default=False,
                         help='For WSClean versions, run only finer imaging from the existing selfcal MS product.')
+    parser.add_argument('--imaging-only', action='store_true', default=False,
+                        help='Rerun final imaging from the existing selfcal MS archive, skipping '
+                             'calibration and self-calibration; combine with --fine-spectral-imaging '
+                             'for fine products.')
     parser.add_argument('--custom-spws', type=str, nargs='+', default=None,
                         help='For WSClean versions, override FrequencySetup SPW groupings, e.g. 0~1 2~4 5~7.')
     parser.add_argument('--force-feature-selfcal', action='store_true', default=False,
@@ -1756,7 +1810,8 @@ if __name__ == '__main__':
                           args.fine_spectral_imaging, args.fine_spectral_only, args.custom_spws,
                           args.force_lo_hi_smooth_extrap, refcal_sql_mode=args.refcal_sql_mode,
                           sql_cal_time=args.sql_cal_time,
-                          force_feature_selfcal=args.force_feature_selfcal)
+                          force_feature_selfcal=args.force_feature_selfcal,
+                          imaging_only=args.imaging_only)
 
     # Exit nonzero if any date failed so wrappers (set -e) do not treat a core
     # imaging/calibration failure as success and proceed to FITS/JP2/preview steps.

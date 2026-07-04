@@ -3665,7 +3665,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  overwrite=False, overwrite_caltb=True, mergeFITSonly=False,
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
                  spws_imaging=None, fits_tag='', fine_spectral_imaging=False,
-                 fine_spectral_only=False, custom_spws=None, force_feature_selfcal=False):
+                 fine_spectral_only=False, custom_spws=None, force_feature_selfcal=False,
+                 imaging_only=False):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -3719,6 +3720,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
     :param fine_spectral_only: If True, skip preprocessing, self-calibration,
         and coarse final imaging, and run only fine final-imaging chunks.
     :type fine_spectral_only: bool, optional
+    :param imaging_only: If True, skip preprocessing and self-calibration and
+        run final (coarse + fine if fine_spectral_imaging) imaging from an
+        existing selfcal MS product.
+    :type imaging_only: bool, optional
     :return: Dictionary mapping coarse indexes and fine SPW keys to output FITS file paths.
     :rtype: dict
     """
@@ -3740,6 +3745,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         custom_spws=','.join(custom_spws) if custom_spws else None,
         fine_spectral_imaging=fine_spectral_imaging,
         fine_spectral_only=fine_spectral_only,
+        imaging_only=imaging_only,
     ):
         if outputvis and os.path.exists(outputvis) and not overwrite and not fine_spectral_only:
             log_print('INFO', f"Output MS file {outputvis} already exists. Skipping processing.")
@@ -3814,10 +3820,11 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             log_print('INFO', "Using YY data swapped into the XX slot for downstream diagnostic imaging")
             pols = 'XX'
         final_data_column = 'CORRECTED_DATA'
-        if fine_spectral_only:
+        if fine_spectral_only or imaging_only:
             final_data_column = 'CORRECTED_DATA' if _ms_has_column(msfile, 'CORRECTED_DATA') else 'DATA'
             log_print('INFO',
-                      f"fine_spectral_only=True: using {final_data_column} for final imaging from {msfile}")
+                      f"fine_spectral_only={fine_spectral_only}, imaging_only={imaging_only}: "
+                      f"using {final_data_column} for final imaging from {msfile}")
 
         viz_timerange = ant_trange(msfile)
         (tstart, tend) = viz_timerange.split('~')
@@ -3907,8 +3914,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         run_start_time = datetime.now()
 
         # --- Pre-processing: flagging, hanning smoothing ---
-        if fine_spectral_only:
-            log_print('INFO', "fine_spectral_only=True: skipping preprocessing flag edits.")
+        if fine_spectral_only or imaging_only:
+            log_print('INFO',
+                      f"fine_spectral_only={fine_spectral_only}, imaging_only={imaging_only}: "
+                      f"skipping preprocessing flag edits.")
         elif os.path.isdir(msfile + '.flagversions'):
             if verbose:
                 log_print('INFO', f'Flagversion of {msfile} already exists. Skipped...')
@@ -3921,7 +3930,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                          timecutoff=3.0, freqcutoff=2.0, maxnpieces=2, flagbackup=False)
                 flagmanager(msfile, mode='save', versionname='pipeline_remove_RFI-and-BURSTS')
 
-        if hanning and not fine_spectral_only:
+        if hanning and not fine_spectral_only and not imaging_only:
             msfile_hanning = msfile + '.hanning'
             if not os.path.exists(msfile_hanning):
                 if verbose:
@@ -4067,91 +4076,104 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
                     log_print('INFO', f"Processing SPW {spws[sidx]} for msfile {msname} ...")
 
-                    # --- Step 1: Brightness check ---
-                    with pipeline_stage("brightness_check", spw=spws[sidx], sidx=sidx, spwstr=spwstr):
-                        delmod(vis=msfile)
-                        imname = '-'.join(imname_init_disk_strlist + [f"sp{spwstr}"])
-                        clean_obj = ww.WSClean(msfile)
-                        clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
-                                        weight_briggs=0.0, niter=500, mgain=0.85,
-                                        data_column='DATA',
-                                        name=os.path.join(workdir, imname),
-                                        multiscale=True, multiscale_gain=0.3,
-                                        multiscale_scale_bias=0.6,
-                                        auto_mask=6, auto_threshold=3,
-                                        intervals_out=1,
-                                        no_negative=True, quiet=True,
-                                        circular_beam=True, beam_size=bmsize,
-                                        spws=sp_index)
-                        clean_obj.run(dryrun=False)
-                        clean_junk(imname)
-
-                    in_fits = os.path.join(workdir, f"{imname}-image.fits")
-                    fits_candidates = sorted(glob(os.path.join(workdir, f"{imname}*image.fits")))
-                    if not os.path.exists(in_fits):
-                        if len(fits_candidates) == 1:
-                            in_fits = fits_candidates[0]
-                            log_print('WARNING',
-                                      f"Exact WSClean FITS not found; using candidate {in_fits} for SPW {spws[sidx]}")
-                        else:
-                            log_print('ERROR',
-                                      f"Expected WSClean FITS not found for SPW {spws[sidx]}: {in_fits}. "
-                                      f"Candidates={fits_candidates}")
-                            slfcal_init_objs.append(None)
-                            caltbs_all.append(caltbs)
-                            continue
-                    diskstatss = []
-                    for i, sp in enumerate(sp_index.split(',')):
-                        reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(f'{sp}~{sp}', return_bmsize=True)
-                        sp = int(sp)
-                        out_fits = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk-model.fits'])
-                        dsz = float(dsize[sp].rstrip('arcsec'))
-                        fdn = fdens[sp]
-                        diskstats = add_convolved_disk_to_fits(in_fits, out_fits, dsz, fdn, ignore_data=True,
-                                                               bmaj=bmsize / 3600., rfreq=reffreq,
-                                                               create_mask=(i == 0))
-                        diskstatss.append(diskstats)
-
-                    fits_mask[sidx] = os.path.join(workdir, f"{imname}-mask.fits")
-                    tb_image = np.nanmean([ds[7] for ds in diskstatss])
-                    if np.isnan(tb_image):
-                        log_print('ERROR', f"TB image for SPW {spws[sidx]} is NaN. Skipping this SPW.")
+                    if imaging_only and not segmented_imaging[sidx]:
+                        log_print('ERROR',
+                                  f"imaging_only=True requires segmented imaging, but SPW {spws[sidx]} "
+                                  f"(sidx={sidx}) is not in a segmented group; skipping this SPW. "
+                                  f"The non-segmented final-imaging branch is stateful (imaging_objs/"
+                                  f"model_ref_name_str) and is not supported for imaging_only resume.")
                         slfcal_init_objs.append(None)
                         caltbs_all.append(caltbs)
                         continue
-                    tb_model = np.nanmean([ds[8] for ds in diskstatss])
-                    tb_models[sidx] = tb_model * 1e3
-                    snr = np.nanmean([ds[10] for ds in diskstatss])
-                    bright_ratio = tb_image / tb_model
-                    bright[sidx] = bright_ratio * snr > bright_thresh[sidx]
-                    log_print('INFO',
-                              f"SPW {spws[sidx]}: tb_image = {tb_image:.1f} kK, tb_model = {tb_model:.1f} kK, "
-                              f"Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]:.1f} "
-                              f"({bright_thresh_source[sidx]}), SNR = {snr:.1f}")
 
-                    if force_feature_selfcal and not bright[sidx]:
-                        bright[sidx] = True
-                        log_print('INFO', f"SPW {spws[sidx]}: force_feature_selfcal=True override. "
-                                          f"Setting bright to True (test mode).")
+                    if not imaging_only:
+                        # --- Step 1: Brightness check ---
+                        with pipeline_stage("brightness_check", spw=spws[sidx], sidx=sidx, spwstr=spwstr):
+                            delmod(vis=msfile)
+                            imname = '-'.join(imname_init_disk_strlist + [f"sp{spwstr}"])
+                            clean_obj = ww.WSClean(msfile)
+                            clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
+                                            weight_briggs=0.0, niter=500, mgain=0.85,
+                                            data_column='DATA',
+                                            name=os.path.join(workdir, imname),
+                                            multiscale=True, multiscale_gain=0.3,
+                                            multiscale_scale_bias=0.6,
+                                            auto_mask=6, auto_threshold=3,
+                                            intervals_out=1,
+                                            no_negative=True, quiet=True,
+                                            circular_beam=True, beam_size=bmsize,
+                                            spws=sp_index)
+                            clean_obj.run(dryrun=False)
+                            clean_junk(imname)
 
-                    # Key these band-specific SNR floors on the TRUE 7-band index
-                    # spw_config_indices[sidx] (recomputed per-band in this loop), not the
-                    # positional sidx, so they don't misfire under --custom-spws where
-                    # sidx != band index. (config_idx from the earlier setup loop is stale here.)
-                    if spw_config_indices[sidx] == 0 and snr >= 5:
-                        bright[sidx] = True
-                        log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
-                    if spw_config_indices[sidx] == 1 and snr >= 30:
-                        bright[sidx] = True
-                        log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
-                    ## the bright threshold is commented out for npz calibration testing, will reinstate after validation
-                    # if bright[sidx]:
-                    #     log_print('INFO', f"SPW {spws[sidx]} is bright. Proceeding with segmented imaging.")
-                    #     segmented_imaging[sidx] = True
-                    # if bright_ratio < tb_ratio_thresh[sidx]:
-                    #     segmented_imaging[sidx] = False
+                        in_fits = os.path.join(workdir, f"{imname}-image.fits")
+                        fits_candidates = sorted(glob(os.path.join(workdir, f"{imname}*image.fits")))
+                        if not os.path.exists(in_fits):
+                            if len(fits_candidates) == 1:
+                                in_fits = fits_candidates[0]
+                                log_print('WARNING',
+                                          f"Exact WSClean FITS not found; using candidate {in_fits} for SPW {spws[sidx]}")
+                            else:
+                                log_print('ERROR',
+                                          f"Expected WSClean FITS not found for SPW {spws[sidx]}: {in_fits}. "
+                                          f"Candidates={fits_candidates}")
+                                slfcal_init_objs.append(None)
+                                caltbs_all.append(caltbs)
+                                continue
+                        diskstatss = []
+                        for i, sp in enumerate(sp_index.split(',')):
+                            reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(f'{sp}~{sp}', return_bmsize=True)
+                            sp = int(sp)
+                            out_fits = '-'.join(imname_init_disk_strlist + [f'sp{sp:02d}_adddisk-model.fits'])
+                            dsz = float(dsize[sp].rstrip('arcsec'))
+                            fdn = fdens[sp]
+                            diskstats = add_convolved_disk_to_fits(in_fits, out_fits, dsz, fdn, ignore_data=True,
+                                                                   bmaj=bmsize / 3600., rfreq=reffreq,
+                                                                   create_mask=(i == 0))
+                            diskstatss.append(diskstats)
+
+                        fits_mask[sidx] = os.path.join(workdir, f"{imname}-mask.fits")
+                        tb_image = np.nanmean([ds[7] for ds in diskstatss])
+                        if np.isnan(tb_image):
+                            log_print('ERROR', f"TB image for SPW {spws[sidx]} is NaN. Skipping this SPW.")
+                            slfcal_init_objs.append(None)
+                            caltbs_all.append(caltbs)
+                            continue
+                        tb_model = np.nanmean([ds[8] for ds in diskstatss])
+                        tb_models[sidx] = tb_model * 1e3
+                        snr = np.nanmean([ds[10] for ds in diskstatss])
+                        bright_ratio = tb_image / tb_model
+                        bright[sidx] = bright_ratio * snr > bright_thresh[sidx]
+                        log_print('INFO',
+                                  f"SPW {spws[sidx]}: tb_image = {tb_image:.1f} kK, tb_model = {tb_model:.1f} kK, "
+                                  f"Ratio = {bright_ratio * snr:.1f}, Thresh = {bright_thresh[sidx]:.1f} "
+                                  f"({bright_thresh_source[sidx]}), SNR = {snr:.1f}")
+
+                        if force_feature_selfcal and not bright[sidx]:
+                            bright[sidx] = True
+                            log_print('INFO', f"SPW {spws[sidx]}: force_feature_selfcal=True override. "
+                                              f"Setting bright to True (test mode).")
+
+                        # Key these band-specific SNR floors on the TRUE 7-band index
+                        # spw_config_indices[sidx] (recomputed per-band in this loop), not the
+                        # positional sidx, so they don't misfire under --custom-spws where
+                        # sidx != band index. (config_idx from the earlier setup loop is stale here.)
+                        if spw_config_indices[sidx] == 0 and snr >= 5:
+                            bright[sidx] = True
+                            log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
+                        if spw_config_indices[sidx] == 1 and snr >= 30:
+                            bright[sidx] = True
+                            log_print('INFO', f"SPW {spws[sidx]}: SNR is high enough ({snr:.1f}). Setting bright to True.")
+                        ## the bright threshold is commented out for npz calibration testing, will reinstate after validation
+                        # if bright[sidx]:
+                        #     log_print('INFO', f"SPW {spws[sidx]} is bright. Proceeding with segmented imaging.")
+                        #     segmented_imaging[sidx] = True
+                        # if bright_ratio < tb_ratio_thresh[sidx]:
+                        #     segmented_imaging[sidx] = False
 
                     # --- Compute time intervals for all rounds ---
+                    # (needed by Step 4/4b regardless of imaging_only; cheap, no
+                    # imaging/gaincal work performed here)
                     round_intervals = {}
                     for round_def in SELFCAL_ROUNDS:
                         mult = round_def['interval_multipliers'].get(spw_config_indices[sidx], 1)
@@ -4159,41 +4181,55 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     mult = FINAL_IMAGING_CONFIG['interval_multipliers'].get(spw_config_indices[sidx], 1)
                     round_intervals['final'] = _compute_round_intervals(wsclean_intervals, mult)
 
-                    # --- Step 2: Feature self-calibration (if bright) ---
-                    feature_slfcal = bright[sidx]
-                    datacolumn = "DATA"
-                    if feature_slfcal:
-                        slfcal_failed = False
-                        slfcal_init_obj = None
-                        for round_def in SELFCAL_ROUNDS:
-                            slfcal_obj, caltbs, datacolumn = _run_slfcal_round(
-                                round_def, msfile, round_intervals[round_def['name']],
-                                spws[sidx], spwstr, workdir, antenna, caltbs, tdur,
-                                pols, bmsize, fits_mask[sidx], datacolumn,
-                                overwrite_caltb, uvmin_l_str[sidx], do_sbdcal=do_sbdcal,
-                                clearcache=clearcache)
-                            if round_def['name'] == 'init':
-                                if slfcal_obj is None:
-                                    slfcal_failed = True
-                                    break
-                                slfcal_init_obj = slfcal_obj
-                        if slfcal_failed:
+                    if not imaging_only:
+                        # --- Step 2: Feature self-calibration (if bright) ---
+                        feature_slfcal = bright[sidx]
+                        datacolumn = "DATA"
+                        if feature_slfcal:
+                            slfcal_failed = False
+                            slfcal_init_obj = None
+                            for round_def in SELFCAL_ROUNDS:
+                                slfcal_obj, caltbs, datacolumn = _run_slfcal_round(
+                                    round_def, msfile, round_intervals[round_def['name']],
+                                    spws[sidx], spwstr, workdir, antenna, caltbs, tdur,
+                                    pols, bmsize, fits_mask[sidx], datacolumn,
+                                    overwrite_caltb, uvmin_l_str[sidx], do_sbdcal=do_sbdcal,
+                                    clearcache=clearcache)
+                                if round_def['name'] == 'init':
+                                    if slfcal_obj is None:
+                                        slfcal_failed = True
+                                        break
+                                    slfcal_init_obj = slfcal_obj
+                            if slfcal_failed:
+                                slfcal_init_objs.append(None)
+                                caltbs_all.append(caltbs)
+                                continue
+                            slfcal_init_objs.append(slfcal_init_obj)
+                        else:
                             slfcal_init_objs.append(None)
-                            caltbs_all.append(caltbs)
-                            continue
-                        slfcal_init_objs.append(slfcal_init_obj)
-                    else:
-                        slfcal_init_objs.append(None)
 
-                    # --- Step 3: Disk self-calibration ---
-                    ri_init = round_intervals['init']
-                    ri_final = round_intervals['final']
-                    caltbs = _run_disk_selfcal(
-                        msfile, sidx, spws[sidx], spwstr, sp_index, workdir, antenna,
-                        caltbs, slfcal_init_objs[sidx], imname_init_disk_strlist,
-                        freq_setup, dsize, fdens, ri_init, ri_final, tdur,
-                        uvmin_l_str[sidx], overwrite_caltb, pols)
-                    caltbs_all.append(caltbs)
+                        # --- Step 3: Disk self-calibration ---
+                        ri_init = round_intervals['init']
+                        ri_final = round_intervals['final']
+                        caltbs = _run_disk_selfcal(
+                            msfile, sidx, spws[sidx], spwstr, sp_index, workdir, antenna,
+                            caltbs, slfcal_init_objs[sidx], imname_init_disk_strlist,
+                            freq_setup, dsize, fdens, ri_init, ri_final, tdur,
+                            uvmin_l_str[sidx], overwrite_caltb, pols)
+                        caltbs_all.append(caltbs)
+                    else:
+                        # imaging_only: no feature/disk self-calibration; the MS
+                        # already carries the final selfcal solution baked into
+                        # its DATA column (final_data_column). Still record an
+                        # empty slfcal_init_objs/caltbs entry so downstream
+                        # per-sidx bookkeeping (caltbs_all, slfcal_init_objs)
+                        # stays aligned with spws_indices.
+                        ri_final = round_intervals['final']
+                        slfcal_init_objs.append(None)
+                        caltbs_all.append(caltbs)
+                        log_print('INFO',
+                                  f"imaging_only=True: skipping brightness check, feature self-cal, and "
+                                  f"disk self-cal for SPW {spws[sidx]}; proceeding directly to final imaging.")
 
                     # --- Step 4: Final imaging ---
                     synfitsfiles, imaging_objs = _run_final_imaging(
@@ -4202,6 +4238,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         reftime_daily, viz_timerange, date_str,
                         segmented_imaging[sidx], imaging_objs, freq_setup,
                         tr_series_time=tr_series_time, fits_tag=fits_tag,
+                        data_column=final_data_column,
                         solar_antenna_total=solar_antenna_total)
 
                     if not segmented_imaging[sidx] and len(synfitsfiles) > 0:
@@ -4352,7 +4389,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         os.remove(f)
 
         # --- Assemble selfcal'd outputvis from per-spw splits via concat ---
-        if outputvis and not fine_spectral_only and not os.path.exists(outputvis):
+        if outputvis and not fine_spectral_only and not imaging_only and not os.path.exists(outputvis):
             log_print('INFO', f"Building selfcal'd outputvis {outputvis} from per-spw splits ...")
             os.makedirs(os.path.dirname(outputvis) or '.', exist_ok=True)
             slfcaled_spw_ms_list = []
@@ -4386,8 +4423,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 log_print('WARNING', "No per-spw slfcaled MS files produced; outputvis not created.")
 
         # --- Tar the source UDB*.ms working copy and remove it ---
-        if fine_spectral_only:
-            log_print('INFO', f"fine_spectral_only=True: retaining working MS {msfile}.")
+        if fine_spectral_only or imaging_only:
+            log_print('INFO',
+                      f"fine_spectral_only={fine_spectral_only}, imaging_only={imaging_only}: "
+                      f"retaining working MS {msfile}.")
         elif os.path.isdir(msfile):
             tar_path = msfile + '.tar.gz'
             log_print('INFO', f"Archiving {msfile} to {tar_path} ...")
@@ -4436,6 +4475,10 @@ if __name__ == '__main__':
                         help='Run an additional final-imaging pass on finer SPW chunks.')
     parser.add_argument('--fine-spectral-only', action='store_true',
                         help='Run only fine final imaging from an existing selfcal MS.')
+    parser.add_argument('--imaging-only', action='store_true',
+                        help='Skip preprocessing and self-calibration and rerun final '
+                             '(coarse + fine if --fine-spectral-imaging) imaging from an '
+                             'existing selfcal MS product.')
     parser.add_argument('--force-feature-selfcal', action='store_true',
                         help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
                              'bypassing the brightness gate. Default off.')
@@ -4469,6 +4512,7 @@ if __name__ == '__main__':
         custom_spws=args.custom_spws,
         fine_spectral_imaging=args.fine_spectral_imaging,
         fine_spectral_only=args.fine_spectral_only,
+        imaging_only=args.imaging_only,
         force_feature_selfcal=args.force_feature_selfcal,
         hanning=args.hanning,
         do_sbdcal=args.do_sbdcal,
