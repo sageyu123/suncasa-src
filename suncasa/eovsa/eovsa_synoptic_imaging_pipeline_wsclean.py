@@ -157,6 +157,16 @@ PIPELINE_CONFIG = {
     'fine_spectral_joint': True,        # one joint-deconvolution wsclean per group instead of per-chunk runs
     'fine_spectral_fit_spectral_pol': 2,
     'fine_spectral_exclude': ['44~49'], # no fine products for these coarse groups (too faint; owner decision)
+    # The joint run's per-channel circular beams are fit per-channel (an accepted
+    # simplification for deconvolution uv-coverage), but that leaves each channel
+    # with an erratic, wsclean-chosen beam size (e.g. 19.0/14.1/11.4 arcsec across
+    # intervals of the *same* chunk) instead of the fixed table beam the legacy
+    # per-chunk convention used for Tb bookkeeping (Tb ~ 1/beam_area). Re-restore
+    # each per-(interval, channel) image at its chunk's table fine_bmsize (arcsec,
+    # forced circular) using `wsclean -beam-size <bmsize> -circular-beam -restore
+    # <residual> <model> <output>` before registration, so Tb conversion matches
+    # the legacy per-chunk convention exactly.
+    'fine_spectral_force_table_beam': True,
 }
 
 
@@ -3343,6 +3353,71 @@ def _fine_joint_channel_division_frequencies(freq_setup, chunks):
     return boundaries_hz
 
 
+def _restore_image_at_table_beam(image_fits, bmsize):
+    """Re-restore one WSClean per-channel image at a forced circular beam.
+
+    The joint fine-spectral WSClean run (:func:`_run_fine_joint_imaging`) fits
+    a per-channel circular beam (``-circular-beam`` with no ``-beam-size``),
+    which can vary erratically between imaging intervals of the *same* fine
+    chunk (e.g. 19.0/14.1/11.4 arcsec seen in practice). Tb bookkeeping
+    requires each chunk's FORCED TABLE beam (``chunks[c]['bmsize']``) so the
+    conversion matches the legacy per-chunk convention. This calls WSClean's
+    ``-restore`` mode (model + residual -> restored image, no cleaning) with
+    ``-beam-size``/``-circular-beam`` to rebuild the output at the table beam.
+
+    :param image_fits: Path to the WSClean ``*-image.fits`` output to
+        re-restore. Its sibling ``*-model.fits``/``*-residual.fits`` (same
+        prefix, suffix swapped) must exist.
+    :type image_fits: str
+    :param bmsize: Forced circular beam FWHM in arcsec (the chunk's table beam).
+    :type bmsize: float
+    :returns: Path to the newly written ``*-tbeam-image.fits`` file on success,
+        or ``None`` if the model/residual siblings are missing or the wsclean
+        subprocess failed.
+    :rtype: str or None
+    """
+    if not image_fits.endswith('-image.fits'):
+        log_print('ERROR',
+                  f"[fine_joint_imaging] cannot derive model/residual siblings for "
+                  f"unexpected filename {image_fits}")
+        return None
+
+    prefix = image_fits[:-len('-image.fits')]
+    model_fits = prefix + '-model.fits'
+    residual_fits = prefix + '-residual.fits'
+    output_fits = prefix + '-tbeam-image.fits'
+
+    if not (os.path.exists(model_fits) and os.path.exists(residual_fits)):
+        log_print('ERROR',
+                  f"[fine_joint_imaging] missing model/residual sibling(s) for "
+                  f"{os.path.basename(image_fits)} (model_exists="
+                  f"{os.path.exists(model_fits)}, residual_exists="
+                  f"{os.path.exists(residual_fits)}); cannot force table beam "
+                  f"{bmsize} arcsec, falling back to the un-restored image for "
+                  f"this item.")
+        return None
+
+    cmd = [WSCLEAN_BIN, '-beam-size', str(bmsize), '-circular-beam',
+           '-restore', residual_fits, model_fits, output_fits]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception:
+        log_print('ERROR',
+                  f"[fine_joint_imaging] wsclean -restore subprocess raised for "
+                  f"{os.path.basename(image_fits)}\n{traceback.format_exc()}")
+        return None
+
+    if proc.returncode != 0 or not os.path.exists(output_fits):
+        log_print('ERROR',
+                  f"[fine_joint_imaging] wsclean -restore failed (returncode="
+                  f"{proc.returncode}) for {os.path.basename(image_fits)} at "
+                  f"beam {bmsize} arcsec | cmd={' '.join(cmd)}\n"
+                  f"stdout={proc.stdout}\nstderr={proc.stderr}")
+        return None
+
+    return output_fits
+
+
 def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_index, group_bmsize,
                            chunks, workdir, imgoutdir, msname, ri_final, briggs_val, pols,
                            reftime_daily, viz_timerange, date_str, is_segmented, freq_setup,
@@ -3524,6 +3599,21 @@ def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_inde
                           f"interval_idx={interval_idx} file={os.path.basename(fpath)}")
                 fitsname.append(fpath)
             fitsname = sorted(fitsname)
+
+            if PIPELINE_CONFIG.get('fine_spectral_force_table_beam', True):
+                chunk_bmsize = chunk['bmsize']
+                restored_count = 0
+                for fits_idx, fpath in enumerate(fitsname):
+                    restored_path = _restore_image_at_table_beam(fpath, chunk_bmsize)
+                    if restored_path is not None:
+                        fitsname[fits_idx] = restored_path
+                        restored_count += 1
+                    # else: fall back to the original (un-restored) image for
+                    # this interval; already logged by the helper.
+                log_print('INFO',
+                          f"[fine_joint_imaging] table-beam re-restore for chunk "
+                          f"{chunk_tag}: forced beam={chunk_bmsize} arcsec, "
+                          f"restored {restored_count}/{len(fitsname)} interval(s).")
 
             fitsname_helio = [f.replace('image.fits', 'image.helio.fits') for f in fitsname]
             fitsname_helio_ref_daily = [f.replace('image.fits', 'image.helio.ref_daily.fits') for f in fitsname]
