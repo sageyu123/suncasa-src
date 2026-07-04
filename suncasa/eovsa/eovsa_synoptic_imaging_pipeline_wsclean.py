@@ -4526,6 +4526,24 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                     _apply_fine_spectral_quality_gate(
                                         fine_synfitsfiles, synfitsfiles, fine_key, cfg=PIPELINE_CONFIG)
 
+                    # --- Checkpoint this group's slfcaled visibilities NOW ---
+                    # uvsub() in later groups' disk self-cal operates on ALL MS
+                    # rows, re-subtracting stale MODEL_DATA from THIS group's
+                    # already-imaged rows. Splitting at end-of-run therefore
+                    # archived contaminated data for every group but the last
+                    # (verified: resume-imaging the end-of-run archive collapsed
+                    # the s31-43 coarse peak 9.3x vs the in-chain product).
+                    # Split immediately after this group's final imaging so the
+                    # archive holds exactly the state imaging consumed.
+                    if outputvis and not fine_spectral_only and not imaging_only:
+                        if os.path.exists(msfile_sp):
+                            shutil.rmtree(msfile_sp, ignore_errors=True)
+                        log_print('INFO',
+                                  f"Checkpointing SPW {spws[sidx]} (CORRECTED_DATA) -> {msfile_sp}")
+                        split(vis=msfile, outputvis=msfile_sp, spw=spws[sidx], datacolumn='corrected')
+                        if not os.path.isdir(msfile_sp):
+                            log_print('WARNING', f"Per-group checkpoint split failed for SPW {spws[sidx]}.")
+
                     elapsed_total = (datetime.now() - run_start_time).total_seconds() / 60
                     log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_total:.1f} minutes")
 
@@ -4624,10 +4642,16 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             for sidx, sp_index in enumerate(spws_indices):
                 spwstr = format_spw(spws[sidx])
                 msfile_sp = os.path.join(workdir, f'{msname}.sp{spwstr}.slfcaled.ms')
-                if os.path.exists(msfile_sp):
-                    shutil.rmtree(msfile_sp, ignore_errors=True)
-                log_print('INFO', f"Splitting SPW {spws[sidx]} (CORRECTED_DATA) -> {msfile_sp}")
-                split(vis=msfile, outputvis=msfile_sp, spw=spws[sidx], datacolumn='corrected')
+                if not os.path.isdir(msfile_sp):
+                    # Fallback only: groups are checkpointed in-loop right after
+                    # their final imaging (see the per-group split above), which
+                    # captures the pre-contamination CORRECTED_DATA state. A
+                    # split taken HERE (end of run) may carry later groups'
+                    # uvsub cross-talk — log loudly.
+                    log_print('WARNING',
+                              f"No in-loop checkpoint for SPW {spws[sidx]}; splitting at end-of-run "
+                              f"(state may include later groups' uvsub cross-talk) -> {msfile_sp}")
+                    split(vis=msfile, outputvis=msfile_sp, spw=spws[sidx], datacolumn='corrected')
                 if os.path.isdir(msfile_sp):
                     slfcaled_spw_ms_list.append(msfile_sp)
                 else:
