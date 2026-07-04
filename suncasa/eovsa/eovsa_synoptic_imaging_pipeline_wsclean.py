@@ -3441,7 +3441,15 @@ def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_inde
                         minuv_l=200,
                         intervals_out=ri_final['N1'],
                         no_negative=False, quiet=True,
-                        circular_beam=True, beam_size=group_bmsize,
+                        # circular beam PER OUTPUT CHANNEL (no forced beam_size):
+                        # forcing the single group-level beam on all channels skews
+                        # the Tb conversion (Tb ~ 1/beam_area) of off-reference
+                        # chunks by the beam-area ratio — e.g. +40% at the low edge
+                        # of s05-10 — which spuriously trips the gate's peak
+                        # backstop. With -circular-beam alone, wsclean fits a
+                        # frequency-appropriate circular beam for each channel and
+                        # the per-chunk FITS headers drive the correct conversion.
+                        circular_beam=True,
                         spws=group_sp_index,
                         join_channels=True,
                         channels_out=n_chunks,
