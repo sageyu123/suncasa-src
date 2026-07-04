@@ -23,6 +23,7 @@ import argparse
 import inspect
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -152,6 +153,10 @@ PIPELINE_CONFIG = {
     'fine_spectral_noise_factor': 3.5,
     'fine_spectral_dr_floor': 70.0,
     'fine_spectral_peak_tb_max': 2.0e6,
+    # --- Joint fine-spectral imaging ---
+    'fine_spectral_joint': True,        # one joint-deconvolution wsclean per group instead of per-chunk runs
+    'fine_spectral_fit_spectral_pol': 2,
+    'fine_spectral_exclude': ['44~49'], # no fine products for these coarse groups (too faint; owner decision)
 }
 
 
@@ -3082,6 +3087,83 @@ def _apply_fine_spectral_quality_gate(fine_fitsfiles, coarse_fitsfiles, tag, cfg
     return kept
 
 
+def _register_and_export_interval_fits(msfile, fitsfilefinal, ri_final, imgoutdir, spwstr,
+                                       reftime_daily, date_str, is_segmented,
+                                       n_ant_img, solar_antenna_total,
+                                       tr_series_time=None, fits_tag=''):
+    """Register per-interval WSClean FITS to helioprojective and export synoptic FITS.
+
+    Extracted verbatim from the tail of :func:`_run_final_imaging` (the loop that
+    ran after ``clean_junk`` there) so that :func:`_run_fine_joint_imaging` can
+    route its per-channel WSClean outputs through the exact same registration,
+    naming, and antenna-keyword-stamping logic used for the existing per-chunk
+    fine-imaging path. Behavior-preserving: no logic changes vs. the original
+    inline block.
+
+    :param msfile: Input measurement set path (passed through to callers; kept
+        for signature parity/future use, matching the original inline block's
+        available scope).
+    :type msfile: str
+    :param fitsfilefinal: Registered helioprojective FITS paths (one per
+        imaging interval), already produced by ``hf.imreg`` (+
+        ``solar_diff_rot_heliofits`` for the segmented case) upstream.
+    :type fitsfilefinal: list(str)
+    :param ri_final: Interval dict from :func:`_compute_round_intervals`.
+    :type ri_final: dict
+    :param imgoutdir: Output directory for synoptic FITS files.
+    :type imgoutdir: str
+    :param spwstr: Formatted SPW range string (e.g. from :func:`format_spw`).
+    :type spwstr: str
+    :param reftime_daily: Daily reference time used to stamp non-segmented products.
+    :type reftime_daily: astropy.time.Time
+    :param date_str: Date string (``YYYYMMDD``) used in non-segmented filenames.
+    :type date_str: str
+    :param is_segmented: Whether this is the segmented (multi-interval) imaging path.
+    :type is_segmented: bool
+    :param n_ant_img: Unflagged solar antenna count used for imaging, or None.
+    :type n_ant_img: int or None
+    :param solar_antenna_total: Total solar antenna count for this epoch, or None.
+    :type solar_antenna_total: int or None
+    :param tr_series_time: List of (start_Time, end_Time) tuples to filter imaging intervals.
+        If provided, only processes intervals overlapping with these ranges.
+    :type tr_series_time: list or None
+    :param fits_tag: Optional infix spliced into the output FITS filenames.
+    :type fits_tag: str
+    :returns: List of synoptic FITS file paths written.
+    :rtype: list(str)
+    """
+    synfitsfiles = []
+    for eoidx, eofile in enumerate(fitsfilefinal):
+        interval_time = ri_final['time_intervals_major_avg'][eoidx]
+        # Filter by tr_series_time if specified
+        if tr_series_time is not None:
+            in_range = any(t0.mjd <= interval_time.mjd <= t1.mjd for t0, t1 in tr_series_time)
+            if not in_range:
+                continue
+        datetimestr = interval_time.datetime.strftime('%Y%m%dT%H%M%SZ')
+        tag = f'.{fits_tag}' if fits_tag else ''
+        if is_segmented:
+            synfitsfile = os.path.join(imgoutdir,
+                                       f"eovsa.synoptic{tag}.{datetimestr}.s{spwstr}.tb.fits")
+        else:
+            synfitsfile = os.path.join(imgoutdir,
+                                       f"eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb.fits")
+        synfitsfiles.append(synfitsfile)
+        log_print('INFO', f"Writing compressed synoptic FITS {synfitsfile} from {eofile} ...")
+        # Keep every WSClean-facing FITS uncompressed. WSClean cannot read the
+        # tiled-compressed FITS files written below, and moving compression
+        # earlier in the model/imaging path breaks later WSClean predict runs.
+        _write_compressed_synoptic_fits(eofile, synfitsfile)
+        _set_imaging_antenna_keywords(synfitsfile, n_ant_img, solar_antenna_total)
+        if not is_segmented:
+            # Non-segmented daily product: content is aligned to the daily
+            # reference epoch, but imreg stamps DATE-OBS with the timerange
+            # start. Restamp to the reference epoch.
+            _set_daily_reference_time_keywords(synfitsfile, reftime_daily)
+
+    return synfitsfiles
+
+
 def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                        msname, ri_final, briggs_val, bmsize, pols,
                        reftime_daily, viz_timerange, date_str,
@@ -3206,36 +3288,277 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
 
     clean_junk('-'.join(["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']))
 
-    synfitsfiles = []
-    for eoidx, eofile in enumerate(fitsfilefinal):
-        interval_time = ri_final['time_intervals_major_avg'][eoidx]
-        # Filter by tr_series_time if specified
-        if tr_series_time is not None:
-            in_range = any(t0.mjd <= interval_time.mjd <= t1.mjd for t0, t1 in tr_series_time)
-            if not in_range:
-                continue
-        datetimestr = interval_time.datetime.strftime('%Y%m%dT%H%M%SZ')
-        tag = f'.{fits_tag}' if fits_tag else ''
-        if is_segmented:
-            synfitsfile = os.path.join(imgoutdir,
-                                       f"eovsa.synoptic{tag}.{datetimestr}.s{spwstr}.tb.fits")
-        else:
-            synfitsfile = os.path.join(imgoutdir,
-                                       f"eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb.fits")
-        synfitsfiles.append(synfitsfile)
-        log_print('INFO', f"Writing compressed synoptic FITS {synfitsfile} from {eofile} ...")
-        # Keep every WSClean-facing FITS uncompressed. WSClean cannot read the
-        # tiled-compressed FITS files written below, and moving compression
-        # earlier in the model/imaging path breaks later WSClean predict runs.
-        _write_compressed_synoptic_fits(eofile, synfitsfile)
-        _set_imaging_antenna_keywords(synfitsfile, n_ant_img, solar_antenna_total)
-        if not is_segmented:
-            # Non-segmented daily product: content is aligned to the daily
-            # reference epoch, but imreg stamps DATE-OBS with the timerange
-            # start. Restamp to the reference epoch.
-            _set_daily_reference_time_keywords(synfitsfile, reftime_daily)
+    synfitsfiles = _register_and_export_interval_fits(
+        msfile, fitsfilefinal, ri_final, imgoutdir, spwstr,
+        reftime_daily, date_str, is_segmented,
+        n_ant_img, solar_antenna_total,
+        tr_series_time=tr_series_time, fits_tag=fits_tag)
 
     return synfitsfiles, imaging_objs
+
+
+_FINE_JOINT_FALLBACK = object()  # sentinel: caller must fall back to the legacy per-chunk loop
+
+
+def _fine_joint_channel_division_frequencies(freq_setup, chunks):
+    """Compute wsclean ``-channel-division-frequencies`` boundaries (Hz) for one group.
+
+    For chunks ``k=1..N-1``, the boundary is the midpoint (in Hz) between the
+    highest frequency of chunk ``k-1`` (the upper edge of its highest-index SPW)
+    and the lowest frequency of chunk ``k`` (the lower edge of its lowest-index
+    SPW). Frequencies are sourced from :class:`FrequencySetup`'s ``eofreq``
+    (per-SPW-index band-center frequency, GHz) and ``bandwidth`` (per-band width,
+    GHz); these are already used elsewhere in this module
+    (:meth:`FrequencySetup.get_reffreq_and_cdelt`) to derive per-SPW frequency
+    coverage, so no separate MS SPW-table read is needed.
+
+    :param freq_setup: The active :class:`FrequencySetup` instance.
+    :type freq_setup: FrequencySetup
+    :param chunks: Ordered list of fine chunks (lowest to highest frequency),
+        each a dict with at least key ``'spw'`` (range string, e.g. ``'44~45'``).
+    :type chunks: list(dict)
+    :returns: Boundary frequencies in Hz, strictly increasing, length ``len(chunks) - 1``.
+    :rtype: list(float)
+    :raises AssertionError: If the computed boundaries are not strictly increasing.
+    """
+    half_bw_ghz = freq_setup.bandwidth / 2.0
+    edges = []
+    for chunk in chunks:
+        start, end = _spw_range_bounds(chunk['spw'])
+        low_ghz = freq_setup.eofreq[start] - half_bw_ghz
+        high_ghz = freq_setup.eofreq[end] + half_bw_ghz
+        edges.append((low_ghz, high_ghz))
+
+    boundaries_hz = []
+    for k in range(1, len(chunks)):
+        prev_high_ghz = edges[k - 1][1]
+        cur_low_ghz = edges[k][0]
+        boundary_ghz = (prev_high_ghz + cur_low_ghz) / 2.0
+        boundaries_hz.append(boundary_ghz * 1.0e9)
+
+    if len(boundaries_hz) > 1:
+        assert all(b2 > b1 for b1, b2 in zip(boundaries_hz[:-1], boundaries_hz[1:])), (
+            f"[fine_joint_imaging] channel-division-frequencies are not strictly "
+            f"increasing: {boundaries_hz} (from chunks={[c['spw'] for c in chunks]})")
+    return boundaries_hz
+
+
+def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_index, group_bmsize,
+                           chunks, workdir, imgoutdir, msname, ri_final, briggs_val, pols,
+                           reftime_daily, viz_timerange, date_str, is_segmented, freq_setup,
+                           tr_series_time=None, fits_tag='', data_column='CORRECTED_DATA',
+                           solar_antenna_total=None):
+    """Run ONE joint-deconvolution WSClean pass over a full coarse group's fine chunks.
+
+    Images all fine sub-chunks of a coarse SPW group in a single WSClean
+    invocation using ``-join-channels -channels-out N -channel-division-frequencies
+    ... -fit-spectral-pol P``, with the FULL group's ``-spws`` selection so every
+    output channel is deconvolved with the full-group uv coverage (rather than
+    each fine chunk's sparse ~2-SPW subset, as the legacy per-chunk loop does).
+    Each resulting per-channel image is then routed through the same
+    registration/export path as the legacy per-chunk imaging
+    (:func:`_register_and_export_interval_fits`), producing FITS files with the
+    same naming convention (including each chunk's own ``spwstr`` tb-fits name)
+    as the legacy path, so downstream merging/gating code is unaffected.
+
+    :param msfile: Input measurement set path.
+    :type msfile: str
+    :param sidx: Coarse-group index/key (for logging only).
+    :param group_spw: Full coarse-group SPW range string (e.g. ``'44~49'``).
+    :type group_spw: str
+    :param group_spwstr: Formatted group SPW string (see :func:`format_spw`); used
+        only for logging/imname here (chunk outputs use each chunk's own spwstr).
+    :type group_spwstr: str
+    :param group_sp_index: Full group SPW id selection (comma list), passed to
+        WSClean's ``-spws``, so the uv coverage is the FULL group's.
+    :type group_sp_index: str
+    :param group_bmsize: Beam size (arcsec) to use for the single joint WSClean
+        call. WSClean fits one beam per output channel when given a single
+        ``-beam-size``; using the group's beam size (rather than per-chunk) is
+        an accepted simplification for this joint mode.
+    :type group_bmsize: float
+    :param chunks: Ordered list (lowest to highest frequency) of fine chunk
+        dicts, each with keys ``'spw'`` (range string), ``'spwstr'`` (formatted
+        string), ``'sp_index'`` (comma id list from
+        :func:`_spw_indices_for_range`), and ``'bmsize'`` (per-chunk beam size,
+        unused for the WSClean call itself but kept for parity/logging).
+    :type chunks: list(dict)
+    :param workdir: Working directory for WSClean outputs.
+    :param imgoutdir: Output directory for synoptic FITS files.
+    :param msname: MS basename used in WSClean image-name construction.
+    :param ri_final: Interval dict from :func:`_compute_round_intervals`.
+    :param briggs_val: Briggs robust weighting value.
+    :param pols: Polarization selection string.
+    :param reftime_daily: Daily reference time (for non-segmented restamping).
+    :param viz_timerange: CASA timerange string used for the non-segmented path
+        (unused when ``is_segmented`` is True; kept for signature parity with
+        :func:`_run_final_imaging`).
+    :param date_str: Date string (``YYYYMMDD``).
+    :param is_segmented: Whether this is the segmented (multi-interval) path.
+    :param freq_setup: Active :class:`FrequencySetup` instance.
+    :param tr_series_time: Optional list of (start_Time, end_Time) tuples to
+        filter imaging intervals.
+    :param fits_tag: Optional infix spliced into output FITS filenames.
+    :param data_column: MS data column to image.
+    :param solar_antenna_total: Total solar antenna count for this epoch, or None.
+    :returns: On success, ``dict`` mapping each chunk's SPW range string to its
+        list of written synoptic FITS file paths (one entry per chunk, in the
+        same order as ``chunks``). On failure (output-count mismatch), returns
+        the module-level sentinel :data:`_FINE_JOINT_FALLBACK` so the caller can
+        fall back to the legacy per-chunk imaging loop.
+    :rtype: dict or object
+    """
+    gain = 0.2
+    n_chunks = len(chunks)
+    fit_spectral_pol = PIPELINE_CONFIG.get('fine_spectral_fit_spectral_pol', 2)
+
+    try:
+        boundaries_hz = _fine_joint_channel_division_frequencies(freq_setup, chunks)
+    except AssertionError:
+        log_print('ERROR',
+                  f"[fine_joint_imaging] {traceback.format_exc()}")
+        return _FINE_JOINT_FALLBACK
+
+    n_ant_img = count_unflagged_solar_antennas(msfile, group_sp_index, solar_antenna_total)
+    if n_ant_img is not None and solar_antenna_total is not None:
+        log_print('INFO',
+                  f"Group SPW {group_spwstr}: {n_ant_img}/{int(solar_antenna_total)} solar antennas "
+                  f"have unflagged data available for joint fine-spectral imaging.")
+
+    with pipeline_stage("fine_joint_imaging", spw=group_spw, spwstr=group_spwstr,
+                        n_chunks=n_chunks, segmented=is_segmented):
+        imname_strlist = ["eovsa", "major", f"{msname}", f"sp{group_spwstr}", 'finejoint']
+        imname = '-'.join(imname_strlist)
+        clean_obj = ww.WSClean(msfile)
+        clean_obj.setup(size=1024, scale="2.5asec", pol=pols,
+                        weight_briggs=briggs_val,
+                        niter=20000, mgain=0.85, gain=gain,
+                        data_column=data_column,
+                        name=os.path.join(workdir, imname),
+                        multiscale=True, multiscale_gain=0.3,
+                        multiscale_scale_bias=0.6,
+                        auto_mask=2, auto_threshold=1,
+                        minuv_l=200,
+                        intervals_out=ri_final['N1'],
+                        no_negative=False, quiet=True,
+                        circular_beam=True, beam_size=group_bmsize,
+                        spws=group_sp_index,
+                        join_channels=True,
+                        channels_out=n_chunks,
+                        channel_division_frequencies=boundaries_hz,
+                        fit_spectral_pol=fit_spectral_pol)
+        clean_obj.run(dryrun=False)
+
+        # Discover the actual output naming at runtime rather than assuming it
+        # (wsclean conventionally uses '-t####' for intervals and '-####' for
+        # channels, plus a per-interval '-MFS' set, but this is not guessed).
+        all_fits = sorted(glob(os.path.join(workdir, imname + '-*image.fits')))
+        # Also cover the no-'-t####'-infix case wsclean uses when intervals_out==1.
+        all_fits += sorted(glob(os.path.join(workdir, imname + '-image.fits')))
+        all_fits = sorted(set(all_fits))
+
+        interval_re = re.compile(r'-t(\d+)-')
+        channel_re = re.compile(r'-(\d+)-image\.fits$')
+        mfs_re = re.compile(r'-MFS-image\.fits$')
+
+        per_interval_channel = {}  # (interval_idx, channel_idx) -> filepath
+        mfs_files = []
+        for fpath in all_fits:
+            base = os.path.basename(fpath)
+            if mfs_re.search(base):
+                mfs_files.append(fpath)
+                continue
+            interval_match = interval_re.search(base)
+            interval_idx = int(interval_match.group(1)) if interval_match else 0
+            channel_match = channel_re.search(base)
+            if not channel_match:
+                # Neither MFS nor a per-channel file; not part of the expected set.
+                continue
+            channel_idx = int(channel_match.group(1))
+            per_interval_channel[(interval_idx, channel_idx)] = fpath
+
+        n_intervals = int(ri_final['N1'])
+        expected_count = n_intervals * n_chunks
+        found_count = len(per_interval_channel)
+        log_print('INFO',
+                  f"[fine_joint_imaging] group {group_spwstr}: discovered {found_count} "
+                  f"per-channel image(s) (+{len(mfs_files)} MFS) vs expected "
+                  f"{expected_count} ({n_intervals} interval(s) x {n_chunks} channel(s)).")
+
+        if found_count != expected_count:
+            log_print('ERROR',
+                      f"[fine_joint_imaging] output count mismatch for group {group_spwstr}: "
+                      f"found {found_count}, expected {expected_count}. Falling back to the "
+                      f"legacy per-chunk fine-imaging loop.")
+            clean_junk(os.path.join(workdir, imname))
+            return _FINE_JOINT_FALLBACK
+
+        # wsclean orders channels by frequency; EOVSA SPW index increases with
+        # frequency, so channel index c (0-based, ascending frequency) maps to
+        # chunk c (chunks are ordered lowest to highest frequency by the caller).
+        chunk_synfitsfiles = {chunk['spw']: [] for chunk in chunks}
+        for channel_idx, chunk in enumerate(chunks):
+            chunk_tag = f"fine:{chunk['spwstr']}"
+            log_print('INFO',
+                      f"[fine_joint_imaging] mapping chunk_tag={chunk_tag} <-> channel_idx={channel_idx}")
+            fitsname = []
+            for interval_idx in range(n_intervals):
+                fpath = per_interval_channel.get((interval_idx, channel_idx))
+                if fpath is None:
+                    log_print('ERROR',
+                              f"[fine_joint_imaging] missing image for chunk {chunk_tag}, "
+                              f"interval {interval_idx}, channel {channel_idx}. Falling back to "
+                              f"the legacy per-chunk fine-imaging loop.")
+                    clean_junk(os.path.join(workdir, imname))
+                    return _FINE_JOINT_FALLBACK
+                log_print('INFO',
+                          f"[fine_joint_imaging] chunk_tag={chunk_tag} channel_idx={channel_idx} "
+                          f"interval_idx={interval_idx} file={os.path.basename(fpath)}")
+                fitsname.append(fpath)
+            fitsname = sorted(fitsname)
+
+            fitsname_helio = [f.replace('image.fits', 'image.helio.fits') for f in fitsname]
+            fitsname_helio_ref_daily = [f.replace('image.fits', 'image.helio.ref_daily.fits') for f in fitsname]
+            try:
+                if is_segmented:
+                    hf.imreg(vis=msfile, imagefile=fitsname, fitsfile=fitsname_helio,
+                             timerange=ri_final['timeranges'], toTb=True)
+                    for eoidx, (fits_helio, fits_helio_ref_daily) in enumerate(
+                            zip(fitsname_helio, fitsname_helio_ref_daily)):
+                        solar_diff_rot_heliofits(fits_helio, reftime_daily, fits_helio_ref_daily,
+                                                 in_time=ri_final['time_intervals_major_avg'][eoidx])
+                    fitsfilefinal = fitsname_helio_ref_daily
+                else:
+                    hf.imreg(vis=msfile, imagefile=fitsname, fitsfile=fitsname_helio,
+                             timerange=[viz_timerange], toTb=True)
+                    fitsfilefinal = fitsname_helio
+            except Exception:
+                log_print('ERROR', f"[fine_joint_imaging] helioprojective registration failed | "
+                                   f"{_format_log_state(spw=chunk['spw'], spwstr=chunk['spwstr'], n_fits=len(fitsname))}\n"
+                                   f"{traceback.format_exc()}")
+                fitsfilefinal = []
+
+            chunk_synfitsfiles[chunk['spw']] = _register_and_export_interval_fits(
+                msfile, fitsfilefinal, ri_final, imgoutdir, chunk['spwstr'],
+                reftime_daily, date_str, is_segmented,
+                n_ant_img, solar_antenna_total,
+                tr_series_time=tr_series_time, fits_tag=fits_tag)
+
+        # Ignore/delete the joint run's MFS outputs -- the coarse product still
+        # comes from the standard Step 4 run, not from this joint fine pass.
+        for mfs_file in mfs_files:
+            try:
+                if os.path.exists(mfs_file):
+                    os.remove(mfs_file)
+            except Exception:
+                log_print('WARNING',
+                          f"[fine_joint_imaging] failed to remove MFS output {mfs_file}\n"
+                          f"{traceback.format_exc()}")
+
+        clean_junk(os.path.join(workdir, imname))
+
+    log_print('INFO', f"Joint fine-spectral imaging for group SPW {group_spw}: completed")
+    return chunk_synfitsfiles
 
 
 def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=None,
@@ -3456,9 +3779,18 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             segmented_imaging[sidx] = True if config_idx in [0, 1, 2, 3, 4, 5, 6] else False
             briggs[sidx] = briggs_[config_idx]
 
+        fine_spectral_exclude_bounds = {
+            _spw_range_bounds(excl) for excl in PIPELINE_CONFIG.get('fine_spectral_exclude', [])
+        }
         if fine_spectral_imaging:
             for sidx, spw in enumerate(spws):
                 if sidx not in spwidx2proc:
+                    continue
+                if _spw_range_bounds(spw) in fine_spectral_exclude_bounds:
+                    log_print('INFO',
+                              f"fine_spectral_exclude: skipping fine-spectral products for coarse group "
+                              f"{spw} (sidx={sidx}); matched fine_spectral_exclude config.")
+                    fine_imaging_spws[sidx] = []
                     continue
                 fine_spws = [
                     fine_spw for fine_spw in _fine_spectral_spws_for_range(spw)
@@ -3549,28 +3881,68 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         f'eovsa.synoptic_daily{post_tag_fso}.{date_str}T200000Z.s{coarse_spwstr}.tb.fits')
                     coarse_fitsfiles = [coarse_candidate] if os.path.exists(coarse_candidate) else []
 
-                for fine_spw in fine_spws:
-                    fine_spwstr = format_spw(fine_spw)
-                    fine_sp_index = _spw_indices_for_range(fine_spw)
-                    _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
-                    fine_key = f'fine:{fine_spwstr}'
-                    fine_synfitsfiles, imaging_objs = _run_final_imaging(
-                        msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
-                        msname, ri_final, briggs[sidx], fine_bmsize, pols,
+                joint_result = _FINE_JOINT_FALLBACK
+                if PIPELINE_CONFIG.get('fine_spectral_joint', False) and len(fine_spws) >= 2:
+                    _, _, group_bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
+                    chunks = []
+                    for fine_spw in fine_spws:
+                        fine_spwstr = format_spw(fine_spw)
+                        fine_sp_index = _spw_indices_for_range(fine_spw)
+                        _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
+                        chunks.append({'spw': fine_spw, 'spwstr': fine_spwstr,
+                                       'sp_index': fine_sp_index, 'bmsize': fine_bmsize})
+                    joint_result = _run_fine_joint_imaging(
+                        msfile, sidx, spws[sidx], coarse_spwstr, sp_index, group_bmsize,
+                        chunks, workdir, imgoutdir, msname, ri_final, briggs[sidx], pols,
                         reftime_daily, viz_timerange, date_str,
-                        segmented_imaging[sidx], imaging_objs, freq_setup,
+                        segmented_imaging[sidx], freq_setup,
                         tr_series_time=tr_series_time, fits_tag=fits_tag,
                         data_column=final_data_column,
                         solar_antenna_total=solar_antenna_total)
+                    if joint_result is _FINE_JOINT_FALLBACK:
+                        log_print('WARNING',
+                                  f"[fine_joint_imaging] joint fine-spectral imaging failed for group "
+                                  f"SPW {spws[sidx]} (sidx={sidx}); falling back to the legacy "
+                                  f"per-chunk fine-imaging loop.")
 
-                    if PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
-                        if not coarse_fitsfiles:
-                            log_print('WARNING',
-                                      f"[fine_spectral_snr_gate] no parent coarse FITS found for "
-                                      f"{fine_key} (sidx={sidx}, spw={coarse_spwstr}); "
-                                      f"skipping gate, keeping fine product(s).")
-                        _apply_fine_spectral_quality_gate(
-                            fine_synfitsfiles, coarse_fitsfiles, fine_key, cfg=PIPELINE_CONFIG)
+                if joint_result is not _FINE_JOINT_FALLBACK:
+                    for fine_spw in fine_spws:
+                        fine_spwstr = format_spw(fine_spw)
+                        fine_key = f'fine:{fine_spwstr}'
+                        fine_synfitsfiles = joint_result.get(fine_spw, [])
+                        if PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
+                            if not coarse_fitsfiles:
+                                log_print('WARNING',
+                                          f"[fine_spectral_snr_gate] no parent coarse FITS found for "
+                                          f"{fine_key} (sidx={sidx}, spw={coarse_spwstr}); "
+                                          f"skipping gate, keeping fine product(s).")
+                            else:
+                                _apply_fine_spectral_quality_gate(
+                                    fine_synfitsfiles, coarse_fitsfiles, fine_key, cfg=PIPELINE_CONFIG)
+                else:
+                    for fine_spw in fine_spws:
+                        fine_spwstr = format_spw(fine_spw)
+                        fine_sp_index = _spw_indices_for_range(fine_spw)
+                        _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
+                        fine_key = f'fine:{fine_spwstr}'
+                        fine_synfitsfiles, imaging_objs = _run_final_imaging(
+                            msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
+                            msname, ri_final, briggs[sidx], fine_bmsize, pols,
+                            reftime_daily, viz_timerange, date_str,
+                            segmented_imaging[sidx], imaging_objs, freq_setup,
+                            tr_series_time=tr_series_time, fits_tag=fits_tag,
+                            data_column=final_data_column,
+                            solar_antenna_total=solar_antenna_total)
+
+                        if PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
+                            if not coarse_fitsfiles:
+                                log_print('WARNING',
+                                          f"[fine_spectral_snr_gate] no parent coarse FITS found for "
+                                          f"{fine_key} (sidx={sidx}, spw={coarse_spwstr}); "
+                                          f"skipping gate, keeping fine product(s).")
+                            else:
+                                _apply_fine_spectral_quality_gate(
+                                    fine_synfitsfiles, coarse_fitsfiles, fine_key, cfg=PIPELINE_CONFIG)
         elif mergeFITSonly:
             log_print('INFO', "mergeFITSonly=True: skipping self-calibration and imaging, proceeding to merge.")
         else:
@@ -3743,22 +4115,53 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         if fine_spws:
                             log_print('INFO',
                                       f"Running fine spectral imaging for SPW {spws[sidx]}: {fine_spws}")
-                        for fine_spw in fine_spws:
-                            fine_spwstr = format_spw(fine_spw)
-                            fine_sp_index = _spw_indices_for_range(fine_spw)
-                            _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
-                            fine_key = f'fine:{fine_spwstr}'
-                            fine_synfitsfiles, imaging_objs = _run_final_imaging(
-                                msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
-                                msname, ri_final, briggs[sidx], fine_bmsize, pols,
+
+                        joint_result = _FINE_JOINT_FALLBACK
+                        if PIPELINE_CONFIG.get('fine_spectral_joint', False) and len(fine_spws) >= 2:
+                            joint_result = _run_fine_joint_imaging(
+                                msfile, sidx, spws[sidx], spwstr, sp_index, bmsize,
+                                [
+                                    {'spw': fine_spw, 'spwstr': format_spw(fine_spw),
+                                     'sp_index': _spw_indices_for_range(fine_spw),
+                                     'bmsize': freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)[2]}
+                                    for fine_spw in fine_spws
+                                ],
+                                workdir, imgoutdir, msname, ri_final, briggs[sidx], pols,
                                 reftime_daily, viz_timerange, date_str,
-                                segmented_imaging[sidx], imaging_objs, freq_setup,
+                                segmented_imaging[sidx], freq_setup,
                                 tr_series_time=tr_series_time, fits_tag=fits_tag,
                                 solar_antenna_total=solar_antenna_total)
+                            if joint_result is _FINE_JOINT_FALLBACK:
+                                log_print('WARNING',
+                                          f"[fine_joint_imaging] joint fine-spectral imaging failed for group "
+                                          f"SPW {spws[sidx]} (sidx={sidx}); falling back to the legacy "
+                                          f"per-chunk fine-imaging loop.")
 
-                            if fine_spectral_imaging and PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
-                                _apply_fine_spectral_quality_gate(
-                                    fine_synfitsfiles, synfitsfiles, fine_key, cfg=PIPELINE_CONFIG)
+                        if joint_result is not _FINE_JOINT_FALLBACK:
+                            for fine_spw in fine_spws:
+                                fine_spwstr = format_spw(fine_spw)
+                                fine_key = f'fine:{fine_spwstr}'
+                                fine_synfitsfiles = joint_result.get(fine_spw, [])
+                                if fine_spectral_imaging and PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
+                                    _apply_fine_spectral_quality_gate(
+                                        fine_synfitsfiles, synfitsfiles, fine_key, cfg=PIPELINE_CONFIG)
+                        else:
+                            for fine_spw in fine_spws:
+                                fine_spwstr = format_spw(fine_spw)
+                                fine_sp_index = _spw_indices_for_range(fine_spw)
+                                _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
+                                fine_key = f'fine:{fine_spwstr}'
+                                fine_synfitsfiles, imaging_objs = _run_final_imaging(
+                                    msfile, fine_key, fine_spw, fine_spwstr, fine_sp_index, workdir, imgoutdir,
+                                    msname, ri_final, briggs[sidx], fine_bmsize, pols,
+                                    reftime_daily, viz_timerange, date_str,
+                                    segmented_imaging[sidx], imaging_objs, freq_setup,
+                                    tr_series_time=tr_series_time, fits_tag=fits_tag,
+                                    solar_antenna_total=solar_antenna_total)
+
+                                if fine_spectral_imaging and PIPELINE_CONFIG.get('fine_spectral_snr_gate', True):
+                                    _apply_fine_spectral_quality_gate(
+                                        fine_synfitsfiles, synfitsfiles, fine_key, cfg=PIPELINE_CONFIG)
 
                     elapsed_total = (datetime.now() - run_start_time).total_seconds() / 60
                     log_print('INFO', f"Pipeline for SPW {spws[sidx]}: completed in {elapsed_total:.1f} minutes")

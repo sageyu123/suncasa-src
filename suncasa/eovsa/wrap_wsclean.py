@@ -259,6 +259,21 @@ class WSClean:
             if spws:
                 cmd.extend(['-spws', spws])
 
+        if self.params.get('join_channels'):
+            cmd.append('-join-channels')
+
+        if 'channels_out' in self.params and self.params['channels_out'] is not None:
+            cmd.extend(['-channels-out', str(self.params['channels_out'])])
+
+        if self.params.get('channel_division_frequencies') is not None:
+            freqs = self.params['channel_division_frequencies']
+            if isinstance(freqs, (list, tuple)):
+                freqs = ','.join(str(f) for f in freqs)
+            cmd.extend(['-channel-division-frequencies', str(freqs)])
+
+        if 'fit_spectral_pol' in self.params and self.params['fit_spectral_pol'] is not None:
+            cmd.extend(['-fit-spectral-pol', str(self.params['fit_spectral_pol'])])
+
         cmd.extend(['-name', self.params['name']])
         cmd.append(self.vis)
 
