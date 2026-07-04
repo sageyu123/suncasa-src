@@ -1995,6 +1995,125 @@ def _data_description_ids_for_spws(msfile, spw_ids):
         tb.close()
 
 
+def _archive_spw_index_remap(msfile, freq_setup):
+    """Map original (pre-``split``) SPW indices onto the row indices of an archive MS.
+
+    ``fine_spectral_only``/``imaging_only`` resume from an archive MS built (by a
+    prior full run) via per-coarse-group ``split(datacolumn='corrected')`` +
+    ``concat``. CASA's ``split`` renumbers SPW ids from 0 in the output, so a
+    SCOPED archive (built from a subset of the original coarse groups, e.g.
+    ``5~10,31~43,44~49``) ends up with SPW ids ``0..N-1`` that do NOT match the
+    ORIGINAL band indices the rest of this module computes from
+    :class:`FrequencySetup` (``spws_indices``, ``fine_sp_index``, etc.). A
+    full 7-group archive tiles ``0~49`` contiguously, so its renumbering is the
+    identity map -- which is why this was never observed before scoped
+    archives were introduced.
+
+    This reads the archive's ``SPECTRAL_WINDOW`` subtable and matches each row's
+    ``REF_FREQUENCY`` back to the nearest :attr:`FrequencySetup.eofreq` band
+    center to recover, for every archive row ``i``, which original band index
+    ``j`` it corresponds to.
+
+    :param msfile: Path to the (possibly scoped) archive MS to inspect.
+    :type msfile: str
+    :param freq_setup: Active :class:`FrequencySetup` instance providing the
+        original per-band center frequencies (``eofreq``, GHz) and band width
+        (``bandwidth``, GHz).
+    :type freq_setup: FrequencySetup
+    :returns: Mapping ``{original_index: archive_row_index}``, or ``None`` if
+        no remapping is needed (identity map) or the mapping could not be
+        determined unambiguously (callers must then treat SPW indices as
+        already being archive-row indices, i.e. no-op).
+    :rtype: dict or None
+    """
+    spw_table = msfile + '/SPECTRAL_WINDOW'
+    tb.open(spw_table)
+    try:
+        ref_freqs = np.asarray(tb.getcol('REF_FREQUENCY')).ravel()
+    finally:
+        tb.close()
+
+    eofreq = np.asarray(freq_setup.eofreq)
+    bandwidth = float(freq_setup.bandwidth)
+
+    remap = {}
+    for i, ref_freq_hz in enumerate(ref_freqs):
+        ref_freq_ghz = float(ref_freq_hz) / 1e9
+        diffs = np.abs(eofreq - ref_freq_ghz)
+        j = int(np.argmin(diffs))
+        min_diff = float(diffs[j])
+        if min_diff >= bandwidth:
+            log_print('ERROR',
+                      f"[archive_spw_remap] archive row {i} (REF_FREQUENCY="
+                      f"{ref_freq_ghz:.4f} GHz) does not match any original band "
+                      f"center within the {bandwidth:.4f} GHz bandwidth tolerance "
+                      f"(closest: band {j} at {eofreq[j]:.4f} GHz, "
+                      f"diff={min_diff:.4f} GHz). Cannot determine archive SPW "
+                      f"remapping for {msfile!r}.")
+            return None
+        if j in remap:
+            log_print('ERROR',
+                      f"[archive_spw_remap] ambiguous remap for {msfile!r}: original "
+                      f"band {j} matches both archive row {remap[j]} and row {i}. "
+                      f"Cannot determine archive SPW remapping.")
+            return None
+        remap[j] = i
+
+    n_rows = len(ref_freqs)
+    if all(j == remap.get(j) for j in range(n_rows)) and len(remap) == n_rows:
+        log_print('INFO',
+                  f"[archive_spw_remap] {msfile}: {n_rows} row(s), identity mapping "
+                  f"(no SPW remapping needed).")
+        return None
+
+    # Summarize as compact "orig a-b -> rows c-d" ranges for one INFO line.
+    ordered_js = sorted(remap.keys())
+    ranges = []
+    run_start_j = ordered_js[0]
+    run_start_i = remap[run_start_j]
+    prev_j = run_start_j
+    prev_i = run_start_i
+    for j in ordered_js[1:]:
+        i = remap[j]
+        if j == prev_j + 1 and i == prev_i + 1:
+            prev_j, prev_i = j, i
+            continue
+        ranges.append((run_start_j, prev_j, run_start_i, prev_i))
+        run_start_j, run_start_i = j, i
+        prev_j, prev_i = j, i
+    ranges.append((run_start_j, prev_j, run_start_i, prev_i))
+    summary = '; '.join(
+        f"orig {j0}-{j1} -> rows {i0}-{i1}" if j0 != j1 else f"orig {j0} -> row {i0}"
+        for j0, j1, i0, i1 in ranges
+    )
+    log_print('INFO',
+              f"[archive_spw_remap] {msfile}: {n_rows} row(s), remapping ({summary}).")
+    return remap
+
+
+def _remap_sp_index_str(sp_index, remap):
+    """Remap a comma-separated string of original SPW indices to archive-row indices.
+
+    :param sp_index: Comma-separated original SPW indices (as produced by
+        :func:`_spw_indices_for_range`), e.g. ``'5,6,7,8,9,10'``.
+    :type sp_index: str
+    :param remap: Mapping ``{original_index: archive_row_index}`` as returned by
+        :func:`_archive_spw_index_remap`.
+    :type remap: dict
+    :returns: Comma-separated archive-row indices in the same order as the
+        input, or ``None`` if any input index is missing from ``remap``.
+    :rtype: str or None
+    """
+    orig_indices = [int(tok) for tok in str(sp_index).split(',')]
+    missing = [j for j in orig_indices if j not in remap]
+    if missing:
+        log_print('ERROR',
+                  f"[archive_spw_remap] original SPW index(es) {missing} not present in "
+                  f"the archive SPW remap; cannot remap sp_index={sp_index!r}.")
+        return None
+    return ','.join(str(remap[j]) for j in orig_indices)
+
+
 def _unflagged_row_mask(flag_values, nrow):
     """Return rows with at least one unflagged correlation/channel sample."""
     flags = np.asarray(flag_values, dtype=bool)
@@ -3845,6 +3964,14 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         date_str = date_local.strftime('%Y%m%d')
         reftime_daily = Time(datetime.combine(date_local, time(20, 0)))
         freq_setup = FrequencySetup(Time(tbg_msfile), spws=custom_spws)
+        # fine_spectral_only/imaging_only resume from an archive MS assembled via
+        # per-coarse-group split()+concat, which CASA renumbers from 0. For a
+        # SCOPED archive that renumbering is not the identity, so original SPW
+        # indices (as computed throughout this module from FrequencySetup) must
+        # be remapped to archive-row indices before being handed to WSClean's
+        # -spws or any MS-row lookup. Normal runs (both flags False) leave
+        # spw_remap as None, and every application site below no-ops on None.
+        spw_remap = _archive_spw_index_remap(msfile, freq_setup) if (fine_spectral_only or imaging_only) else None
         spws_indices = freq_setup.spws_indices
         spw_config_indices = freq_setup.spw_config_indices
         tb_models = {}
@@ -3992,14 +4119,34 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 if PIPELINE_CONFIG.get('fine_spectral_joint', False) and len(fine_spws) >= 2:
                     _, _, group_bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
                     chunks = []
+                    chunks_ok = True
                     for fine_spw in fine_spws:
                         fine_spwstr = format_spw(fine_spw)
                         fine_sp_index = _spw_indices_for_range(fine_spw)
+                        if spw_remap is not None:
+                            fine_sp_index = _remap_sp_index_str(fine_sp_index, spw_remap)
+                            if fine_sp_index is None:
+                                chunks_ok = False
+                                break
                         _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
                         chunks.append({'spw': fine_spw, 'spwstr': fine_spwstr,
                                        'sp_index': fine_sp_index, 'bmsize': fine_bmsize})
+                    # NOTE: `sp_index` here is the coarse group's index string
+                    # (`spws_indices[sidx]`), matching `group_sp_index` in
+                    # `_run_fine_joint_imaging`'s signature -- the same value the
+                    # main-path Step 4b passes from its own `sp_index` loop var.
+                    group_sp_index = spws_indices[sidx]
+                    if spw_remap is not None:
+                        group_sp_index = _remap_sp_index_str(group_sp_index, spw_remap)
+                        if group_sp_index is None:
+                            chunks_ok = False
+                    if not chunks_ok:
+                        log_print('ERROR',
+                                  f"[archive_spw_remap] skipping joint fine-spectral imaging for group "
+                                  f"SPW {spws[sidx]} (sidx={sidx}): SPW index missing from archive remap.")
+                        continue
                     joint_result = _run_fine_joint_imaging(
-                        msfile, sidx, spws[sidx], coarse_spwstr, sp_index, group_bmsize,
+                        msfile, sidx, spws[sidx], coarse_spwstr, group_sp_index, group_bmsize,
                         chunks, workdir, imgoutdir, msname, ri_final, briggs[sidx], pols,
                         reftime_daily, viz_timerange, date_str,
                         segmented_imaging[sidx], freq_setup,
@@ -4030,6 +4177,14 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     for fine_spw in fine_spws:
                         fine_spwstr = format_spw(fine_spw)
                         fine_sp_index = _spw_indices_for_range(fine_spw)
+                        if spw_remap is not None:
+                            fine_sp_index = _remap_sp_index_str(fine_sp_index, spw_remap)
+                            if fine_sp_index is None:
+                                log_print('ERROR',
+                                          f"[archive_spw_remap] skipping fine chunk {fine_spw} for group "
+                                          f"SPW {spws[sidx]} (sidx={sidx}): SPW index missing from "
+                                          f"archive remap.")
+                                continue
                         _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
                         fine_key = f'fine:{fine_spwstr}'
                         fine_synfitsfiles, imaging_objs = _run_final_imaging(
@@ -4072,6 +4227,25 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         slfcal_init_objs.append(None)
                         caltbs_all.append(caltbs)
                         continue
+
+                    # imaging_only resumes from a (possibly scoped) archive MS whose
+                    # SPW ids were renumbered by split()+concat; remap this group's
+                    # original index string to the archive's row indices before it
+                    # reaches any imaging/-spws consumer below. Brightness-check and
+                    # disk-selfcal (unmapped uses of `sp_index` further down) are
+                    # unreachable whenever spw_remap is not None, since those are
+                    # gated by `if not imaging_only:` and spw_remap is only computed
+                    # for fine_spectral_only/imaging_only (and this main loop is never
+                    # reached when fine_spectral_only=True).
+                    if spw_remap is not None:
+                        sp_index = _remap_sp_index_str(sp_index, spw_remap)
+                        if sp_index is None:
+                            log_print('ERROR',
+                                      f"[archive_spw_remap] skipping SPW {spws[sidx]} (sidx={sidx}): "
+                                      f"SPW index missing from archive remap.")
+                            slfcal_init_objs.append(None)
+                            caltbs_all.append(caltbs)
+                            continue
 
                     reffreq, cdelt4_real, bmsize = freq_setup.get_reffreq_and_cdelt(spws[sidx], return_bmsize=True)
                     log_print('INFO', f"Processing SPW {spws[sidx]} for msfile {msname} ...")
@@ -4253,25 +4427,38 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
 
                         joint_result = _FINE_JOINT_FALLBACK
                         if PIPELINE_CONFIG.get('fine_spectral_joint', False) and len(fine_spws) >= 2:
-                            joint_result = _run_fine_joint_imaging(
-                                msfile, sidx, spws[sidx], spwstr, sp_index, bmsize,
-                                [
-                                    {'spw': fine_spw, 'spwstr': format_spw(fine_spw),
-                                     'sp_index': _spw_indices_for_range(fine_spw),
-                                     'bmsize': freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)[2]}
-                                    for fine_spw in fine_spws
-                                ],
-                                workdir, imgoutdir, msname, ri_final, briggs[sidx], pols,
-                                reftime_daily, viz_timerange, date_str,
-                                segmented_imaging[sidx], freq_setup,
-                                tr_series_time=tr_series_time, fits_tag=fits_tag,
-                                data_column=final_data_column,
-                                solar_antenna_total=solar_antenna_total)
-                            if joint_result is _FINE_JOINT_FALLBACK:
-                                log_print('WARNING',
-                                          f"[fine_joint_imaging] joint fine-spectral imaging failed for group "
-                                          f"SPW {spws[sidx]} (sidx={sidx}); falling back to the legacy "
-                                          f"per-chunk fine-imaging loop.")
+                            fine_chunks = []
+                            fine_chunks_ok = True
+                            for fine_spw in fine_spws:
+                                chunk_sp_index = _spw_indices_for_range(fine_spw)
+                                if spw_remap is not None:
+                                    chunk_sp_index = _remap_sp_index_str(chunk_sp_index, spw_remap)
+                                    if chunk_sp_index is None:
+                                        fine_chunks_ok = False
+                                        break
+                                fine_chunks.append({
+                                    'spw': fine_spw, 'spwstr': format_spw(fine_spw),
+                                    'sp_index': chunk_sp_index,
+                                    'bmsize': freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)[2]})
+                            if not fine_chunks_ok:
+                                log_print('ERROR',
+                                          f"[archive_spw_remap] skipping joint fine-spectral imaging for group "
+                                          f"SPW {spws[sidx]} (sidx={sidx}): SPW index missing from archive remap.")
+                            else:
+                                joint_result = _run_fine_joint_imaging(
+                                    msfile, sidx, spws[sidx], spwstr, sp_index, bmsize,
+                                    fine_chunks,
+                                    workdir, imgoutdir, msname, ri_final, briggs[sidx], pols,
+                                    reftime_daily, viz_timerange, date_str,
+                                    segmented_imaging[sidx], freq_setup,
+                                    tr_series_time=tr_series_time, fits_tag=fits_tag,
+                                    data_column=final_data_column,
+                                    solar_antenna_total=solar_antenna_total)
+                                if joint_result is _FINE_JOINT_FALLBACK:
+                                    log_print('WARNING',
+                                              f"[fine_joint_imaging] joint fine-spectral imaging failed for group "
+                                              f"SPW {spws[sidx]} (sidx={sidx}); falling back to the legacy "
+                                              f"per-chunk fine-imaging loop.")
 
                         if joint_result is not _FINE_JOINT_FALLBACK:
                             for fine_spw in fine_spws:
@@ -4285,6 +4472,14 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                             for fine_spw in fine_spws:
                                 fine_spwstr = format_spw(fine_spw)
                                 fine_sp_index = _spw_indices_for_range(fine_spw)
+                                if spw_remap is not None:
+                                    fine_sp_index = _remap_sp_index_str(fine_sp_index, spw_remap)
+                                    if fine_sp_index is None:
+                                        log_print('ERROR',
+                                                  f"[archive_spw_remap] skipping fine chunk {fine_spw} for "
+                                                  f"group SPW {spws[sidx]} (sidx={sidx}): SPW index missing "
+                                                  f"from archive remap.")
+                                        continue
                                 _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(fine_spw, return_bmsize=True)
                                 fine_key = f'fine:{fine_spwstr}'
                                 fine_synfitsfiles, imaging_objs = _run_final_imaging(
