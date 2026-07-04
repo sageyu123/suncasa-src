@@ -3937,6 +3937,34 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             else:
                 raise ValueError(f"Unsupported file format: {msfile}")
         msfile = msfile_copy
+        if fine_spectral_only or imaging_only:
+            # Resume-mode archives are built by per-coarse-group split + concat,
+            # which leaves the main table GROUP-BLOCKED: TIME is non-monotonic
+            # across the concatenated sub-MS blocks. wsclean's -intervals-out
+            # mis-partitions such an MS — each group's data lands in only a
+            # contiguous subset of the time intervals and the rest image as
+            # blank (verified on a real scoped archive: 3 OK + 9 BLANK of 12
+            # intervals unsorted vs 12/12 OK after time-sorting). Sort in place.
+            tb.open(msfile)
+            try:
+                _time_col = tb.getcol('TIME')
+            finally:
+                tb.close()
+            if not np.all(np.diff(_time_col) >= 0):
+                msfile_sorted = os.path.join(workdir, f'{msname}.tsorted.ms')
+                log_print('INFO',
+                          f"Archive MS main table is not time-sorted (group-blocked concat); "
+                          f"time-sorting {msfile} in place for interval-based imaging.")
+                if os.path.exists(msfile_sorted):
+                    shutil.rmtree(msfile_sorted, ignore_errors=True)
+                ms.open(msfile, nomodify=False)
+                try:
+                    ms.timesort(msfile_sorted)
+                finally:
+                    ms.close()
+                shutil.rmtree(msfile, ignore_errors=True)
+                shutil.move(msfile_sorted, msfile)
+            del _time_col
         msfile, msname = _prepare_yy_as_xx_ms(msfile, workdir, msname, pols, overwrite=overwrite)
         if str(pols).upper().replace(',', '') in ('YY', 'YY_AS_XX'):
             log_print('INFO', "Using YY data swapped into the XX slot for downstream diagnostic imaging")
@@ -4607,7 +4635,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             if slfcaled_spw_ms_list:
                 log_print('INFO',
                           f"Concatenating {len(slfcaled_spw_ms_list)} per-spw MS files into {outputvis} ...")
-                concat(vis=slfcaled_spw_ms_list, concatvis=outputvis, freqtol='', dirtol='')
+                # timesort=True: without it the concat output is group-blocked
+                # (TIME non-monotonic), which breaks wsclean -intervals-out when
+                # the archive is later consumed by --imaging-only/--fine-spectral-only.
+                concat(vis=slfcaled_spw_ms_list, concatvis=outputvis, freqtol='', dirtol='', timesort=True)
                 log_print('INFO', f"Selfcal'd outputvis saved to {outputvis}")
                 # Tar the outputvis and remove the MS directory
                 outputvis_tar = outputvis + '.tar.gz'
