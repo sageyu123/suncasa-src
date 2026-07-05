@@ -152,7 +152,12 @@ PIPELINE_CONFIG = {
     'fine_spectral_snr_gate': True,
     'fine_spectral_noise_factor': 3.5,
     'fine_spectral_dr_floor': 70.0,
-    'fine_spectral_peak_tb_max': 2.0e6,
+    'fine_spectral_peak_tb_max': 2.0e6,   # fallback only (no coarse parent for the interval)
+    # Primary peak criterion: relative to the coarse parent's peak in the same
+    # interval. Real fine-chunk sources track the group MFS peak (spectral slope
+    # ~x2 max); divergence blows up >~x10. Absolute ceilings misfire on active
+    # days (2026-07-01: 2-10 MK sources with DR 80-200 were mass-rejected).
+    'fine_spectral_peak_ratio_max': 3.0,
     # --- Joint fine-spectral imaging ---
     'fine_spectral_joint': True,        # one joint-deconvolution wsclean per group instead of per-chunk runs
     'fine_spectral_fit_spectral_pol': 2,
@@ -3144,17 +3149,21 @@ def _fine_spectral_quality_gate(fine_fits, coarse_fits, cfg=None):
     noise_factor = cfg.get('fine_spectral_noise_factor', 5.0)
     dr_floor = cfg.get('fine_spectral_dr_floor', 40.0)
     peak_tb_max = cfg.get('fine_spectral_peak_tb_max', 3.0e6)
+    peak_ratio_max = cfg.get('fine_spectral_peak_ratio_max', 3.0)
 
-    metrics = {'fine_noise': None, 'fine_peak': None, 'fine_dr': None, 'coarse_noise': None}
+    metrics = {'fine_noise': None, 'fine_peak': None, 'fine_dr': None,
+               'coarse_noise': None, 'coarse_peak': None}
     try:
         fine_noise, fine_peak = _fits_corner_noise_peak(fine_fits)
         fine_dr = fine_peak / fine_noise if fine_noise > 0 else float('inf')
         metrics.update(fine_noise=fine_noise, fine_peak=fine_peak, fine_dr=fine_dr)
 
         coarse_noise = None
+        coarse_peak = None
         if coarse_fits and os.path.exists(coarse_fits):
-            coarse_noise, _coarse_peak = _fits_corner_noise_peak(coarse_fits)
+            coarse_noise, coarse_peak = _fits_corner_noise_peak(coarse_fits)
             metrics['coarse_noise'] = coarse_noise
+            metrics['coarse_peak'] = coarse_peak
 
         if coarse_noise is not None and coarse_noise > 0 and fine_noise > noise_factor * coarse_noise:
             return False, metrics, (
@@ -3162,7 +3171,19 @@ def _fine_spectral_quality_gate(fine_fits, coarse_fits, cfg=None):
                 f"{noise_factor:g}*coarse_noise({coarse_noise:.3g})")
         if fine_dr < dr_floor:
             return False, metrics, f"fine_dr={fine_dr:.3g} < dr_floor({dr_floor:g})"
-        if fine_peak > peak_tb_max:
+        # Peak criterion is RELATIVE to the coarse parent when available: a fine
+        # chunk of a real source cannot exceed the group's MFS peak by much more
+        # than the spectral slope allows (~x2), while true divergence blows up
+        # >~x10. An ABSOLUTE ceiling misfires on active days: genuinely bright
+        # sources (2-10 MK at 3-5 GHz with healthy DR 80-200) were mass-rejected
+        # by peak_tb_max=2e6 on 2026-07-01. The absolute ceiling is retained
+        # only as a fallback when no coarse parent exists for the interval.
+        if coarse_peak is not None and coarse_peak > 0:
+            if fine_peak > peak_ratio_max * coarse_peak:
+                return False, metrics, (
+                    f"fine_peak={fine_peak:.3g} > "
+                    f"{peak_ratio_max:g}*coarse_peak({coarse_peak:.3g})")
+        elif fine_peak > peak_tb_max:
             return False, metrics, f"fine_peak={fine_peak:.3g} > peak_tb_max({peak_tb_max:.3g})"
         return True, metrics, ""
     except Exception:
