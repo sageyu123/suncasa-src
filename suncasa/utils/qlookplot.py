@@ -3166,16 +3166,17 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                         if nspws > 1:
                             if opencontour:
                                 rmap_plt_.contour(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                  levels=clvls[pol][:1] * np.nanmax(rmap_plt.data), alpha=calpha)
+                                                  levels=clvls[pol][:1] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                  zorder=10)
                             else:
                                 rmap_plt_.contourf(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                   levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha)
+                                                   levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                   zorder=10)
                         else:
                             rmap_plt_.contour(axes=[axs[pidx][0], axs[pidx][1]], cmap=cmaps[pol],
-                                              levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha)
+                                              levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                              zorder=10)
                         if draw_limb_grid_flag:
-                            rmap_plt_.draw_limb(axes=[axs[pidx][0], axs[pidx][1]])
-                            rmap_plt_.draw_grid(axes=[axs[pidx][0], axs[pidx][1]])
                             draw_limb_grid_flag = False
                             if nspws < 2:
                                 title = title0 + ' + {0} {1:6.3f} GHz'.format(observatory, (bfreqghz + efreqghz) / 2.0)
@@ -3226,10 +3227,12 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                             rmap_plt_ = pmX.Sunmap(rmap_plt)
                             if opencontour:
                                 rmap_plt_.contour(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                  levels=clvls[pol][:1] * np.nanmax(rmap_plt.data), alpha=calpha)
+                                                  levels=clvls[pol][:1] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                  zorder=10)
                             else:
                                 rmap_plt_.contourf(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                   levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha)
+                                                   levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                   zorder=10)
                             axs[pidx][0].set_title(title + ' ' + pols[pidx], fontsize=9)
                             rmap_plt_.draw_limb(axes=[axs[pidx][0], axs[pidx][1]])
                             rmap_plt_.draw_grid(axes=[axs[pidx][0], axs[pidx][1]])

@@ -351,6 +351,7 @@ def get_calibration_readiness(tim):
         'refcal_timestamp_utc': None,
         'phacal_count': 0,
         'latest_phacal_timestamp_utc': None,
+        'phacal_warning': None,
     }
 
     try:
@@ -380,16 +381,26 @@ def get_calibration_readiness(tim):
         bphsbd = sql2refcal_bphsbdX(etime)
         if isinstance(bphsbd, list):
             bphsbd = bphsbd[-1] if bphsbd else None
-        if bphsbd is not None and bphsbd.get('t_refcal') is not None:
+        bphsbd_record_time = bphsbd.get('timestamp') if isinstance(bphsbd, dict) else None
+        if (
+            bphsbd_record_time is not None
+            and btime.mjd <= bphsbd_record_time.mjd < etime.mjd
+            and bphsbd.get('t_refcal') is not None
+        ):
             ref_obs = bphsbd['t_refcal']
     except Exception:
         pass
     readiness['refcal_timestamp_utc'] = ref_obs.iso
+    if not (btime.mjd <= ref_obs.mjd < etime.mjd):
+        readiness['reason'] = 'stale_refcal'
+        return readiness
 
     try:
         phacals = sql2phacalX([btime, etime], nrecords=0, neat=True, verbose=False) or []
     except Exception as exc:
-        readiness['reason'] = f'phacal_query_failed: {exc}'
+        readiness['ready'] = True
+        readiness['reason'] = 'ready_phacal_query_failed'
+        readiness['phacal_warning'] = f'phacal_query_failed: {exc}'
         return readiness
 
     valid_phacals = []
@@ -402,7 +413,9 @@ def get_calibration_readiness(tim):
         readiness['latest_phacal_timestamp_utc'] = max(ph['t_pha'] for ph in valid_phacals).iso
 
     if not valid_phacals:
-        readiness['reason'] = 'missing_phacal'
+        readiness['ready'] = True
+        readiness['reason'] = 'ready_without_phacal'
+        readiness['phacal_warning'] = 'missing_phacal'
         return readiness
 
     readiness['ready'] = True
@@ -429,7 +442,8 @@ def find_previous_ready_calibration(tim, max_lookback_days=None):
         readiness = get_calibration_readiness(cal_day)
         if not readiness.get('ready'):
             continue
-        _, lookup_time = get_local_day_bounds(cal_day)
+        _, etime = get_local_day_bounds(cal_day)
+        lookup_time = Time(etime.mjd - 1.0 / 86400.0, format='mjd')
         return {
             'date': cal_day.iso[:10],
             'lookup_time_utc': lookup_time.iso,
@@ -468,6 +482,93 @@ def smart_cal_status_fields(readiness=None, fallback_calibration=None, sql_cal_t
     if message:
         fields['message'] = message
     return fields
+
+
+def summarize_applied_refcal_provenance(records, target_date):
+    """Validate applied SQL refcal provenance and summarize the common record."""
+    if not records:
+        raise ValueError('missing applied refcal provenance')
+
+    required_fields = (
+        'vis',
+        'lookup_time_utc',
+        'source',
+        'mode',
+        'sql_record_time_utc',
+        'refcal_time_utc',
+        'refcal_date_utc',
+    )
+    signatures = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f'refcal provenance record {index} is not a mapping')
+        if record.get('applied') is not True:
+            raise ValueError(f'refcal provenance record {index} was not applied')
+        missing = [field for field in required_fields if not record.get(field)]
+        if missing:
+            raise ValueError(
+                f'refcal provenance record {index} is missing {", ".join(missing)}'
+            )
+        signatures.add(tuple(record[field] for field in (
+            'source',
+            'mode',
+            'sql_record_time_utc',
+            'refcal_time_utc',
+            'refcal_date_utc',
+        )))
+
+    if len(signatures) != 1:
+        raise ValueError('inconsistent applied refcal provenance records')
+
+    source, mode, sql_record_time, refcal_time, refcal_date = signatures.pop()
+    btime, etime = get_local_day_bounds(Time(target_date))
+    refcal_time_value = Time(refcal_time)
+    return {
+        'record_count': len(records),
+        'source': source,
+        'mode': mode,
+        'sql_record_time_utc': sql_record_time,
+        'refcal_time_utc': refcal_time,
+        'refcal_date_utc': refcal_date,
+        'same_day': bool(btime.mjd <= refcal_time_value.mjd < etime.mjd),
+    }
+
+
+def classify_synoptic_refcal_provenance(records, target_date, fits_complete):
+    """Classify a smart SQL product from the refcal records actually applied."""
+    summary = summarize_applied_refcal_provenance(records, target_date)
+    using_fallback = not summary['same_day']
+    if using_fallback:
+        state = PROVISIONAL_SUCCESS_STATE if fits_complete else FALLBACK_PARTIAL_STATE
+        message = (
+            f'Completed with {summary["refcal_date_utc"]} SQL calibration; '
+            f'will be replaced once {Time(target_date).iso[:10]} same-day calibration is ready.'
+        )
+    else:
+        state = 'success' if fits_complete else 'partial'
+        message = None
+    calibration_reason = 'applied_fallback_refcal' if using_fallback else 'applied_same_day_refcal'
+
+    return {
+        'state': state,
+        'message': message,
+        'warning_calibration_date': summary['refcal_date_utc'] if using_fallback else None,
+        'using_fallback_calibration': using_fallback,
+        'needs_same_day_calibration_rerun': using_fallback,
+        'ready': not using_fallback,
+        'reason': calibration_reason,
+        'calibration_ready': not using_fallback,
+        'calibration_reason': calibration_reason,
+        'same_day_calibration_ready': not using_fallback,
+        'same_day_calibration_reason': calibration_reason,
+        'refcal_timestamp_utc': summary['refcal_time_utc'],
+        'applied_refcal_record_count': summary['record_count'],
+        'applied_refcal_source': summary['source'],
+        'applied_refcal_mode': summary['mode'],
+        'applied_refcal_sql_record_time_utc': summary['sql_record_time_utc'],
+        'applied_refcal_time_utc': summary['refcal_time_utc'],
+        'applied_refcal_date_utc': summary['refcal_date_utc'],
+    }
 
 
 def should_enable_smart_cal_check(enable_flag=None):
@@ -623,8 +724,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
                    secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
-                   custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
-                   sql_cal_time=None, force_feature_selfcal=False, imaging_only=False):
+                   custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto',
+                   sql_cal_time=None, force_feature_selfcal=False, imaging_only=False,
+                   refcal_provenance=None):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -659,6 +761,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
        sql_cal_time: optional SQL lookup time override for no-NPZ refcal/phacal
                 selection. Used by cron provisional runs to image with a previous
                 ready calibration day while keeping the target observing date.
+       refcal_provenance: optional mutable list receiving the SQL refcal provenance
+                actually applied to each successfully calibrated input MS.
        force_feature_selfcal: TEST ONLY: force feature self-calibration for all
                 processed SPW groups, bypassing the brightness gate. Default off.
     '''
@@ -892,7 +996,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                              doimage=False, doconcat=True,
                              concatvis=outputvis, keep_orig_ms=False,
                              refcal_sql_mode=refcal_sql_mode,
-                             sql_cal_time=sql_cal_time)
+                             sql_cal_time=sql_cal_time,
+                             refcal_provenance=refcal_provenance)
     else:
         if verbose:
             print(f'Using existing visibility file: {vis}')
@@ -1329,7 +1434,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
              version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
              secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
-             custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
+             custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto',
              sql_cal_time=None, force_feature_selfcal=False, imaging_only=False):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
@@ -1450,6 +1555,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
         statusfile = synoptic_info['statusfile']
         is_wsclean_version = version in WSCLEAN_PIPELINE_VERSIONS
+        refcal_provenance_records = [] if smart_cal_check and is_wsclean_version else None
         readiness = {}
         fallback_calibration = None
         sql_cal_time_for_run = sql_cal_time
@@ -1487,6 +1593,12 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                             'fallback_refcal_timestamp_utc',
                             'fallback_phacal_count',
                             'fallback_latest_phacal_timestamp_utc',
+                            'applied_refcal_record_count',
+                            'applied_refcal_source',
+                            'applied_refcal_mode',
+                            'applied_refcal_sql_record_time_utc',
+                            'applied_refcal_time_utc',
+                            'applied_refcal_date_utc',
                         ):
                             if key in previous_status:
                                 status_extra[key] = previous_status[key]
@@ -1618,7 +1730,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            refcal_sql_mode=refcal_sql_mode,
                                            sql_cal_time=sql_cal_time_for_run,
                                            force_feature_selfcal=force_feature_selfcal,
-                                           imaging_only=imaging_only)
+                                           imaging_only=imaging_only,
+                                           refcal_provenance=refcal_provenance_records)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite_for_run, doimport=doimport,
@@ -1634,7 +1747,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                refcal_sql_mode=refcal_sql_mode,
                                                sql_cal_time=sql_cal_time_for_run,
                                                force_feature_selfcal=force_feature_selfcal,
-                                               imaging_only=imaging_only)
+                                               imaging_only=imaging_only,
+                                               refcal_provenance=refcal_provenance_records)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1667,22 +1781,90 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms'
             )
             outputvis_exists = os.path.exists(outputvis_root) or os.path.exists(f'{outputvis_root}.tar.gz')
+            try:
+                provenance_classification = classify_synoptic_refcal_provenance(
+                    refcal_provenance_records,
+                    datestr,
+                    fits_complete=synoptic_info['fits_complete'],
+                )
+            except ValueError as exc:
+                provenance_error = str(exc)
+                print(f'Failed to validate applied refcal provenance for {datestr}: {provenance_error}')
+                failed_dates.append(datestr)
+                status_extra = smart_cal_status_fields(
+                    readiness,
+                    fallback_calibration=fallback_calibration,
+                    sql_cal_time=sql_cal_time_for_run,
+                    message=run_message,
+                    ran_after_deadline=run_state == 'running_after_deadline',
+                    needs_same_day_calibration_rerun=fallback_calibration is not None,
+                )
+                status_extra.update({
+                    'refcal_provenance_error': provenance_error,
+                    'refcal_provenance_records': refcal_provenance_records or [],
+                })
+                write_pipeline_status(
+                    statusfile,
+                    'failed',
+                    date=datestr,
+                    fits_count=synoptic_info['fits_count'],
+                    fits_expected_count=synoptic_info['fits_expected_count'],
+                    fitsfiles=synoptic_info['existing_fitsfiles'],
+                    outputvis_exists=outputvis_exists,
+                    pipeline_result_type=type(vis_corrected).__name__,
+                    **status_extra,
+                )
+                continue
+
             calibration_warning_updates = set_synoptic_calibration_warning(
                 synoptic_info['existing_fitsfiles'],
-                calibration_date=(fallback_calibration or {}).get('date')
+                calibration_date=provenance_classification['warning_calibration_date'],
             )
-            if fallback_calibration is not None and synoptic_info['fits_complete']:
-                state = PROVISIONAL_SUCCESS_STATE
-                final_message = (
-                    f'Completed with {fallback_calibration["date"]} SQL calibration; '
-                    f'will be replaced once {datestr} same-day calibration is ready.'
+            state = provenance_classification['state']
+            final_message = provenance_classification['message'] or run_message
+            status_extra = smart_cal_status_fields(
+                readiness,
+                fallback_calibration=fallback_calibration,
+                sql_cal_time=sql_cal_time_for_run,
+                message=final_message,
+                ran_after_deadline=run_state == 'running_after_deadline',
+                needs_same_day_calibration_rerun=(
+                    provenance_classification['needs_same_day_calibration_rerun']
+                ),
+            )
+            status_extra.update({
+                key: value
+                for key, value in provenance_classification.items()
+                if key not in ('state', 'message', 'warning_calibration_date')
+            })
+            if provenance_classification['using_fallback_calibration']:
+                status_extra.update({
+                    'fallback_calibration_date': provenance_classification['applied_refcal_date_utc'],
+                    'fallback_refcal_timestamp_utc': provenance_classification['applied_refcal_time_utc'],
+                })
+            calibration_warning_expected = len(synoptic_info['existing_fitsfiles'])
+            if calibration_warning_updates != calibration_warning_expected:
+                warning_error = (
+                    f'updated calibration warning metadata for {calibration_warning_updates} '
+                    f'of {calibration_warning_expected} FITS files'
                 )
-            elif fallback_calibration is not None:
-                state = FALLBACK_PARTIAL_STATE
-                final_message = run_message
-            else:
-                state = 'success' if synoptic_info['fits_complete'] else 'partial'
-                final_message = run_message
+                print(f'Failed to finalize calibration warning metadata for {datestr}: {warning_error}')
+                failed_dates.append(datestr)
+                write_pipeline_status(
+                    statusfile,
+                    'failed',
+                    date=datestr,
+                    fits_count=synoptic_info['fits_count'],
+                    fits_expected_count=synoptic_info['fits_expected_count'],
+                    fitsfiles=synoptic_info['existing_fitsfiles'],
+                    outputvis_exists=outputvis_exists,
+                    calibration_warning_fits_count=calibration_warning_updates,
+                    calibration_warning_fits_expected_count=calibration_warning_expected,
+                    pipeline_result_type=type(vis_corrected).__name__,
+                    error=warning_error,
+                    **status_extra,
+                )
+                continue
             write_pipeline_status(
                 statusfile,
                 state,
@@ -1693,14 +1875,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 outputvis_exists=outputvis_exists,
                 calibration_warning_fits_count=calibration_warning_updates,
                 pipeline_result_type=type(vis_corrected).__name__,
-                **smart_cal_status_fields(
-                    readiness,
-                    fallback_calibration=fallback_calibration,
-                    sql_cal_time=sql_cal_time_for_run,
-                    message=final_message,
-                    ran_after_deadline=run_state == 'running_after_deadline',
-                    needs_same_day_calibration_rerun=fallback_calibration is not None,
-                ),
+                **status_extra,
             )
         if clearcache:
             os.chdir(workdir)
@@ -1767,12 +1942,14 @@ if __name__ == '__main__':
                              'bph_sbd uses saved band phase plus sbd only; '
                              'smooth_bandpass applies the per-channel smooth phase as a phase-only B table '
                              '(subsumes the refcal sbd, no separate ph/sbd tables).')
-    parser.add_argument('--refcal-sql-mode', type=str, default='bph_sbd',
-                        choices=['bph_sbd', 'smb'],
+    parser.add_argument('--refcal-sql-mode', type=str, default='auto',
+                        choices=['auto', 'bph_sbd', 'smb', 'legacy'],
                         help='Refcal apply mode for the no-NPZ SQL path. '
-                             'bph_sbd uses the caltype-14 band phase + sbd tables (default); '
+                             'auto selects fresh caltype-14 BPH+SBD, then fresh caltype-15 SMB, '
+                             'then legacy type-8 BPH + phacal MBD (default); '
+                             'bph_sbd uses the caltype-14 band phase + sbd tables; '
                              'smb applies the caltype-15 smooth phase bandpass as a per-channel '
-                             'phase-only B table.')
+                             'phase-only B table; legacy uses type-8 BPH plus phacal MBD only.')
     parser.add_argument('--sql-cal-time', type=str, default=None,
                         help='Optional SQL calibration lookup timestamp override for no-NPZ SQL runs. '
                              'Cron fallback uses this internally to image a target date with an older '

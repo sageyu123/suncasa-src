@@ -938,10 +938,18 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
                 pltEovsaQlookImage_v3(datestr, spws_v3, vmaxs, vmins, dpis_dict_eo, fig, ax,
                                        overwrite=ovwrite_eovsa, verbose=True, version=eovsa_version,
                                        fits_tag=version_fits_tag, include_fine_bands=include_fine_bands)
-        pltSdoQlookImage(datestr, dpis_dict_sdo, fig, ax,
-                         overwrite=ovwrite_sdo, verbose=True, clearcache=clearcache, debug=debug)
-        pltBbsoQlookImage(datestr, dpis_dict_bbso, fig, ax,
-                          overwrite=ovwrite_bbso, verbose=True, clearcache=clearcache)
+        try:
+            pltSdoQlookImage(datestr, dpis_dict_sdo, fig, ax,
+                             overwrite=ovwrite_sdo, verbose=True, clearcache=clearcache, debug=debug)
+        except Exception as err:
+            print('Skipping optional SDO preview for date {} after error.'.format(datestr))
+            print(err)
+        try:
+            pltBbsoQlookImage(datestr, dpis_dict_bbso, fig, ax,
+                              overwrite=ovwrite_bbso, verbose=True, clearcache=clearcache)
+        except Exception as err:
+            print('Skipping optional BBSO preview for date {} after error.'.format(datestr))
+            print(err)
         dateobs = dateobs + timedelta(days=1)
 
 if __name__ == '__main__':

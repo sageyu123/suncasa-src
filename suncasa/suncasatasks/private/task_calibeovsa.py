@@ -96,6 +96,124 @@ def _valid_sql_bphsbd_arrays(record):
     return (bph, sbd, flag), None
 
 
+def _single_sql_record(record):
+    if isinstance(record, list):
+        return record[-1] if record else None
+    return record
+
+
+def _sql_lookup_local_day_bounds(tim):
+    try:
+        dhr = tim.LocalTime.utcoffset().total_seconds() / 60. / 60.
+    except Exception:
+        dhr = -7.
+    btime = Time(np.fix(tim.mjd + dhr / 24.) - dhr / 24., format='mjd')
+    return btime, Time(btime.mjd + 1., format='mjd')
+
+
+def _sql_record_in_lookup_day(record, lookup_time, label):
+    if not isinstance(record, dict):
+        return False, "{0} record missing".format(label)
+    record_time = record.get("timestamp")
+    if record_time is None:
+        return False, "{0} record has no SQL timestamp".format(label)
+    bday, eday = _sql_lookup_local_day_bounds(lookup_time)
+    if bday.mjd <= record_time.mjd < eday.mjd:
+        return True, None
+    return False, (
+        "{0} SQL timestamp {1} is outside lookup local day {2} to {3}"
+    ).format(label, record_time.iso, bday.iso, eday.iso)
+
+
+def _sql_smb_record_to_refcal(sql_lookup_time):
+    try:
+        smb_rec = sql2refcal_bphaseX(sql_lookup_time)
+    except Exception as exc:
+        return None, "query failed: {0}".format(exc)
+    smb_rec = _single_sql_record(smb_rec)
+    fresh, fresh_reason = _sql_record_in_lookup_day(
+        smb_rec, sql_lookup_time, "SQL smooth-bandpass"
+    )
+    if not fresh:
+        return None, fresh_reason
+    smb_phase = (np.asarray(smb_rec['phase_rad'], dtype=np.float64)
+                 if smb_rec is not None else np.zeros(0))
+    smb_freq = (np.asarray(smb_rec['freq_ghz'], dtype=np.float64).reshape(-1)
+                if smb_rec is not None else np.zeros(0))
+    if smb_rec is None or smb_phase.ndim != 3 or smb_phase.size == 0 or smb_freq.size == 0:
+        return None, "no usable caltype-15 smooth phase bandpass arrays"
+    try:
+        refcal = sql2refcalX(sql_lookup_time)
+    except Exception as exc:
+        raise ValueError(
+            'SQL smooth-bandpass mode needs a type-8 refcal for metadata, '
+            'but sql2refcalX failed for {0}: {1}'.format(sql_lookup_time.iso, exc))
+    type8_time = refcal.get('timestamp')
+    smb_flag = np.asarray(smb_rec['flag'], dtype=np.float64)
+    if smb_flag.shape == smb_phase.shape:
+        smb_phase = np.where(smb_flag != 0, np.nan, smb_phase)
+    refcal['model_phase_fine'] = smb_phase
+    refcal['fine_frequency_ghz'] = smb_freq
+    refcal.pop('lo_model_phase_fine', None)
+    refcal.pop('lo_model_fine_frequency_ghz', None)
+    refcal['type8_timestamp'] = type8_time
+    refcal['sql_smb_timestamp'] = smb_rec.get('timestamp')
+    t_refcal = smb_rec.get('t_refcal')
+    if t_refcal is not None:
+        # Anchor caltable naming and the phacal filter to the SMB record's
+        # t_refcal.  This mirrors the BPH+SBD anchoring below.
+        refcal['sql_smb_t_refcal'] = t_refcal
+        refcal['timestamp'] = t_refcal
+    msg_prompt = ('SQL smooth phase bandpass (caltype 15) found; applying as a '
+                  'per-channel phase-only B table')
+    if t_refcal is not None:
+        msg_prompt += ' with t_refcal {0}'.format(t_refcal.iso)
+    msg_prompt += '.'
+    return refcal, msg_prompt
+
+
+def _time_iso_or_none(value):
+    if value is None:
+        return None
+    return value.iso if hasattr(value, 'iso') else str(value)
+
+
+def _refcal_provenance_entry(msfile, lookup_time, cal_src, refcal,
+                             refcal_npz_mode, is_npz):
+    if is_npz:
+        source = 'calwidget_v2_npz'
+        mode = refcal_npz_mode
+        sql_record_time = None
+        refcal_time = refcal.get('t_bg') or refcal.get('timestamp')
+    elif cal_src == 'SQL BPH+SBD':
+        source = 'sql_bph_sbd'
+        mode = 'bph_sbd'
+        sql_record_time = refcal.get('sql_bphsbd_timestamp')
+        refcal_time = refcal.get('sql_bphsbd_t_refcal') or refcal.get('timestamp')
+    elif cal_src == 'SQL smooth bandpass (caltype 15)':
+        source = 'sql_smooth_bandpass'
+        mode = 'smooth_bandpass'
+        sql_record_time = refcal.get('sql_smb_timestamp')
+        refcal_time = refcal.get('sql_smb_t_refcal') or refcal.get('timestamp')
+    else:
+        source = 'sql_legacy_type8'
+        mode = 'legacy'
+        sql_record_time = refcal.get('type8_timestamp') or refcal.get('timestamp')
+        refcal_time = refcal.get('t_bg') or refcal.get('timestamp')
+
+    refcal_time_utc = _time_iso_or_none(refcal_time)
+    return {
+        'vis': str(msfile),
+        'lookup_time_utc': _time_iso_or_none(lookup_time),
+        'source': source,
+        'mode': mode,
+        'sql_record_time_utc': _time_iso_or_none(sql_record_time),
+        'refcal_time_utc': refcal_time_utc,
+        'refcal_date_utc': refcal_time_utc[:10] if refcal_time_utc else None,
+        'applied': False,
+    }
+
+
 def _attach_sql_bphsbd_refcal(refcal, record, arrays):
     bph, sbd, flag = arrays
     if not isinstance(refcal, dict):
@@ -104,6 +222,7 @@ def _attach_sql_bphsbd_refcal(refcal, record, arrays):
     refcal["resolved_sbd_ns"] = sbd
     refcal["resolved_flag"] = flag
     refcal["sql_bphsbd_t_refcal"] = record.get("t_refcal")
+    refcal["sql_bphsbd_timestamp"] = record.get("timestamp")
     if "timestamp" not in refcal:
         refcal["timestamp"] = record.get("t_refcal") or record.get("timestamp")
     if "t_bg" not in refcal:
@@ -148,7 +267,8 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                flagspw='', doimage=False, imagedir=None, antenna='', timerange=None, spw=None, stokes=None,
                dosplit=False, outputvis=None, doconcat=False, concatvis=None, keep_orig_ms=True,
                keep_corrected_column=False, cal_npz=None, refcal_npz_mode='bph_sbd', secondary_npz=None,
-               force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd', sql_cal_time=None):
+               force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto', sql_cal_time=None,
+               refcal_provenance=None):
     '''
 
     :param vis: EOVSA visibility dataset(s) to be calibrated 
@@ -159,14 +279,20 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
     :param flagant:
     :param stokes:
     :param doconcat:
+    :param refcal_provenance: Optional mutable list receiving one refcal
+        provenance record per successfully processed input MS.
     :return:
     '''
 
     interp0 = interp
     refcal_npz_mode = _normalize_refcal_npz_mode(refcal_npz_mode)
-    refcal_sql_mode = (refcal_sql_mode or 'bph_sbd').strip().lower()
-    if refcal_sql_mode not in ('bph_sbd', 'smb'):
-        raise ValueError("refcal_sql_mode must be 'bph_sbd' or 'smb', got {0!r}".format(refcal_sql_mode))
+    refcal_sql_mode = (refcal_sql_mode or 'auto').strip().lower()
+    if refcal_sql_mode not in ('auto', 'bph_sbd', 'smb', 'legacy'):
+        raise ValueError(
+            "refcal_sql_mode must be 'auto', 'bph_sbd', 'smb', or 'legacy', got {0!r}".format(
+                refcal_sql_mode
+            )
+        )
 
     cal_npz_refcal = None
     cal_npz_phacals = None
@@ -218,6 +344,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
         #    caltable=[os.path.basename(vis).replace('.ms','.'+c) for c in caltype]
 
         try:  # --- begin per-file try block ---
+            pending_refcal_provenance = None
             # get band information
             tb.open(msfile + '/SPECTRAL_WINDOW')
             nspw = tb.nrows()
@@ -285,6 +412,16 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 sql_smb_active = False
                 if cal_npz_refcal is not None:
                     refcal = cal_npz_refcal
+                elif refcal_sql_mode == 'legacy':
+                    refcal = sql2refcalX(sql_lookup_time)
+                    refcal['type8_timestamp'] = refcal.get('timestamp')
+                    cal_src = 'SQL legacy type-8 BPH'
+                    msg_prompt = (
+                        'SQL legacy type-8 BPH refcal selected; skipping SQL BPH+SBD '
+                        'and smooth-bandpass companion records.'
+                    )
+                    casalog.post(msg_prompt)
+                    print(msg_prompt)
                 elif refcal_sql_mode == 'smb':
                     # No-NPZ smooth-bandpass path: read the caltype-15 smooth phase
                     # bandpass record and apply it as a per-channel B table. The
@@ -294,49 +431,15 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     # interpolation drops them) and do NOT set the LO fine fields
                     # (no re-combination).  The SQL15 B table is the full phase
                     # correction for this mode; do not append a separate SBD table.
-                    try:
-                        smb_rec = sql2refcal_bphaseX(sql_lookup_time)
-                    except Exception as exc:
-                        smb_rec = None
-                        print('SQL smooth-bandpass (caltype 15) query failed: {0}'.format(exc))
-                    if isinstance(smb_rec, list):
-                        smb_rec = smb_rec[-1] if smb_rec else None
-                    smb_phase = (np.asarray(smb_rec['phase_rad'], dtype=np.float64)
-                                 if smb_rec is not None else np.zeros(0))
-                    smb_freq = (np.asarray(smb_rec['freq_ghz'], dtype=np.float64).reshape(-1)
-                                if smb_rec is not None else np.zeros(0))
-                    if smb_rec is None or smb_phase.ndim != 3 or smb_phase.size == 0 or smb_freq.size == 0:
+                    smb_result = _sql_smb_record_to_refcal(sql_lookup_time)
+                    if smb_result[0] is None:
                         raise ValueError(
                             'refcal_sql_mode="smb" requested but no usable caltype-15 smooth '
-                            'phase bandpass record was found in SQL for {0}.'.format(sql_lookup_time.iso))
-                    try:
-                        refcal = sql2refcalX(sql_lookup_time)
-                    except Exception as exc:
-                        raise ValueError(
-                            'SQL smooth-bandpass mode needs a type-8 refcal for metadata, '
-                            'but sql2refcalX failed for {0}: {1}'.format(sql_lookup_time.iso, exc))
-                    type8_time = refcal.get('timestamp')
-                    smb_flag = np.asarray(smb_rec['flag'], dtype=np.float64)
-                    if smb_flag.shape == smb_phase.shape:
-                        smb_phase = np.where(smb_flag != 0, np.nan, smb_phase)
-                    refcal['model_phase_fine'] = smb_phase
-                    refcal['fine_frequency_ghz'] = smb_freq
-                    refcal.pop('lo_model_phase_fine', None)
-                    refcal.pop('lo_model_fine_frequency_ghz', None)
-                    refcal['type8_timestamp'] = type8_time
-                    t_refcal = smb_rec.get('t_refcal')
-                    if t_refcal is not None:
-                        # Anchor caltable naming and the phacal filter to the SMB
-                        # record's t_refcal (mirrors the BPH+SBD anchoring above).
-                        refcal['sql_smb_t_refcal'] = t_refcal
-                        refcal['timestamp'] = t_refcal
+                            'phase bandpass record was found in SQL for {0}: {1}.'.format(
+                                sql_lookup_time.iso, smb_result[1]))
+                    refcal, msg_prompt = smb_result
                     sql_smb_active = True
                     cal_src = 'SQL smooth bandpass (caltype 15)'
-                    msg_prompt = ('SQL smooth phase bandpass (caltype 15) found; applying as a '
-                                  'per-channel phase-only B table')
-                    if t_refcal is not None:
-                        msg_prompt += ' with t_refcal {0}'.format(t_refcal.iso)
-                    msg_prompt += '.'
                     casalog.post(msg_prompt)
                     print(msg_prompt)
                 else:
@@ -347,7 +450,12 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                         bphsbd_rec = None
                         bphsbd_reason = "query failed: {0}".format(exc)
                     else:
-                        bphsbd_arrays, bphsbd_reason = _valid_sql_bphsbd_arrays(bphsbd_rec)
+                        bphsbd_rec = _single_sql_record(bphsbd_rec)
+                        bphsbd_fresh, bphsbd_reason = _sql_record_in_lookup_day(
+                            bphsbd_rec, sql_lookup_time, "SQL BPH+SBD"
+                        )
+                        if bphsbd_fresh:
+                            bphsbd_arrays, bphsbd_reason = _valid_sql_bphsbd_arrays(bphsbd_rec)
                     if bphsbd_rec is not None and bphsbd_arrays is not None:
                         try:
                             refcal = sql2refcalX(sql_lookup_time)
@@ -382,12 +490,34 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                             ).format(exc)
                         cal_src = "SQL BPH+SBD"
                     else:
-                        refcal = sql2refcalX(sql_lookup_time)
-                        msg_prompt = (
-                            "SQL refcal BPH+SBD tables not usable ({0}); using SQL type-8 BPH only."
-                        ).format(
-                            bphsbd_reason or "record missing"
-                        )
+                        if refcal_sql_mode == 'auto':
+                            smb_result = _sql_smb_record_to_refcal(sql_lookup_time)
+                            if smb_result[0] is not None:
+                                refcal, msg_prompt = smb_result
+                                sql_smb_active = True
+                                cal_src = 'SQL smooth bandpass (caltype 15)'
+                                msg_prompt = (
+                                    "SQL BPH+SBD tables not usable ({0}); "
+                                ).format(bphsbd_reason or "record missing") + msg_prompt
+                            else:
+                                refcal = sql2refcalX(sql_lookup_time)
+                                cal_src = 'SQL legacy type-8 BPH'
+                                msg_prompt = (
+                                    "SQL BPH+SBD tables not usable ({0}); SQL smooth-bandpass "
+                                    "not usable ({1}); using legacy SQL type-8 BPH + phacal MBD."
+                                ).format(
+                                    bphsbd_reason or "record missing",
+                                    smb_result[1] or "record missing",
+                                )
+                        else:
+                            refcal = sql2refcalX(sql_lookup_time)
+                            cal_src = 'SQL legacy type-8 BPH'
+                            msg_prompt = (
+                                "SQL refcal BPH+SBD tables not usable ({0}); "
+                                "using legacy SQL type-8 BPH + phacal MBD."
+                            ).format(
+                                bphsbd_reason or "record missing"
+                            )
                     casalog.post(msg_prompt)
                     print(msg_prompt)
                 # shape is 15 (nant) x 2 (npol) x 34 (nband)
@@ -438,6 +568,14 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 amp = refcal['amp']
                 amp[np.where(refcal['flag'] == 1)] = 1.
                 t_ref = refcal['timestamp']
+                pending_refcal_provenance = _refcal_provenance_entry(
+                    msfile,
+                    sql_lookup_time,
+                    cal_src,
+                    refcal,
+                    refcal_npz_mode,
+                    cal_npz_refcal is not None,
+                )
                 # find the start and end time of the local day when refcal is registered
                 try:
                     dhr = t_ref.LocalTime.utcoffset().total_seconds() / 60. / 60.
@@ -1022,6 +1160,8 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
             if docalib:
                 clearcal(msfile)
                 applycal(vis=msfile, gaintable=gaintables, spwmap=spwmaps, applymode='calflag', calwt=False)
+                if pending_refcal_provenance is not None:
+                    pending_refcal_provenance['applied'] = True
             if doflag:
                 # flag zeros and NaNs
                 flagdata(vis=msfile, mode='clip', clipzeros=True)
@@ -1088,6 +1228,9 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     # eomap.draw_grid()
 
                 plt.show()
+
+            if pending_refcal_provenance is not None and refcal_provenance is not None:
+                refcal_provenance.append(pending_refcal_provenance)
 
         except Exception as e:
             import traceback as _tb

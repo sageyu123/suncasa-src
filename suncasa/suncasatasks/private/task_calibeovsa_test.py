@@ -988,3 +988,196 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
         return concatvis
     else:
         return outputvis
+
+
+def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
+                                applycal_error=None):
+    from . import task_calibeovsa as production
+
+    scan_start = Time('2026-07-09 13:51:55.500')
+    scan_end = Time('2026-07-09 15:09:56.500')
+
+    class FakeTable:
+        def __init__(self):
+            self.path = ''
+
+        def open(self, path, *args, **kwargs):
+            self.path = str(path)
+
+        def close(self):
+            self.path = ''
+
+        def nrows(self):
+            return 1
+
+        def getcol(self, name, *args, **kwargs):
+            if self.path.endswith('/SPECTRAL_WINDOW'):
+                return {
+                    'NAME': np.array(['band01']),
+                    'NUM_CHAN': np.array([1]),
+                    'REF_FREQUENCY': np.array([1.0e9]),
+                    'TOTAL_BANDWIDTH': np.array([1.0e8]),
+                    'CHAN_FREQ': np.array([[1.0e9]]),
+                }[name]
+            if self.path.endswith('/ANTENNA') and name == 'NAME':
+                return np.array(['eo01', 'eo02'])
+            raise AssertionError('Unexpected getcol({0}) for {1}'.format(name, self.path))
+
+        def getcell(self, name, row):
+            if self.path.endswith('/SPECTRAL_WINDOW') and name == 'CHAN_FREQ':
+                return np.array([1.0e9])
+            if self.path.endswith('/OBSERVATION') and name == 'TIME_RANGE':
+                return np.array([scan_start.mjd, scan_end.mjd]) * 86400.0
+            raise AssertionError('Unexpected getcell({0}) for {1}'.format(name, self.path))
+
+        def putcol(self, *args, **kwargs):
+            return None
+
+    class FakeCasaLog:
+        def origin(self, *args, **kwargs):
+            return None
+
+        def post(self, *args, **kwargs):
+            return None
+
+    msfile = tmp_path / 'UDB20260709135125.ms'
+    msfile.mkdir()
+    caltbdir = tmp_path / 'caltable'
+    caltbdir.mkdir()
+
+    applied = []
+    provenance = []
+
+    def fake_applycal(**kwargs):
+        applied.append(kwargs)
+        if applycal_error is not None:
+            raise applycal_error
+
+    monkeypatch.setattr(production, 'tb', FakeTable())
+    monkeypatch.setattr(production, 'casalog', FakeCasaLog())
+    monkeypatch.setattr(production, 'sql2refcalX', lambda *_args, **_kwargs: dict(legacy))
+    monkeypatch.setattr(production, 'sql2refcal_bphsbdX', lambda *_args, **_kwargs: dict(bphsbd))
+    monkeypatch.setattr(production.db, 'get_reboot', lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(production.ch, 'read_calX', lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(production, 'gencal', lambda **_kwargs: None)
+    monkeypatch.setattr(production, 'clearcal', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(production, 'applycal', fake_applycal)
+
+    result = production.calibeovsa(
+        str(msfile),
+        caltype=['refpha'],
+        caltbdir=str(caltbdir) + '/',
+        docalib=True,
+        doflag=False,
+        refcal_sql_mode='bph_sbd',
+        refcal_provenance=provenance,
+    )
+
+    return str(msfile), scan_start, result, applied, provenance
+
+
+def test_calibeovsa_reports_the_legacy_refcal_actually_applied(monkeypatch, tmp_path):
+    """A stale companion must report the legacy record selected at apply time."""
+    legacy_record_time = Time('2026-07-08 07:12:00.000')
+    legacy_refcal_time = Time('2026-07-08 12:51:52.000')
+    legacy = {
+        'pha': np.zeros((2, 2, 1), dtype=np.float64),
+        'amp': np.ones((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': legacy_record_time,
+        't_bg': legacy_refcal_time,
+        't_ed': Time('2026-07-08 13:39:53.000'),
+    }
+    stale_bphsbd = {
+        'bph_rad': np.zeros((2, 2, 1), dtype=np.float64),
+        'sbd_ns': np.zeros((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': legacy_record_time,
+        't_refcal': legacy_refcal_time,
+    }
+
+    msfile, scan_start, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch, tmp_path, legacy, stale_bphsbd)
+
+    assert result == [msfile]
+    assert len(applied) == 1
+    assert provenance == [{
+        'vis': msfile,
+        'lookup_time_utc': scan_start.iso,
+        'source': 'sql_legacy_type8',
+        'mode': 'legacy',
+        'sql_record_time_utc': legacy_record_time.iso,
+        'refcal_time_utc': legacy_refcal_time.iso,
+        'refcal_date_utc': '2026-07-08',
+        'applied': True,
+    }]
+
+
+def test_calibeovsa_reports_the_fresh_bph_sbd_refcal_actually_applied(monkeypatch, tmp_path):
+    """A fresh companion must expose its own locator and true refcal time."""
+    sql_record_time = Time('2026-07-09 07:12:00.000')
+    refcal_time = Time('2026-07-09 12:52:53.000')
+    legacy = {
+        'pha': np.zeros((2, 2, 1), dtype=np.float64),
+        'amp': np.ones((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': sql_record_time,
+        't_bg': refcal_time,
+        't_ed': Time('2026-07-09 13:46:27.000'),
+    }
+    bphsbd = {
+        'bph_rad': np.zeros((2, 2, 1), dtype=np.float64),
+        'sbd_ns': np.zeros((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': sql_record_time,
+        't_refcal': refcal_time,
+    }
+
+    msfile, scan_start, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch, tmp_path, legacy, bphsbd)
+
+    assert result == [msfile]
+    assert len(applied) == 1
+    assert provenance == [{
+        'vis': msfile,
+        'lookup_time_utc': scan_start.iso,
+        'source': 'sql_bph_sbd',
+        'mode': 'bph_sbd',
+        'sql_record_time_utc': sql_record_time.iso,
+        'refcal_time_utc': refcal_time.iso,
+        'refcal_date_utc': '2026-07-09',
+        'applied': True,
+    }]
+
+
+def test_calibeovsa_does_not_report_a_refcal_when_applycal_fails(monkeypatch, tmp_path):
+    """A failed per-MS apply path must not escape as applied provenance."""
+    sql_record_time = Time('2026-07-09 07:12:00.000')
+    refcal_time = Time('2026-07-09 12:52:53.000')
+    legacy = {
+        'pha': np.zeros((2, 2, 1), dtype=np.float64),
+        'amp': np.ones((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': sql_record_time,
+        't_bg': refcal_time,
+        't_ed': Time('2026-07-09 13:46:27.000'),
+    }
+    bphsbd = {
+        'bph_rad': np.zeros((2, 2, 1), dtype=np.float64),
+        'sbd_ns': np.zeros((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': sql_record_time,
+        't_refcal': refcal_time,
+    }
+
+    _, _, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch,
+        tmp_path,
+        legacy,
+        bphsbd,
+        applycal_error=RuntimeError('applycal failed'),
+    )
+
+    assert result is None
+    assert len(applied) == 1
+    assert provenance == []
