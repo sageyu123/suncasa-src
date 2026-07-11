@@ -56,6 +56,7 @@ def _run_smart_pipeline_case(
     readiness,
     applied_refcal_date,
     warning_update_count=None,
+    fine_spectral_imaging=False,
 ):
     incomplete = {
         "statusfile": str(tmp_path / "status.json"),
@@ -127,6 +128,7 @@ def _run_smart_pipeline_case(
         doimport=True,
         version="v3.0",
         smart_cal_check=True,
+        fine_spectral_imaging=fine_spectral_imaging,
     )
     return captured
 
@@ -426,6 +428,36 @@ def test_pipeline_reruns_provisional_product_with_same_day_provenance(
     assert final_status["same_day_calibration_ready"] is True
     assert final_status["needs_same_day_calibration_rerun"] is False
     assert final_status["applied_refcal_date_utc"] == "2026-07-09"
+
+
+def test_fine_request_bypasses_standard_product_completion(monkeypatch, tmp_path):
+    captured = _run_smart_pipeline_case(
+        monkeypatch,
+        tmp_path,
+        initial_complete=True,
+        previous_status={"state": "success"},
+        readiness={
+            "ready": True,
+            "reason": "ready_without_phacal",
+            "deadline_expired": False,
+            "refcal_timestamp_utc": "2026-07-09 12:52:53.000",
+        },
+        applied_refcal_date="2026-07-09",
+        fine_spectral_imaging=True,
+    )
+
+    assert captured["result"] == {"failed_dates": []}
+    assert len(captured["provenance_lists"]) == 1
+
+
+def test_parentless_fine_only_request_is_rejected_before_pipeline_work():
+    with pytest.raises(ValueError, match="fine_spectral_only is no longer safe"):
+        eovsa_pipeline.pipeline(
+            year=2026,
+            month=7,
+            day=9,
+            fine_spectral_only=True,
+        )
 
 
 def test_pipeline_fails_when_not_all_fits_receive_calibration_warning_metadata(

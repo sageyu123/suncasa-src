@@ -750,14 +750,20 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 primary BPH slots while primary SBD remains authoritative.
        force_lo_hi_smooth_extrap: in ``bph_sbd`` runs, force LO bands to use
                 the HI smooth-model extrapolated phase base instead of LO BPH.
-       fine_spectral_imaging: run an additional WSClean final-imaging pass on
-                finer SPW chunks after the standard final-imaging pass.
-       fine_spectral_only: run only the finer WSClean final-imaging pass from
-                an existing selfcal'd MS product for this date/version/tag.
+       fine_spectral_imaging: bootstrap finer SPW chunks from the freshly
+                imaged coarse parent, run one phase-only refinement, then run
+                fine WSClean final imaging.
+       fine_spectral_only: deprecated parentless resume mode; the request is
+                rejected. Use imaging_only with fine_spectral_imaging so
+                each coarse parent is regenerated first.
        imaging_only: rerun final (coarse + fine if fine_spectral_imaging) WSClean
                 imaging from an existing selfcal'd MS product for this
                 date/version/tag, skipping preprocessing and self-calibration.
-       custom_spws: optional WSClean FrequencySetup SPW grouping override.
+                Fine resume requires an archive minted by the current
+                seven-parent checkpoint path.
+       custom_spws: optional WSClean FrequencySetup SPW grouping override. With
+                fine_spectral_imaging, the exact 24-product 52-band plan is
+                treated as fine outputs over the unchanged seven parents.
        sql_cal_time: optional SQL lookup time override for no-NPZ refcal/phacal
                 selection. Used by cron provisional runs to image with a previous
                 ready calibration day while keeping the target observing date.
@@ -773,6 +779,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
         cal_tag = ''
     if fine_spectral_only:
         fine_spectral_imaging = True
+        raise ValueError(
+            'fine_spectral_only is no longer safe; use imaging_only with '
+            'fine_spectral_imaging to regenerate the coarse parents first.')
     use_imported_scan_ms = bool(cal_npz)
 
     if workdir is None:
@@ -1496,17 +1505,22 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param force_lo_hi_smooth_extrap: force LO bands to use the HI smooth-model
         extrapolated phase base in ``bph_sbd`` runs.
     :type force_lo_hi_smooth_extrap: bool, optional
-    :param fine_spectral_imaging: run an additional WSClean final-imaging pass
-        on finer SPW chunks after the standard final-imaging pass.
+    :param fine_spectral_imaging: bootstrap finer SPW chunks from freshly
+        imaged coarse parents, run one phase-only refinement, and then run fine
+        WSClean final imaging.
     :type fine_spectral_imaging: bool, optional
-    :param fine_spectral_only: run only the finer WSClean final-imaging pass
-        from an existing selfcal'd MS product for this date/version/tag.
+    :param fine_spectral_only: deprecated parentless resume mode; the request
+        is rejected. Use ``imaging_only`` with ``fine_spectral_imaging`` to
+        regenerate each parent first.
     :type fine_spectral_only: bool, optional
     :param imaging_only: rerun final (coarse + fine if fine_spectral_imaging)
         WSClean imaging from an existing selfcal'd MS product for this
-        date/version/tag, skipping preprocessing and self-calibration.
+        date/version/tag, skipping preprocessing and self-calibration. Fine
+        resume requires an archive minted by the current seven-parent path.
     :type imaging_only: bool, optional
     :param custom_spws: optional WSClean FrequencySetup SPW grouping override.
+        With fine imaging, the exact 24-product 52-band plan is treated as fine
+        outputs over the unchanged seven parents.
     :type custom_spws: list or str, optional
     :param sql_cal_time: optional SQL calibration lookup timestamp override.
         This is mainly for cron fallback runs that image the target date using
@@ -1528,6 +1542,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
 
     >>> python eovsa_pipeline.py -h
     """
+    if fine_spectral_only:
+        raise ValueError(
+            'fine_spectral_only is no longer safe; use imaging_only with '
+            'fine_spectral_imaging to regenerate the coarse parents first.')
     smart_cal_check = should_enable_smart_cal_check(smart_cal_check)
     if cal_npz:
         # Calwidget_v2 NPZ supplies refcal+phacal directly, so MySQL readiness
@@ -1572,7 +1590,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms'
             )
             outputvis_exists = os.path.exists(outputvis_root) or os.path.exists(f'{outputvis_root}.tar.gz')
-            if synoptic_info['fits_complete']:
+            # Seven standard daily products do not complete an explicitly
+            # requested hierarchical fine run.  Always enter the run path so
+            # missing/rejected fine children can be (re)attempted.
+            if synoptic_info['fits_complete'] and not fine_spectral_imaging:
                 if previous_state == PROVISIONAL_SUCCESS_STATE:
                     readiness = get_calibration_readiness(t1)
                     if not readiness['ready']:
@@ -1958,15 +1979,19 @@ if __name__ == '__main__':
                         help='For bph_sbd calwidget_v2 NPZ runs, force LO bands to use the '
                              'HI smooth-model extrapolated phase base instead of LO BPH.')
     parser.add_argument('--fine-spectral-imaging', action='store_true', default=False,
-                        help='For WSClean versions, run an additional final-imaging pass on finer SPW chunks.')
+                        help='For WSClean versions, bootstrap fine chunks from freshly imaged coarse '
+                             'parents and run one phase-only refinement before fine imaging.')
     parser.add_argument('--fine-spectral-only', action='store_true', default=False,
-                        help='For WSClean versions, run only finer imaging from the existing selfcal MS product.')
+                        help='Deprecated parentless resume mode; the request is rejected. Use '
+                             '--imaging-only --fine-spectral-imaging instead.')
     parser.add_argument('--imaging-only', action='store_true', default=False,
                         help='Rerun final imaging from the existing selfcal MS archive, skipping '
                              'calibration and self-calibration; combine with --fine-spectral-imaging '
-                             'for fine products.')
+                             'for fine products. Fine resume requires a current seven-parent archive.')
     parser.add_argument('--custom-spws', type=str, nargs='+', default=None,
-                        help='For WSClean versions, override FrequencySetup SPW groupings, e.g. 0~1 2~4 5~7.')
+                        help='For WSClean versions, override FrequencySetup SPW groupings. With '
+                             '--fine-spectral-imaging, the exact 24-product plan preserves the '
+                             'default seven parents and requests fine outputs.')
     parser.add_argument('--force-feature-selfcal', action='store_true', default=False,
                         help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
                              'bypassing the brightness gate. Default off.')
