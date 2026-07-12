@@ -2002,6 +2002,11 @@ def _resolve_fine_spectral_spw_mode(custom_spws, fine_spectral_imaging,
     :rtype: tuple(list(str) or None, list(str) or None)
     """
     normalized = _normalize_spw_list(custom_spws)
+    default_fine_plan = _normalize_spw_list(FINE_SPECTRAL_SPWS_52BAND)
+    if fine_spectral_imaging and normalized is None:
+        if fine_spectral_bootstrap:
+            return None, default_fine_plan
+        return default_fine_plan, None
     if fine_spectral_imaging and fine_spectral_bootstrap and normalized is not None:
         requested_bounds = [_spw_range_bounds(spw) for spw in normalized]
         exact_bounds = [_spw_range_bounds(spw) for spw in FINE_SPECTRAL_SPWS_52BAND]
@@ -2248,6 +2253,33 @@ def _caltable_has_unflagged_solutions(caltable):
     except Exception:
         log_print('WARNING',
                   f"[fine_bootstrap] could not validate phase solutions in {caltable}.\n"
+                  f"{traceback.format_exc()}")
+        return False
+
+
+def _caltable_has_unflagged_solutions_for_spws(caltable, expected_spws):
+    """Return whether every requested SPW has at least one usable solution row."""
+    expected = set(int(spw) for spw in expected_spws)
+    if not expected or not os.path.exists(caltable):
+        return False
+    try:
+        tb.open(caltable)
+        try:
+            nrow = tb.nrows()
+            columns = tb.colnames()
+            if nrow < 1 or 'FLAG' not in columns or 'SPECTRAL_WINDOW_ID' not in columns:
+                return False
+            usable_rows = _unflagged_row_mask(tb.getcol('FLAG'), nrow)
+            spw_ids = np.asarray(tb.getcol('SPECTRAL_WINDOW_ID'), dtype=int).reshape(-1)
+            if spw_ids.size != nrow:
+                return False
+            solved = set(int(spw) for spw in spw_ids[usable_rows])
+            return expected.issubset(solved)
+        finally:
+            tb.close()
+    except Exception:
+        log_print('WARNING',
+                  f"[fine_bootstrap] could not validate per-SPW phase solutions in {caltable}.\n"
                   f"{traceback.format_exc()}")
         return False
 
@@ -2718,6 +2750,7 @@ class MSselfcal:
         self.circular_beam = circular_beam
         self.fits_mask = fits_mask
         self.theoretic_beam = theoretic_beam
+        self.last_wsclean_status = None
 
         # self.intervals_out = None
 
@@ -2779,7 +2812,7 @@ class MSselfcal:
                         beam_size=self.beam_size,
                         theoretic_beam=self.theoretic_beam,
                         circular_beam=self.circular_beam)
-        clean_obj.run(dryrun=False)
+        self.last_wsclean_status = clean_obj.run(dryrun=False)
 
         if clearcache:
             extensions = ['dirty', 'psf', 'residual']
@@ -3104,8 +3137,13 @@ def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
                       caltbs, slfcal_init_obj, imname_init_disk_strlist,
                       freq_setup, dsize, fdens, ri_init,
                       ri_final, tdur, uvmin_l_str_sidx,
-                      overwrite_caltb, pols):
-    """Run disk self-calibration: predict disk model, gaincal, applycal, flag, uvsub."""
+                      overwrite_caltb, pols, pre_disk_outputvis=None):
+    """Run disk self-calibration and optionally snapshot calibrated full-sky data.
+
+    The optional snapshot is taken after the disk solutions and flagging have
+    been applied, but before ``MODEL_DATA`` is replaced with the disk-only
+    model and :func:`uvsub` turns ``CORRECTED_DATA`` into residual data.
+    """
     with pipeline_stage("disk_selfcal", spw=spw, spwstr=spwstr, has_feature_model=slfcal_init_obj is not None):
         delmod(vis=msfile)
         run_start = datetime.now()
@@ -3177,6 +3215,22 @@ def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
 
         flagdata(vis=msfile, mode="tfcrop", spw=spw, action='apply', display='',
                  timecutoff=6.0, freqcutoff=6.0, maxnpieces=2, flagbackup=False)
+
+        if pre_disk_outputvis:
+            for path in (pre_disk_outputvis, f'{pre_disk_outputvis}.flagversions'):
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.exists(path):
+                    os.remove(path)
+            log_print('INFO',
+                      f"[fine_bootstrap] checkpointing calibrated full-sky parent "
+                      f"SPW {spw} before disk subtraction -> {pre_disk_outputvis}")
+            split(vis=msfile, outputvis=pre_disk_outputvis,
+                  spw=spw, datacolumn='corrected')
+            if not os.path.isdir(pre_disk_outputvis):
+                log_print('WARNING',
+                          f"[fine_bootstrap] pre-disk parent checkpoint was not created: "
+                          f"{pre_disk_outputvis}")
 
         # Subtract disk model
         run_start_sub = datetime.now()
@@ -3586,67 +3640,341 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
     return synfitsfiles, imaging_objs
 
 
-def _run_bootstrapped_fine_product(*, parent_msfile, source_sp_index,
-                                   fine_spw, fine_spwstr, fine_msfile,
-                                   workdir, antenna, parent_data_column,
-                                   final_imaging_kwargs):
-    """Image one fine product from an isolated copy of its coarse parent model.
+def _ms_reference_frequencies(msfile):
+    """Return local SPW reference frequencies for an alignment check."""
+    spw_table = tbtool()
+    spw_table.open(os.path.join(msfile, 'SPECTRAL_WINDOW'))
+    try:
+        return np.asarray(spw_table.getcol('REF_FREQUENCY'), dtype=float).reshape(-1)
+    finally:
+        spw_table.close()
 
-    ``splitX`` copies both the parent data column used for coarse imaging and
-    the coarse final image's ``MODEL_DATA``.  The child then gets exactly one
-    phase-only refinement before final imaging.  The parent MS is never
-    calibrated or imaged by this helper.
+
+def _ms_column_has_unflagged_signal_for_spws(msfile, column, expected_spws,
+                                             row_chunk=4096, pols=None):
+    """Return whether every local SPW has finite, nonzero unflagged model data."""
+    expected = set(int(spw) for spw in expected_spws)
+    if not expected:
+        return False
+
+    ddids_by_spw = {
+        spw: _data_description_ids_for_spws(msfile, [spw])
+        for spw in expected
+    }
+    if any(not ddids for ddids in ddids_by_spw.values()):
+        return False
+
+    main_table = tbtool()
+    main_table.open(msfile)
+    try:
+        if column not in main_table.colnames() or 'FLAG' not in main_table.colnames():
+            return False
+        for spw in sorted(expected):
+            has_signal = False
+            for ddid in ddids_by_spw[spw]:
+                subtable = main_table.query(f'DATA_DESC_ID == {ddid}')
+                try:
+                    nrow = subtable.nrows()
+                    for startrow in range(0, nrow, row_chunk):
+                        nread = min(row_chunk, nrow - startrow)
+                        values = np.asarray(
+                            subtable.getcol(column, startrow, nread))
+                        flags = np.asarray(
+                            subtable.getcol('FLAG', startrow, nread), dtype=bool)
+                        if values.shape != flags.shape:
+                            return False
+                        pol_key = str(pols or '').upper().replace(',', '')
+                        if values.ndim > 0 and pol_key in ('XX', 'YY', 'XXYY'):
+                            corr_indices = ([0] if pol_key == 'XX' else
+                                            [1] if pol_key == 'YY' else [0, 1])
+                            if max(corr_indices) >= values.shape[0]:
+                                return False
+                            values = values[corr_indices]
+                            flags = flags[corr_indices]
+                        finite = np.isfinite(values.real) & np.isfinite(values.imag)
+                        if np.any(finite & ~flags & (np.abs(values) > 0.0)):
+                            has_signal = True
+                            break
+                finally:
+                    subtable.close()
+                if has_signal:
+                    break
+            if not has_signal:
+                return False
+        return True
+    finally:
+        main_table.close()
+
+
+def _add_aligned_model_data(source_ms, target_ms, row_chunk=4096,
+                            source_column='DATA'):
+    """Add a saved source model into an exactly row-aligned target MS.
+
+    Both MSes are produced from the same parent with the same SPW selection,
+    but from two deliberately different visibility states.  Refuse to combine
+    them unless row identity and model array shapes agree; silently adding
+    misaligned model rows would make the subsequent calibration meaningless.
     """
-    local_spw_count = len(_spw_id_list(source_sp_index))
-    if local_spw_count < 1:
-        log_print('ERROR',
-                  f"[fine_bootstrap] no source SPWs for fine product {fine_spw}; skipping.")
-        return None
+    source_table = tbtool()
+    target_table = tbtool()
+    source_open = False
+    target_open = False
+    try:
+        source_freqs = _ms_reference_frequencies(source_ms)
+        target_freqs = _ms_reference_frequencies(target_ms)
+        if (source_freqs.shape != target_freqs.shape
+                or not np.allclose(source_freqs, target_freqs, rtol=0.0, atol=1.0)):
+            raise RuntimeError(
+                f"MODEL_DATA SPW-frequency mismatch: source={source_freqs.tolist()}, "
+                f"target={target_freqs.tolist()}")
+
+        source_table.open(source_ms)
+        source_open = True
+        target_table.open(target_ms, nomodify=False)
+        target_open = True
+        source_columns = set(source_table.colnames())
+        target_columns = set(target_table.colnames())
+        row_keys = {'TIME', 'ANTENNA1', 'ANTENNA2', 'DATA_DESC_ID'}
+        missing_source = sorted((row_keys | {source_column}) - source_columns)
+        missing_target = sorted((row_keys | {'MODEL_DATA'}) - target_columns)
+        if missing_source or missing_target:
+            raise RuntimeError(
+                f"MODEL_DATA combine requires row keys {sorted(row_keys)} plus "
+                f"source {source_column} and target MODEL_DATA; "
+                f"source missing={missing_source}, target missing={missing_target}")
+
+        source_nrow = source_table.nrows()
+        target_nrow = target_table.nrows()
+        if source_nrow != target_nrow or source_nrow < 1:
+            raise RuntimeError(
+                f"MODEL_DATA row mismatch: source={source_nrow}, target={target_nrow}")
+
+        for startrow in range(0, source_nrow, row_chunk):
+            nread = min(row_chunk, source_nrow - startrow)
+            identity_columns = ['ANTENNA1', 'ANTENNA2', 'DATA_DESC_ID']
+            identity_columns.extend(
+                column for column in ('FIELD_ID', 'SCAN_NUMBER')
+                if column in source_columns and column in target_columns)
+            for column in identity_columns:
+                source_values = np.asarray(source_table.getcol(column, startrow, nread))
+                target_values = np.asarray(target_table.getcol(column, startrow, nread))
+                if not np.array_equal(source_values, target_values):
+                    raise RuntimeError(
+                        f"MODEL_DATA row alignment failed for {column} at row {startrow}")
+            source_time = np.asarray(source_table.getcol('TIME', startrow, nread), dtype=float)
+            target_time = np.asarray(target_table.getcol('TIME', startrow, nread), dtype=float)
+            if (source_time.shape != target_time.shape
+                    or not np.allclose(source_time, target_time, rtol=0.0, atol=1.0e-6)):
+                raise RuntimeError(
+                    f"MODEL_DATA row alignment failed for TIME at row {startrow}")
+
+            source_model = np.asarray(source_table.getcol(source_column, startrow, nread))
+            target_model = np.asarray(target_table.getcol('MODEL_DATA', startrow, nread))
+            if source_model.shape != target_model.shape:
+                raise RuntimeError(
+                    f"MODEL_DATA shape mismatch at row {startrow}: "
+                    f"source={source_model.shape}, target={target_model.shape}")
+            target_table.putcol('MODEL_DATA', target_model + source_model,
+                                startrow, nread)
+        target_table.flush()
+        return source_nrow
+    finally:
+        if target_open:
+            target_table.close()
+        if source_open:
+            source_table.close()
+
+
+def _predict_fine_disk_model(msfile, disk_model_prefixes, pols):
+    """Predict one uniform-disk model per local child SPW into ``MODEL_DATA``."""
+    if not disk_model_prefixes:
+        raise RuntimeError('fine child has no disk model prefixes')
+    for local_spw, model_prefix in enumerate(disk_model_prefixes):
+        if not glob(f'{model_prefix}*model.fits'):
+            raise RuntimeError(f'fine child disk model is unavailable: {model_prefix}')
+        cmd = (f"{WSCLEAN_BIN} -predict -reorder -spws {local_spw} -pol {pols} "
+               f"-name {model_prefix} -quiet -intervals-out 1 {msfile}")
+        log_print('INFO',
+                  f"[fine_bootstrap] predicting disk for local SPW {local_spw}: {cmd}")
+        subprocess.run(cmd, shell=True, check=True)
+
+
+def _build_fullsky_fine_child(*, pre_disk_parent_ms, residual_parent_ms,
+                              pre_disk_sp_index, residual_sp_index,
+                              fine_msfile, residual_model_ms,
+                              disk_model_prefixes, pols):
+    """Build a child with pre-disk DATA and final parent full-sky MODEL_DATA."""
+    pre_disk_spws = _spw_id_list(pre_disk_sp_index)
+    residual_spws = _spw_id_list(residual_sp_index)
+    if not pre_disk_spws or len(pre_disk_spws) != len(residual_spws):
+        raise RuntimeError(
+            f"fine child SPW selection mismatch: pre-disk={pre_disk_sp_index}, "
+            f"residual={residual_sp_index}")
+    if len(disk_model_prefixes) != len(pre_disk_spws):
+        raise RuntimeError(
+            f"fine child disk-model count mismatch: models={len(disk_model_prefixes)}, "
+            f"SPWs={len(pre_disk_spws)}")
+    if not os.path.isdir(pre_disk_parent_ms):
+        raise RuntimeError(f'pre-disk parent checkpoint is unavailable: {pre_disk_parent_ms}')
+    if not os.path.isdir(residual_parent_ms):
+        raise RuntimeError(f'final residual parent MS is unavailable: {residual_parent_ms}')
+
+    for path in (fine_msfile, f'{fine_msfile}.flagversions', residual_model_ms,
+                 f'{residual_model_ms}.flagversions'):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+
+    with pipeline_stage('fine_bootstrap:split_fullsky_data', spw=residual_sp_index):
+        # DATA in the pre-disk checkpoint is the calibrated parent
+        # CORRECTED_DATA saved by _run_disk_selfcal.
+        split(vis=pre_disk_parent_ms, outputvis=fine_msfile,
+              spw=pre_disk_sp_index, datacolumn='data')
+    if not os.path.isdir(fine_msfile):
+        raise RuntimeError(f'fine full-sky child MS was not created: {fine_msfile}')
+
+    with pipeline_stage('fine_bootstrap:split_final_residual_model', spw=residual_sp_index):
+        # Standard CASA split writes the selected parent MODEL_DATA into the
+        # temporary MS DATA column.  This avoids splitX's shared ``.tmpms``
+        # scratch path and whole-column row-copy behavior.
+        split(vis=residual_parent_ms, outputvis=residual_model_ms,
+              spw=residual_sp_index, datacolumn='model')
+    if not os.path.isdir(residual_model_ms):
+        raise RuntimeError(
+            f'fine residual-model checkpoint was not created: {residual_model_ms}')
+    local_spw_ids = list(range(len(pre_disk_spws)))
+    if not _ms_column_has_unflagged_signal_for_spws(
+            residual_model_ms, 'DATA', local_spw_ids, pols=pols):
+        raise RuntimeError(
+            f'final parent residual model does not contain usable data for '
+            f'every child SPW: {residual_model_ms}')
+
+    clearcal(vis=fine_msfile, addmodel=True)
+    _predict_fine_disk_model(fine_msfile, disk_model_prefixes, pols)
+    _add_aligned_model_data(residual_model_ms, fine_msfile)
+
+    local_spw_count = len(pre_disk_spws)
     local_casa_spw = '0' if local_spw_count == 1 else f'0~{local_spw_count - 1}'
     local_sp_index = ','.join(str(idx) for idx in range(local_spw_count))
-    caltb = os.path.join(workdir, f'caltb_fine_bootstrap_sp{fine_spwstr}.pha')
-    parent_column = str(parent_data_column).upper()
-    if parent_column.startswith('CORRECTED'):
-        split_data_column = 'corrected'
-    elif parent_column == 'DATA':
-        split_data_column = 'data'
-    else:
-        log_print('ERROR',
-                  f"[fine_bootstrap] unsupported parent data column {parent_data_column!r}; "
-                  f"skipping fine product {fine_spw}.")
-        return None
+    return local_casa_spw, local_sp_index
+
+
+def _run_fine_selfcal_round(*, msfile, fine_spw, fine_spwstr,
+                            local_casa_spw, local_sp_index, workdir,
+                            antenna, tdur, pols, bmsize, ri,
+                            seed_caltable, fits_mask=None, clearcache=True):
+    """Run one genuine fine-band image/predict/phase-selfcal round."""
+    round_def = next(rd for rd in SELFCAL_ROUNDS if rd['name'] == 'round1')
+    slfcal_obj = MSselfcal(
+        msfile, ri['time_intervals'], ri['time_intervals_major_avg'],
+        ri['time_intervals_minor_avg'], fine_spw, ri['N1'], ri['N2'], workdir,
+        image_marker='fine_round1', niter=round_def['niter'],
+        briggs=round_def['briggs'], auto_mask=round_def['auto_mask'],
+        auto_threshold=round_def['auto_threshold'], fits_mask=fits_mask,
+        pols=pols, beam_size=bmsize, circular_beam=round_def['circular_beam'],
+        data_column='CORRECTED_DATA', sp_index=local_sp_index)
+    slfcal_obj.run(clearcache=clearcache)
+    if (not slfcal_obj.succeeded
+            or getattr(slfcal_obj, 'last_wsclean_status', None) not in (None, 0)):
+        raise RuntimeError(f'fine self-calibration imaging failed for {fine_spw}')
+
+    fine_caltable = os.path.join(workdir, f'caltb_fine_round1_sp{fine_spwstr}.pha')
+    if os.path.exists(fine_caltable):
+        shutil.rmtree(fine_caltable, ignore_errors=True)
+    solint = f'{tdur * 60 / ri["N1"] / ri["N2"]:.0f}s'
+    gaincal(vis=msfile, caltable=fine_caltable, selectdata=True,
+            uvrange='', spw=local_casa_spw, combine='scan',
+            antenna=f'{antenna}&{antenna}', refant='0', solint=solint,
+            refantmode='flex', gaintype='G', gaintable=[seed_caltable],
+            minsnr=1.0, calmode='p', append=False)
+    local_spws = _spw_id_list(local_casa_spw)
+    if not _caltable_has_unflagged_solutions_for_spws(fine_caltable, local_spws):
+        raise RuntimeError(
+            f'fine round caltable lacks usable solutions for every child SPW: {fine_caltable}')
+    applycal(vis=msfile, selectdata=True, antenna=antenna,
+             spw=local_casa_spw, gaintable=[seed_caltable, fine_caltable],
+             interp='linear', calwt=False, applymode='calonly')
+    return slfcal_obj, fine_caltable
+
+
+def _run_bootstrapped_fine_product(*, pre_disk_parent_ms, residual_parent_ms,
+                                   pre_disk_sp_index, residual_sp_index,
+                                   fine_spw, fine_spwstr, fine_msfile,
+                                   residual_model_ms, disk_model_prefixes,
+                                   workdir, antenna, tdur, pols, bmsize,
+                                   fine_round_ri, final_imaging_kwargs,
+                                   fine_fits_mask=None, clearcache=True):
+    """Bootstrap, self-calibrate, disk-subtract, and image one isolated child.
+
+    The parent stays untouched.  A missing checkpoint/model/solution skips the
+    fine product; this path intentionally has no implicit from-scratch fallback.
+    """
+    seed_caltable = os.path.join(workdir, f'caltb_fine_seed_sp{fine_spwstr}.pha')
+    fine_caltable = os.path.join(workdir, f'caltb_fine_round1_sp{fine_spwstr}.pha')
+    modelrot_dir = os.path.join(
+        workdir, f'modelrot_{os.path.basename(fine_msfile)}_fine_round1')
 
     def cleanup_scratch():
-        for path in (fine_msfile, f'{fine_msfile}.flagversions', caltb,
-                     f'{parent_msfile}.tmpms'):
+        for path in (fine_msfile, f'{fine_msfile}.flagversions', residual_model_ms,
+                     f'{residual_model_ms}.flagversions', seed_caltable,
+                     fine_caltable, modelrot_dir):
             if os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
             elif os.path.exists(path):
                 os.remove(path)
+        image_prefixes = (
+            f'eovsa-major-{os.path.basename(fine_msfile)}-sp{fine_spwstr}-fine_round1',
+            f'eovsa-minor-{os.path.basename(fine_msfile)}-sp{fine_spwstr}-fine_round1',
+        )
+        for image_prefix in image_prefixes:
+            for path in glob(os.path.join(workdir, f'{image_prefix}*')):
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.exists(path):
+                    os.remove(path)
 
     cleanup_scratch()
     fine_result = None
     try:
-        with pipeline_stage('fine_bootstrap:split', spw=fine_spw, spwstr=fine_spwstr):
-            mstl.splitX(parent_msfile, outputvis=fine_msfile,
-                        spw=source_sp_index, datacolumn=split_data_column,
-                        datacolumn2='MODEL_DATA')
-        if not os.path.isdir(fine_msfile):
-            raise RuntimeError(f'fine child MS was not created: {fine_msfile}')
+        local_casa_spw, local_sp_index = _build_fullsky_fine_child(
+            pre_disk_parent_ms=pre_disk_parent_ms,
+            residual_parent_ms=residual_parent_ms,
+            pre_disk_sp_index=pre_disk_sp_index,
+            residual_sp_index=residual_sp_index,
+            fine_msfile=fine_msfile,
+            residual_model_ms=residual_model_ms,
+            disk_model_prefixes=disk_model_prefixes,
+            pols=pols)
+        local_spws = _spw_id_list(local_casa_spw)
 
-        with pipeline_stage('fine_bootstrap:gaincal', spw=fine_spw, spwstr=fine_spwstr):
-            gaincal(vis=fine_msfile, caltable=caltb, selectdata=True,
+        with pipeline_stage('fine_bootstrap:seed_gaincal', spw=fine_spw, spwstr=fine_spwstr):
+            gaincal(vis=fine_msfile, caltable=seed_caltable, selectdata=True,
                     uvrange='', spw=local_casa_spw, combine='scan',
                     antenna=f'{antenna}&{antenna}', refant='0', solint='inf',
                     refantmode='flex', gaintype='G', gaintable=[],
                     minsnr=1.0, calmode='p', append=False)
-        if not _caltable_has_unflagged_solutions(caltb):
-            raise RuntimeError(f'fine phase caltable has no unflagged solutions: {caltb}')
-
-        with pipeline_stage('fine_bootstrap:applycal', spw=fine_spw, spwstr=fine_spwstr):
+        if not _caltable_has_unflagged_solutions_for_spws(seed_caltable, local_spws):
+            raise RuntimeError(
+                f'fine seed caltable lacks usable solutions for every child SPW: {seed_caltable}')
+        with pipeline_stage('fine_bootstrap:seed_applycal', spw=fine_spw, spwstr=fine_spwstr):
             applycal(vis=fine_msfile, selectdata=True, antenna=antenna,
-                     spw=local_casa_spw, gaintable=[caltb], interp='linear',
-                     calwt=False, applymode='calonly')
+                     spw=local_casa_spw, gaintable=[seed_caltable],
+                     interp='linear', calwt=False, applymode='calonly')
+
+        with pipeline_stage('fine_bootstrap:selfcal_round', spw=fine_spw, spwstr=fine_spwstr):
+            _run_fine_selfcal_round(
+                msfile=fine_msfile, fine_spw=fine_spw,
+                fine_spwstr=fine_spwstr, local_casa_spw=local_casa_spw,
+                local_sp_index=local_sp_index, workdir=workdir,
+                antenna=antenna, tdur=tdur, pols=pols, bmsize=bmsize,
+                ri=fine_round_ri, seed_caltable=seed_caltable,
+                fits_mask=fine_fits_mask, clearcache=clearcache)
+
+        with pipeline_stage('fine_bootstrap:disk_subtract', spw=fine_spw, spwstr=fine_spwstr):
+            delmod(vis=fine_msfile)
+            _predict_fine_disk_model(fine_msfile, disk_model_prefixes, pols)
+            uvsub(vis=fine_msfile)
 
         final_kwargs = dict(final_imaging_kwargs)
         final_kwargs.update(msfile=fine_msfile, spw=fine_spw,
@@ -4021,7 +4349,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
                  spws_imaging=None, fits_tag='', fine_spectral_imaging=False,
                  fine_spectral_only=False, custom_spws=None, force_feature_selfcal=False,
-                 imaging_only=False):
+                 imaging_only=False, fine_spectral_bootstrap=False):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -4067,36 +4395,48 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
     :param spws_imaging: Spectral windows to process. If provided, overrides the default spwidx2proc.
     :type spws_imaging: list, optional
     :param custom_spws: Override the default FrequencySetup SPW grouping with
-        explicit ranges such as ``['0~1', '2~4', '5~7']``. With fine imaging,
-        the exact :data:`FINE_SPECTRAL_SPWS_52BAND` plan is instead interpreted
-        as requested fine outputs and preserves the default seven parents.
+        explicit ranges such as ``['0~1', '2~4', '5~7']``. Fine imaging uses
+        these as standalone from-scratch groups unless bootstrap is explicitly
+        enabled and the exact :data:`FINE_SPECTRAL_SPWS_52BAND` plan is supplied.
     :type custom_spws: list or str, optional
-    :param fine_spectral_imaging: If True, bootstrap each finer SPW chunk from
-        its freshly imaged coarse parent's ``MODEL_DATA``, run one phase-only
-        solve on an isolated child MS, and then run fine final imaging.
+    :param fine_spectral_imaging: Request fine SPW products. By default the
+        fine ranges are processed independently from scratch.
     :type fine_spectral_imaging: bool, optional
+    :param fine_spectral_bootstrap: Explicitly use each freshly processed
+        coarse parent to seed an isolated child from pre-disk calibrated data
+        plus the final residual+disk full-sky model, then run one actual fine
+        self-calibration round before child disk subtraction. Defaults to False.
+    :type fine_spectral_bootstrap: bool, optional
     :param fine_spectral_only: Deprecated parentless resume mode. The request
-        is rejected because an archive MS has no trusted coarse-final
-        ``MODEL_DATA`` checkpoint; use ``imaging_only`` with
-        ``fine_spectral_imaging`` to regenerate each parent first.
+        is rejected because an archive MS has no trusted pre-disk parent state.
     :type fine_spectral_only: bool, optional
     :param imaging_only: If True, skip preprocessing and self-calibration and
-        run final (coarse + fine if fine_spectral_imaging) imaging from an
-        existing selfcal MS product. Fine imaging requires the seven-parent
-        provenance marker written by the current pipeline.
+        run final standalone imaging from an existing selfcal MS product.
+        Parent bootstrap is not supported in this mode.
     :type imaging_only: bool, optional
     :return: Dictionary mapping coarse indexes and fine SPW keys to output FITS file paths.
     :rtype: dict
     """
     if fine_spectral_only:
-        fine_spectral_imaging = True
-    custom_spws, requested_fine_spws = _resolve_fine_spectral_spw_mode(
-        custom_spws, fine_spectral_imaging)
-    if fine_spectral_only:
         raise RuntimeError(
             "fine_spectral_only is no longer safe because an archive MS has no trusted "
-            "coarse-final MODEL_DATA checkpoint. Use imaging_only=True with "
-            "fine_spectral_imaging=True to regenerate each parent first.")
+            "pre-disk parent state. Run the requested fine groups from scratch instead.")
+    if fine_spectral_bootstrap and not fine_spectral_imaging:
+        raise ValueError('fine_spectral_bootstrap requires fine_spectral_imaging=True')
+    if fine_spectral_bootstrap and imaging_only:
+        raise ValueError(
+            'fine_spectral_bootstrap requires a full run; imaging_only archives '
+            'do not contain the pre-disk parent state')
+    if fine_spectral_bootstrap and custom_spws is not None:
+        normalized_bootstrap_spws = _normalize_spw_list(custom_spws)
+        if ([_spw_range_bounds(spw) for spw in normalized_bootstrap_spws]
+                != [_spw_range_bounds(spw)
+                    for spw in FINE_SPECTRAL_SPWS_52BAND]):
+            raise ValueError(
+                'fine_spectral_bootstrap accepts only the exact 52-band '
+                'fine-output plan (24 requested groups)')
+    custom_spws, requested_fine_spws = _resolve_fine_spectral_spw_mode(
+        custom_spws, fine_spectral_imaging, fine_spectral_bootstrap)
     if requested_fine_spws is not None:
         log_print('INFO',
                   "Recognized the exact 52-band fine-output plan: preserving the default "
@@ -4117,6 +4457,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         custom_spws=','.join(custom_spws) if custom_spws else None,
         requested_fine_spws=','.join(requested_fine_spws) if requested_fine_spws else None,
         fine_spectral_imaging=fine_spectral_imaging,
+        fine_spectral_bootstrap=fine_spectral_bootstrap,
         fine_spectral_only=fine_spectral_only,
         imaging_only=imaging_only,
     ):
@@ -4245,7 +4586,12 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             date_local = tbg_msfile.date()
         date_str = date_local.strftime('%Y%m%d')
         reftime_daily = Time(datetime.combine(date_local, time(20, 0)))
-        if requested_fine_spws is not None and Time(tbg_msfile).mjd <= SPW_EPOCH_SPLIT_MJD:
+        exact_fine_plan = (custom_spws is not None
+                           and [_spw_range_bounds(spw) for spw in custom_spws]
+                           == [_spw_range_bounds(spw)
+                               for spw in FINE_SPECTRAL_SPWS_52BAND])
+        if ((requested_fine_spws is not None or exact_fine_plan)
+                and Time(tbg_msfile).mjd <= SPW_EPOCH_SPLIT_MJD):
             raise ValueError(
                 "The exact 24-product fine SPW plan is only valid for the 52-band EOVSA setup")
         freq_setup = FrequencySetup(Time(tbg_msfile), spws=custom_spws)
@@ -4276,10 +4622,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         freq = defaultfreq
         nbands = freq_setup.nbands
         fine_output_spws = requested_fine_spws
-        if (fine_spectral_imaging and fine_output_spws is None
+        if (fine_spectral_bootstrap and fine_output_spws is None
                 and custom_spws is None and nbands == 52):
             fine_output_spws = _normalize_spw_list(FINE_SPECTRAL_SPWS_52BAND)
-        if (imaging_only and fine_spectral_imaging and nbands == 52
+        if (imaging_only and fine_spectral_bootstrap and nbands == 52
                 and not _has_fine_bootstrap_parent_marker(msfile)):
             log_print('WARNING',
                       f"[fine_bootstrap] {msfile} predates the seven-parent checkpoint "
@@ -4297,7 +4643,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 if _spw_range_bounds(fine_spw) not in parent_bounds:
                     _remove_fine_spectral_products(
                         imgoutdir, date_str, format_spw(fine_spw), fits_tag=fits_tag)
-            fine_spectral_imaging = False
+            fine_spectral_bootstrap = False
             fine_output_spws = None
 
         for sidx, sp_index in enumerate(spws_indices):
@@ -4323,7 +4669,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         fine_spectral_exclude_bounds = {
             _spw_range_bounds(excl) for excl in PIPELINE_CONFIG.get('fine_spectral_exclude', [])
         }
-        if fine_spectral_imaging:
+        if fine_spectral_bootstrap:
             for sidx, spw in enumerate(spws):
                 if sidx not in spwidx2proc:
                     continue
@@ -4415,6 +4761,10 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                 spwstr = format_spw(spws[sidx])
                 msfile_sp = f'{msname}.sp{spwstr}.slfcaled.ms'
                 caltbs = []
+                pre_disk_parent_ms = None
+                if fine_spectral_bootstrap and fine_imaging_spws.get(sidx):
+                    pre_disk_parent_ms = os.path.join(
+                        workdir, f'{msname}.sp{spwstr}.pre-disk-fullsky.ms')
 
                 with pipeline_stage("spw", spw=spws[sidx], sidx=sidx, spwstr=spwstr, msfile=msfile):
                     if os.path.exists(msfile_sp):
@@ -4591,7 +4941,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                             msfile, sidx, spws[sidx], spwstr, sp_index, workdir, antenna,
                             caltbs, slfcal_init_objs[sidx], imname_init_disk_strlist,
                             freq_setup, dsize, fdens, ri_init, ri_final, tdur,
-                            uvmin_l_str[sidx], overwrite_caltb, pols)
+                            uvmin_l_str[sidx], overwrite_caltb, pols,
+                            pre_disk_outputvis=pre_disk_parent_ms)
                         caltbs_all.append(caltbs)
                     else:
                         # imaging_only: no feature/disk self-calibration; the MS
@@ -4621,7 +4972,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                         outfits_all[sidx] = synfitsfiles[0]
 
                     # --- Step 4b: Optional finer spectral final imaging ---
-                    if fine_spectral_imaging:
+                    if fine_spectral_bootstrap:
                         fine_spws = fine_imaging_spws.get(sidx, [])
                         if fine_spws and not synfitsfiles:
                             log_print('WARNING',
@@ -4639,28 +4990,44 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                 fine_key = f'fine:{fine_spwstr}'
                                 _remove_fine_spectral_products(
                                     imgoutdir, date_str, fine_spwstr, fits_tag=fits_tag)
-                                source_sp_index = _spw_indices_for_range(fine_spw)
-                                if spw_remap is not None:
-                                    source_sp_index = _remap_sp_index_str(source_sp_index, spw_remap)
-                                    if source_sp_index is None:
-                                        log_print('ERROR',
-                                                  f"[archive_spw_remap] skipping fine chunk {fine_spw} for "
-                                                  f"group SPW {spws[sidx]} (sidx={sidx}): SPW index missing "
-                                                  f"from archive remap.")
-                                        continue
+                                fine_start, fine_end = _spw_range_bounds(fine_spw)
+                                parent_start, _ = _spw_range_bounds(spws[sidx])
+                                pre_disk_sp_index = ','.join(
+                                    str(sp - parent_start)
+                                    for sp in range(fine_start, fine_end + 1))
+                                residual_sp_index = _spw_indices_for_range(fine_spw)
                                 _, _, fine_bmsize = freq_setup.get_reffreq_and_cdelt(
                                     fine_spw, return_bmsize=True)
                                 fine_msfile = os.path.join(
                                     workdir, f'{msname}.sp{fine_spwstr}.fine-bootstrap.ms')
+                                residual_model_ms = os.path.join(
+                                    workdir,
+                                    f'{msname}.sp{fine_spwstr}.fine-residual-model.ms')
+                                disk_model_prefixes = [
+                                    os.path.join(
+                                        workdir,
+                                        '-'.join(imname_init_disk_strlist
+                                                 + [f'sp{sp:02d}_adddisk']))
+                                    for sp in range(fine_start, fine_end + 1)
+                                ]
                                 fine_result = _run_bootstrapped_fine_product(
-                                    parent_msfile=msfile,
-                                    source_sp_index=source_sp_index,
+                                    pre_disk_parent_ms=pre_disk_parent_ms,
+                                    residual_parent_ms=msfile,
+                                    pre_disk_sp_index=pre_disk_sp_index,
+                                    residual_sp_index=residual_sp_index,
                                     fine_spw=fine_spw,
                                     fine_spwstr=fine_spwstr,
                                     fine_msfile=fine_msfile,
+                                    residual_model_ms=residual_model_ms,
+                                    disk_model_prefixes=disk_model_prefixes,
                                     workdir=workdir,
                                     antenna=antenna,
-                                    parent_data_column=final_data_column,
+                                    tdur=tdur,
+                                    pols=pols,
+                                    bmsize=fine_bmsize,
+                                    fine_round_ri=round_intervals['round1'],
+                                    fine_fits_mask=fits_mask[sidx],
+                                    clearcache=clearcache,
                                     final_imaging_kwargs={
                                         'sidx': fine_key,
                                         'workdir': workdir,
@@ -4695,6 +5062,14 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                 else:
                                     _remove_fine_spectral_products(
                                         imgoutdir, date_str, fine_spwstr, fits_tag=fits_tag)
+
+                    if pre_disk_parent_ms:
+                        for path in (pre_disk_parent_ms,
+                                     f'{pre_disk_parent_ms}.flagversions'):
+                            if os.path.isdir(path):
+                                shutil.rmtree(path, ignore_errors=True)
+                            elif os.path.exists(path):
+                                os.remove(path)
 
                     # --- Checkpoint this group's slfcaled visibilities NOW ---
                     # uvsub() in later groups' disk self-cal operates on ALL MS
@@ -4908,16 +5283,18 @@ if __name__ == '__main__':
     parser.add_argument('--tr_series_imaging', nargs='*', help='Time ranges for imaging, expects a list of tuples.')
     parser.add_argument('--spws_imaging', nargs='*', help='Spectral windows selected for imaging.')
     parser.add_argument('--custom-spws', nargs='+',
-                        help='Override FrequencySetup SPW groupings. With --fine-spectral-imaging, '
-                             'the exact 24-product plan preserves the seven default parents.')
+                        help='Override FrequencySetup SPW groupings. Fine requests are processed '
+                             'from scratch unless --fine-spectral-bootstrap is also set.')
     parser.add_argument('--fits_tag', type=str, default='',
                         help='Optional tag inserted into synoptic FITS filenames.')
     parser.add_argument('--fine-spectral-imaging', action='store_true',
-                        help='Bootstrap fine SPW chunks from each default parent, run one phase-only '
-                             'solve, then run fine final imaging.')
+                        help='Request fine SPW products; defaults to standalone from-scratch groups.')
+    parser.add_argument('--fine-spectral-bootstrap', action='store_true',
+                        help='Explicitly seed fine children from pre-disk parent data plus the final '
+                             'parent full-sky model, run one fine selfcal round, then subtract the disk.')
     parser.add_argument('--fine-spectral-only', action='store_true',
-                        help='Deprecated parentless resume mode; the request is rejected. Use '
-                             '--imaging-only --fine-spectral-imaging to regenerate parents first.')
+                        help='Deprecated parentless resume mode; the request is rejected. Use a full '
+                             '--fine-spectral-imaging run for standalone fine groups.')
     parser.add_argument('--imaging-only', action='store_true',
                         help='Skip preprocessing and self-calibration and rerun final '
                              '(coarse + fine if --fine-spectral-imaging) imaging from an '
@@ -4955,6 +5332,7 @@ if __name__ == '__main__':
         fits_tag=args.fits_tag,
         custom_spws=args.custom_spws,
         fine_spectral_imaging=args.fine_spectral_imaging,
+        fine_spectral_bootstrap=args.fine_spectral_bootstrap,
         fine_spectral_only=args.fine_spectral_only,
         imaging_only=args.imaging_only,
         force_feature_selfcal=args.force_feature_selfcal,
