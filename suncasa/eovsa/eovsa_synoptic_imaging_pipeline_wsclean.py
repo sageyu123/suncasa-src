@@ -1988,19 +1988,21 @@ def _normalize_spw_list(spws):
     return normalized
 
 
-def _resolve_fine_spectral_spw_mode(custom_spws, fine_spectral_imaging):
-    """Separate the exact 52-band fine plan from the coarse processing groups.
+def _resolve_fine_spectral_spw_mode(custom_spws, fine_spectral_imaging,
+                                    fine_spectral_bootstrap=False):
+    """Resolve scratch versus parent-bootstrapped fine-SPW processing.
 
     Operators historically passed the 24 requested output ranges through
-    ``custom_spws``.  With fine imaging enabled, recognize that exact plan and
-    keep the default seven SPW groups for self-calibration and parent imaging.
-    Other custom groupings retain their existing override semantics.
+    ``custom_spws`` and self-calibrated every range independently. Preserve
+    that safe behavior unless parent bootstrapping is explicitly enabled.
+    With both fine imaging and bootstrapping enabled, recognize the exact plan
+    as requested child outputs and keep the default seven parent groups.
 
     :returns: ``(processing_custom_spws, requested_fine_spws)``.
     :rtype: tuple(list(str) or None, list(str) or None)
     """
     normalized = _normalize_spw_list(custom_spws)
-    if fine_spectral_imaging and normalized is not None:
+    if fine_spectral_imaging and fine_spectral_bootstrap and normalized is not None:
         requested_bounds = [_spw_range_bounds(spw) for spw in normalized]
         exact_bounds = [_spw_range_bounds(spw) for spw in FINE_SPECTRAL_SPWS_52BAND]
         if requested_bounds == exact_bounds:

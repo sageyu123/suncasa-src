@@ -35,7 +35,7 @@ def test_default_coarse_spws_remain_unchanged(pipeline):
     assert pipeline.PIPELINE_CONFIG["spwidx2proc"] == list(range(7))
 
 
-def test_exact_fine_plan_constant_and_mode_resolution(pipeline):
+def test_exact_fine_plan_routes_to_scratch_without_changing_default_parent_plan(pipeline):
     assert pipeline.FINE_SPECTRAL_SPWS_52BAND == FINE_SPWS
     assert len(FINE_SPWS) == 24
 
@@ -43,14 +43,23 @@ def test_exact_fine_plan_constant_and_mode_resolution(pipeline):
         f"{start}~{end}"
         for start, end in map(pipeline._spw_range_bounds, FINE_SPWS)
     ]
-    assert pipeline._resolve_fine_spectral_spw_mode(FINE_SPWS, True) == (
-        None,
-        normalized_fine_spws,
-    )
-    assert pipeline._resolve_fine_spectral_spw_mode(FINE_SPWS, False) == (
+    assert pipeline._resolve_fine_spectral_spw_mode(
+        FINE_SPWS, True, fine_spectral_bootstrap=False) == (
         normalized_fine_spws,
         None,
     )
+    assert pipeline._resolve_fine_spectral_spw_mode(
+        FINE_SPWS, True, fine_spectral_bootstrap=True) == (
+        None,
+        normalized_fine_spws,
+    )
+    assert pipeline._resolve_fine_spectral_spw_mode(
+        FINE_SPWS, False, fine_spectral_bootstrap=True) == (
+        normalized_fine_spws,
+        None,
+    )
+    assert pipeline._resolve_fine_spectral_spw_mode(
+        None, False, fine_spectral_bootstrap=False) == (None, None)
     assert pipeline._resolve_fine_spectral_spw_mode(["2", "5~6"], True) == (
         ["2~2", "5~6"],
         None,
