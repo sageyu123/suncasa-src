@@ -204,101 +204,7 @@ def get_local_day_bounds(tim):
     return btime, etime
 
 
-def get_expected_synoptic_spws(tim, custom_spws=None,
-                                fine_spectral_imaging=False,
-                                fine_spectral_bootstrap=False):
-    """Return the normalized SPW groups required for run completeness.
-
-    Standalone custom/fine runs require the groups they requested. Explicit
-    bootstrap runs require the unchanged coarse parents plus only requested
-    children that are strictly contained by a parent. The 52-band notch-only
-    windows 2 and 3 are not science products and are excluded.
-
-    :param tim: Observation time used to select the frequency setup.
-    :type tim: astropy.time.Time or compatible
-    :param custom_spws: Optional requested SPW groups.
-    :type custom_spws: list[str] or str or None
-    :param fine_spectral_imaging: Whether fine products were requested.
-    :type fine_spectral_imaging: bool
-    :param fine_spectral_bootstrap: Whether hierarchical bootstrap was
-        explicitly requested.
-    :type fine_spectral_bootstrap: bool
-    :returns: Ordered, normalized, de-duplicated expected SPW groups.
-    :rtype: list[str]
-    """
-    from suncasa.eovsa.eovsa_synoptic_imaging_pipeline_wsclean import (
-        FINE_SPECTRAL_SPWS_52BAND,
-        FrequencySetup,
-        _spw_range_bounds,
-    )
-
-    tim = Time(tim)
-    freq_setup = FrequencySetup(tim)
-    parent_spws = list(freq_setup.spws)
-    is_52band = _spw_range_bounds(parent_spws[-1])[1] == 49
-
-    if fine_spectral_bootstrap and not fine_spectral_imaging:
-        raise ValueError('fine_spectral_bootstrap requires fine_spectral_imaging.')
-
-    requested_spws = custom_spws
-    if requested_spws is None and fine_spectral_imaging:
-        requested_spws = FINE_SPECTRAL_SPWS_52BAND
-    if requested_spws is None:
-        requested_spws = parent_spws
-    requested_spws = list(FrequencySetup(tim, spws=requested_spws).spws)
-
-    def is_notch_only(spw):
-        start, end = _spw_range_bounds(spw)
-        return is_52band and 2 <= start <= end <= 3
-
-    def append_unique(output, seen, spw):
-        start, end = _spw_range_bounds(spw)
-        normalized = f'{start}~{end}'
-        bounds = (start, end)
-        if not is_notch_only(normalized) and bounds not in seen:
-            output.append(normalized)
-            seen.add(bounds)
-
-    expected = []
-    seen = set()
-    if fine_spectral_bootstrap:
-        for parent_spw in parent_spws:
-            append_unique(expected, seen, parent_spw)
-        parent_bounds = [_spw_range_bounds(parent_spw) for parent_spw in parent_spws]
-        for child_spw in requested_spws:
-            child_bounds = _spw_range_bounds(child_spw)
-            if any(
-                parent_start <= child_bounds[0] <= child_bounds[1] <= parent_end
-                and child_bounds != (parent_start, parent_end)
-                for parent_start, parent_end in parent_bounds
-            ):
-                append_unique(expected, seen, child_spw)
-    else:
-        for requested_spw in requested_spws:
-            append_unique(expected, seen, requested_spw)
-    return expected
-
-
-def _validate_fine_spectral_bootstrap_spws(custom_spws):
-    """Reject custom bootstrap requests outside the validated exact plan."""
-    if custom_spws is None:
-        return
-    from suncasa.eovsa.eovsa_synoptic_imaging_pipeline_wsclean import (
-        FINE_SPECTRAL_SPWS_52BAND,
-        _normalize_spw_list,
-        _spw_range_bounds,
-    )
-
-    requested = _normalize_spw_list(custom_spws)
-    requested_bounds = [_spw_range_bounds(spw) for spw in requested]
-    exact_bounds = [_spw_range_bounds(spw) for spw in FINE_SPECTRAL_SPWS_52BAND]
-    if requested_bounds != exact_bounds:
-        raise ValueError(
-            'fine_spectral_bootstrap accepts only the exact 52-band '
-            'fine-output plan (24 requested groups).')
-
-
-def get_synoptic_output_info(tim, version='v3.0', fits_tag='', expected_spws=None):
+def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
     """Return the expected synoptic daily FITS products and status file for one day.
 
     When ``fits_tag`` is a non-empty string (e.g. ``'test'`` for calwidget_v2
@@ -317,9 +223,8 @@ def get_synoptic_output_info(tim, version='v3.0', fits_tag='', expected_spws=Non
     imgoutdir = get_synoptic_product_output_dir(tim, version)
     tag = f'.{fits_tag}' if fits_tag else ''
     freq_setup = FrequencySetup(tim)
-    output_spws = freq_setup.spws if expected_spws is None else expected_spws
     fitsfiles = []
-    for spw in output_spws:
+    for spw in freq_setup.spws:
         spwstr = format_spw(spw)
         fitsfiles.append(os.path.join(
             imgoutdir,
@@ -337,10 +242,9 @@ def get_synoptic_output_info(tim, version='v3.0', fits_tag='', expected_spws=Non
     }
 
 
-def summarize_synoptic_outputs(tim, version='v3.0', fits_tag='', expected_spws=None):
+def summarize_synoptic_outputs(tim, version='v3.0', fits_tag=''):
     """Summarize synoptic daily FITS availability for one pipeline day."""
-    info = get_synoptic_output_info(
-        tim, version=version, fits_tag=fits_tag, expected_spws=expected_spws)
+    info = get_synoptic_output_info(tim, version=version, fits_tag=fits_tag)
     existing = [f for f in info['fitsfiles'] if os.path.exists(f)]
     return {
         **info,
@@ -822,7 +726,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
                    custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto',
                    sql_cal_time=None, force_feature_selfcal=False, imaging_only=False,
-                   refcal_provenance=None, fine_spectral_bootstrap=False):
+                   refcal_provenance=None):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -846,26 +750,20 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 primary BPH slots while primary SBD remains authoritative.
        force_lo_hi_smooth_extrap: in ``bph_sbd`` runs, force LO bands to use
                 the HI smooth-model extrapolated phase base instead of LO BPH.
-       fine_spectral_imaging: request finer SPW products. By default, each
-                requested SPW group is imaged from scratch. Set
-                fine_spectral_bootstrap to opt in to hierarchical bootstrap.
-       fine_spectral_bootstrap: explicitly bootstrap fine SPW chunks from the
-                freshly processed coarse parent using the pre-disk visibility
-                state and final parent full-sky model, then run one fine
-                self-calibration round before child disk subtraction. Requires
-                fine_spectral_imaging and a full, non-imaging-only run.
+       fine_spectral_imaging: bootstrap finer SPW chunks from the freshly
+                imaged coarse parent, run one phase-only refinement, then run
+                fine WSClean final imaging.
        fine_spectral_only: deprecated parentless resume mode; the request is
-                rejected. Use a full run with fine_spectral_imaging, or use
-                imaging_only only for non-bootstrap fine products.
+                rejected. Use imaging_only with fine_spectral_imaging so
+                each coarse parent is regenerated first.
        imaging_only: rerun final (coarse + fine if fine_spectral_imaging) WSClean
                 imaging from an existing selfcal'd MS product for this
                 date/version/tag, skipping preprocessing and self-calibration.
-                Hierarchical fine bootstrap is rejected because an archived MS
-                does not contain the required pre-disk parent state.
+                Fine resume requires an archive minted by the current
+                seven-parent checkpoint path.
        custom_spws: optional WSClean FrequencySetup SPW grouping override. With
-                fine_spectral_imaging alone, the exact 24-product 52-band plan
-                is processed as standalone groups. With fine_spectral_bootstrap,
-                it is treated as fine outputs over the unchanged seven parents.
+                fine_spectral_imaging, the exact 24-product 52-band plan is
+                treated as fine outputs over the unchanged seven parents.
        sql_cal_time: optional SQL lookup time override for no-NPZ refcal/phacal
                 selection. Used by cron provisional runs to image with a previous
                 ready calibration day while keeping the target observing date.
@@ -882,21 +780,8 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
     if fine_spectral_only:
         fine_spectral_imaging = True
         raise ValueError(
-            'fine_spectral_only is no longer safe; use a full run with '
-            'fine_spectral_imaging, or imaging_only for non-bootstrap fine products.')
-    if fine_spectral_bootstrap and not fine_spectral_imaging:
-        raise ValueError('fine_spectral_bootstrap requires fine_spectral_imaging.')
-    if fine_spectral_bootstrap and version not in WSCLEAN_PIPELINE_VERSIONS:
-        raise ValueError(
-            'fine_spectral_bootstrap is only supported for WSClean versions: '
-            f'{WSCLEAN_PIPELINE_VERSIONS}')
-    if fine_spectral_bootstrap and imaging_only:
-        raise ValueError(
-            'fine_spectral_bootstrap requires a full run because imaging_only '
-            'archives do not contain the pre-disk parent state.')
-    if fine_spectral_bootstrap:
-        _validate_fine_spectral_bootstrap_spws(custom_spws)
-        print('Fine spectral bootstrap enabled (explicit opt-in).')
+            'fine_spectral_only is no longer safe; use imaging_only with '
+            'fine_spectral_imaging to regenerate the coarse parents first.')
     use_imported_scan_ms = bool(cal_npz)
 
     if workdir is None:
@@ -949,7 +834,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    'pols': pols, 'ncpu': ncpu,
                    'fine_spectral_only': fine_spectral_only,
                    'fine_spectral_imaging': fine_spectral_imaging,
-                   'fine_spectral_bootstrap': fine_spectral_bootstrap,
                    'custom_spws': custom_spws,
                    'force_feature_selfcal': force_feature_selfcal})
         return esip.pipeline_run(slfcaled_vis, outputvis='',
@@ -960,7 +844,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  fits_tag=cal_tag,
                                  fine_spectral_imaging=True,
                                  fine_spectral_only=True,
-                                 fine_spectral_bootstrap=fine_spectral_bootstrap,
                                  custom_spws=custom_spws,
                                  force_feature_selfcal=force_feature_selfcal)
 
@@ -990,7 +873,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    'clearcache': clearcache,
                    'pols': pols, 'ncpu': ncpu,
                    'fine_spectral_imaging': fine_spectral_imaging,
-                   'fine_spectral_bootstrap': fine_spectral_bootstrap,
                    'fine_spectral_only': False,
                    'imaging_only': imaging_only,
                    'custom_spws': custom_spws,
@@ -1002,7 +884,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  overwrite=overwrite,
                                  fits_tag=cal_tag,
                                  fine_spectral_imaging=fine_spectral_imaging,
-                                 fine_spectral_bootstrap=fine_spectral_bootstrap,
                                  custom_spws=custom_spws,
                                  force_feature_selfcal=force_feature_selfcal,
                                  imaging_only=True)
@@ -1146,7 +1027,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'clearcache': clearcache,
                'pols': pols, 'ncpu': ncpu,
                'fine_spectral_imaging': fine_spectral_imaging,
-               'fine_spectral_bootstrap': fine_spectral_bootstrap,
                'fine_spectral_only': fine_spectral_only,
                'custom_spws': custom_spws,
                'force_feature_selfcal': force_feature_selfcal})
@@ -1174,7 +1054,6 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 imgoutdir=imgoutdir, pols=pols, overwrite=overwrite_pipeline,
                                 fits_tag=cal_tag,
                                 fine_spectral_imaging=fine_spectral_imaging,
-                                fine_spectral_bootstrap=fine_spectral_bootstrap,
                                 fine_spectral_only=fine_spectral_only,
                                 custom_spws=custom_spws,
                                 force_feature_selfcal=force_feature_selfcal)
@@ -1565,8 +1444,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
              secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
              custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto',
-             sql_cal_time=None, force_feature_selfcal=False, imaging_only=False,
-             fine_spectral_bootstrap=False):
+             sql_cal_time=None, force_feature_selfcal=False, imaging_only=False):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1627,27 +1505,21 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param force_lo_hi_smooth_extrap: force LO bands to use the HI smooth-model
         extrapolated phase base in ``bph_sbd`` runs.
     :type force_lo_hi_smooth_extrap: bool, optional
-    :param fine_spectral_imaging: request finer SPW products. By default, each
-        requested SPW group is imaged from scratch.
+    :param fine_spectral_imaging: bootstrap finer SPW chunks from freshly
+        imaged coarse parents, run one phase-only refinement, and then run fine
+        WSClean final imaging.
     :type fine_spectral_imaging: bool, optional
-    :param fine_spectral_bootstrap: explicitly bootstrap fine SPW chunks from
-        freshly processed coarse parents using pre-disk visibility state and
-        the final parent full-sky model. Requires ``fine_spectral_imaging`` and
-        a full, non-imaging-only run.
-    :type fine_spectral_bootstrap: bool, optional
     :param fine_spectral_only: deprecated parentless resume mode; the request
-        is rejected. Use a full run with ``fine_spectral_imaging``, or use
-        ``imaging_only`` only for non-bootstrap fine products.
+        is rejected. Use ``imaging_only`` with ``fine_spectral_imaging`` to
+        regenerate each parent first.
     :type fine_spectral_only: bool, optional
     :param imaging_only: rerun final (coarse + fine if fine_spectral_imaging)
         WSClean imaging from an existing selfcal'd MS product for this
-        date/version/tag, skipping preprocessing and self-calibration.
-        Hierarchical fine bootstrap is rejected because the archive lacks the
-        required pre-disk parent state.
+        date/version/tag, skipping preprocessing and self-calibration. Fine
+        resume requires an archive minted by the current seven-parent path.
     :type imaging_only: bool, optional
     :param custom_spws: optional WSClean FrequencySetup SPW grouping override.
-        With fine imaging alone, the exact 24-product 52-band plan is processed
-        as standalone groups. With fine bootstrap, it is treated as fine
+        With fine imaging, the exact 24-product 52-band plan is treated as fine
         outputs over the unchanged seven parents.
     :type custom_spws: list or str, optional
     :param sql_cal_time: optional SQL calibration lookup timestamp override.
@@ -1672,20 +1544,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     """
     if fine_spectral_only:
         raise ValueError(
-            'fine_spectral_only is no longer safe; use a full run with '
-            'fine_spectral_imaging, or imaging_only for non-bootstrap fine products.')
-    if fine_spectral_bootstrap and not fine_spectral_imaging:
-        raise ValueError('fine_spectral_bootstrap requires fine_spectral_imaging.')
-    if fine_spectral_bootstrap and version not in WSCLEAN_PIPELINE_VERSIONS:
-        raise ValueError(
-            'fine_spectral_bootstrap is only supported for WSClean versions: '
-            f'{WSCLEAN_PIPELINE_VERSIONS}')
-    if fine_spectral_bootstrap and imaging_only:
-        raise ValueError(
-            'fine_spectral_bootstrap requires a full run because imaging_only '
-            'archives do not contain the pre-disk parent state.')
-    if fine_spectral_bootstrap:
-        _validate_fine_spectral_bootstrap_spws(custom_spws)
+            'fine_spectral_only is no longer safe; use imaging_only with '
+            'fine_spectral_imaging to regenerate the coarse parents first.')
     smart_cal_check = should_enable_smart_cal_check(smart_cal_check)
     if cal_npz:
         # Calwidget_v2 NPZ supplies refcal+phacal directly, so MySQL readiness
@@ -1710,24 +1570,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     for d in range(ndays):
         t1 = Time(t.mjd - d, format='mjd')
         datestr = t1.iso[:10]
-        is_wsclean_version = version in WSCLEAN_PIPELINE_VERSIONS
-        expected_synoptic_spws = (
-            get_expected_synoptic_spws(
-                t1,
-                custom_spws=custom_spws,
-                fine_spectral_imaging=fine_spectral_imaging,
-                fine_spectral_bootstrap=fine_spectral_bootstrap,
-            )
-            if is_wsclean_version else None
-        )
-        explicit_output_request = bool(
-            is_wsclean_version
-            and (fine_spectral_imaging or custom_spws is not None)
-        )
-        synoptic_info = summarize_synoptic_outputs(
-            t1, version=version, fits_tag=fits_tag,
-            expected_spws=expected_synoptic_spws)
+        synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
         statusfile = synoptic_info['statusfile']
+        is_wsclean_version = version in WSCLEAN_PIPELINE_VERSIONS
         refcal_provenance_records = [] if smart_cal_check and is_wsclean_version else None
         readiness = {}
         fallback_calibration = None
@@ -1900,7 +1745,6 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
                                            secondary_npz=secondary_npz,
                                            fine_spectral_imaging=fine_spectral_imaging,
-                                           fine_spectral_bootstrap=fine_spectral_bootstrap,
                                            fine_spectral_only=fine_spectral_only,
                                            custom_spws=custom_spws,
                                            force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
@@ -1918,7 +1762,6 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                cal_npz=cal_npz, cal_tag=cal_tag, refcal_npz_mode=refcal_npz_mode,
                                                secondary_npz=secondary_npz,
                                                fine_spectral_imaging=fine_spectral_imaging,
-                                               fine_spectral_bootstrap=fine_spectral_bootstrap,
                                                fine_spectral_only=fine_spectral_only,
                                                custom_spws=custom_spws,
                                                force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
@@ -1932,9 +1775,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 print(traceback.format_exc())
                 failed_dates.append(datestr)
                 if smart_cal_check and is_wsclean_version:
-                    synoptic_info = summarize_synoptic_outputs(
-                        t1, version=version, fits_tag=fits_tag,
-                        expected_spws=expected_synoptic_spws)
+                    synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
                     write_pipeline_status(
                         statusfile,
                         'failed',
@@ -1954,9 +1795,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                     )
                 continue
         if smart_cal_check and is_wsclean_version:
-            synoptic_info = summarize_synoptic_outputs(
-                t1, version=version, fits_tag=fits_tag,
-                expected_spws=expected_synoptic_spws)
+            synoptic_info = summarize_synoptic_outputs(t1, version=version, fits_tag=fits_tag)
             outputvis_root = os.path.join(
                 udbmsslfcaleddir,
                 t1.datetime.strftime('%Y%m'),
@@ -2059,18 +1898,6 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                 pipeline_result_type=type(vis_corrected).__name__,
                 **status_extra,
             )
-        elif explicit_output_request:
-            synoptic_info = summarize_synoptic_outputs(
-                t1, version=version, fits_tag=fits_tag,
-                expected_spws=expected_synoptic_spws)
-
-        if explicit_output_request and not synoptic_info['fits_complete']:
-            if datestr not in failed_dates:
-                failed_dates.append(datestr)
-            print(
-                f'Explicit output request for {datestr} is incomplete: '
-                f'{synoptic_info["fits_count"]}/'
-                f'{synoptic_info["fits_expected_count"]} daily FITS products found.')
         if clearcache:
             os.chdir(workdir)
             os.system('rm -rf {}'.format(subdir))
@@ -2152,26 +1979,19 @@ if __name__ == '__main__':
                         help='For bph_sbd calwidget_v2 NPZ runs, force LO bands to use the '
                              'HI smooth-model extrapolated phase base instead of LO BPH.')
     parser.add_argument('--fine-spectral-imaging', action='store_true', default=False,
-                        help='For WSClean versions, request fine SPW products. Requested groups are '
-                             'imaged from scratch unless --fine-spectral-bootstrap is also set.')
-    parser.add_argument('--fine-spectral-bootstrap', action='store_true', default=False,
-                        help='Explicitly bootstrap fine chunks from freshly processed coarse parents '
-                             'using pre-disk visibility state and the final parent full-sky model, '
-                             'then run one fine self-calibration round before child disk subtraction. '
-                             'Requires --fine-spectral-imaging and is incompatible with --imaging-only.')
+                        help='For WSClean versions, bootstrap fine chunks from freshly imaged coarse '
+                             'parents and run one phase-only refinement before fine imaging.')
     parser.add_argument('--fine-spectral-only', action='store_true', default=False,
-                        help='Deprecated parentless resume mode; the request is rejected. Use a full '
-                             '--fine-spectral-imaging run, or --imaging-only only for non-bootstrap '
-                             'fine products.')
+                        help='Deprecated parentless resume mode; the request is rejected. Use '
+                             '--imaging-only --fine-spectral-imaging instead.')
     parser.add_argument('--imaging-only', action='store_true', default=False,
                         help='Rerun final imaging from the existing selfcal MS archive, skipping '
                              'calibration and self-calibration; combine with --fine-spectral-imaging '
-                             'for standalone fine products. Hierarchical fine bootstrap is not supported.')
+                             'for fine products. Fine resume requires a current seven-parent archive.')
     parser.add_argument('--custom-spws', type=str, nargs='+', default=None,
-                        help='For WSClean versions, override FrequencySetup SPW groupings. With fine '
-                             'imaging alone, the exact 24-product plan is processed as standalone '
-                             'groups; --fine-spectral-bootstrap preserves the seven parents and '
-                             'treats that plan as fine outputs.')
+                        help='For WSClean versions, override FrequencySetup SPW groupings. With '
+                             '--fine-spectral-imaging, the exact 24-product plan preserves the '
+                             'default seven parents and requests fine outputs.')
     parser.add_argument('--force-feature-selfcal', action='store_true', default=False,
                         help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
                              'bypassing the brightness gate. Default off.')
@@ -2193,8 +2013,7 @@ if __name__ == '__main__':
                           args.force_lo_hi_smooth_extrap, refcal_sql_mode=args.refcal_sql_mode,
                           sql_cal_time=args.sql_cal_time,
                           force_feature_selfcal=args.force_feature_selfcal,
-                          imaging_only=args.imaging_only,
-                          fine_spectral_bootstrap=args.fine_spectral_bootstrap)
+                          imaging_only=args.imaging_only)
 
     # Exit nonzero if any date failed so wrappers (set -e) do not treat a core
     # imaging/calibration failure as success and proceed to FITS/JP2/preview steps.
