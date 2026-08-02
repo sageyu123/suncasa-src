@@ -46,8 +46,11 @@ from eovsapy.calibeovsa_bph_sbd import (
     _triplet_bph_sbd_terms_for_band,
     _bph_candidate_for_band,
     _bph_sbd_phase_base_for_band,
+    sample_refcal_bps_for_band,
     load_calwidget_v2_npz,
     _attach_secondary_bph_refcal,
+    resolve_bph_sbd_tables,
+    recenter_bph_rad,
     REFCAL_NPZ_MODES,
 )
 
@@ -143,6 +146,83 @@ def flag_phambd_by_spw(caltb, flagspw='0~1'):
     return True
 
 
+def _bps_candidate_code_for_source(source):
+    """Return the BPS candidate code for a resolved BPH source."""
+
+    if source == 'band_phase':
+        return 1
+    if source == 'secondary_band_phase':
+        return 2
+    return 0
+
+
+def _refcal_bps_payload_for_spw(
+        refcal, candidate_code, phase_flag, band_id, target_freq_ghz, nant):
+    """Build one SPW's phase-only residual BPS payload.
+
+    :param refcal: Primary NPZ refcal dictionary.
+    :type refcal: dict
+    :param candidate_code: Per-antenna/polarization source codes; 1 selects
+        primary measured BPH, 2 selects secondary measured BPH, and 0 is an
+        identity tier.
+    :type candidate_code: array-like
+    :param phase_flag: Per-antenna/polarization BPH invalid flags.
+    :type phase_flag: array-like
+    :param band_id: One-based EOVSA band identifier.
+    :type band_id: int
+    :param target_freq_ghz: Science channel frequencies in GHz.
+    :type target_freq_ghz: array-like
+    :param nant: Number of antenna rows in the CASA table.
+    :type nant: int
+    :returns: ``(cparam, flag, applied_slots, measured_slots)`` with arrays
+        shaped ``(nant, 2, nchan)``.
+    :rtype: tuple[numpy.ndarray, numpy.ndarray, int, int]
+    """
+
+    target = np.asarray(target_freq_ghz, dtype=np.float64).reshape(-1)
+    cparam = np.ones((int(nant), 2, target.size), dtype=np.complex128)
+    flag = np.zeros((int(nant), 2, target.size), dtype=np.bool_)
+    codes = np.asarray(candidate_code)
+    invalid = np.asarray(phase_flag)
+    if (
+        codes.ndim != 2
+        or invalid.ndim != 2
+        or codes.shape[1] < 2
+        or invalid.shape[1] < 2
+    ):
+        flag[:] = True
+        return cparam, flag, 0, 0
+
+    covered_nant = min(int(nant), codes.shape[0], invalid.shape[0])
+    secondary = refcal.get('secondary_bph_refcal')
+    applied_slots = 0
+    measured_slots = 0
+    for ant_i in range(covered_nant):
+        for pol_i in range(2):
+            if invalid[ant_i, pol_i] != 0:
+                flag[ant_i, pol_i, :] = True
+                continue
+            code = int(codes[ant_i, pol_i])
+            if code not in (1, 2):
+                continue
+            measured_slots += 1
+            candidate = refcal if code == 1 else (
+                secondary if isinstance(secondary, dict) else {}
+            )
+            bps_phase, applied = sample_refcal_bps_for_band(
+                candidate,
+                ant_i,
+                pol_i,
+                band_id,
+                target,
+            )
+            if applied:
+                cparam[ant_i, pol_i, :] = np.exp(1j * bps_phase)
+                applied_slots += 1
+    flag[covered_nant:, :, :] = True
+    return cparam, flag, applied_slots, measured_slots
+
+
 def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, doflag=True, flagant='',
                flagspw='', doimage=False, imagedir=None, antenna='', timerange=None, spw=None, stokes=None,
                dosplit=False, outputvis=None, doconcat=False, concatvis=None, keep_orig_ms=True,
@@ -227,6 +307,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
             cfreqs_spw = np.asarray([
                 float(np.mean(tb.getcell('CHAN_FREQ', s))) for s in range(nspw)
             ], dtype=np.float64)
+            chan_freqs_per_spw = [
+                np.asarray(tb.getcell('CHAN_FREQ', s), dtype=np.float64).reshape(-1)
+                for s in range(nspw)
+            ]
 
             tb.close()
             tb.open(msfile + '/ANTENNA')
@@ -321,14 +405,64 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 use_npz_triplets = bool(cal_npz_refcal is not None and refcal_npz_mode == 'triplet' and triplet)
                 use_npz_smooth_model = bool(cal_npz_refcal is not None and refcal_npz_mode == 'smooth_model')
                 use_npz_bph_sbd = bool(cal_npz_refcal is not None and refcal_npz_mode == 'bph_sbd')
-                resolved_bph = np.asarray(refcal.get('resolved_bph_rad', []), dtype=np.float64)
-                resolved_sbd = np.asarray(refcal.get('resolved_sbd_ns', []), dtype=np.float64)
-                resolved_flag = np.asarray(refcal.get('resolved_flag', []), dtype=np.float64)
+                resolved_source = None
+                if use_npz_bph_sbd:
+                    resolved_nband = max(
+                        52,
+                        int(np.asarray(refcal.get('fghz', [])).size),
+                        max(bd) + 1 if bd else 0,
+                    )
+                    (
+                        resolved_bph,
+                        resolved_sbd,
+                        resolved_flag,
+                        resolved_source,
+                        resolved_ref_freq,
+                    ) = resolve_bph_sbd_tables(
+                        refcal,
+                        nant=nant - 1,
+                        nband=resolved_nband,
+                        force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
+                        return_sources=True,
+                        return_ref_freqs=True,
+                    )
+                else:
+                    resolved_bph = np.asarray(
+                        refcal.get('resolved_bph_rad', []),
+                        dtype=np.float64,
+                    )
+                    resolved_sbd = np.asarray(
+                        refcal.get('resolved_sbd_ns', []),
+                        dtype=np.float64,
+                    )
+                    resolved_flag = np.asarray(
+                        refcal.get('resolved_flag', []),
+                        dtype=np.float64,
+                    )
+                    resolved_ref_freq = np.full(
+                        resolved_bph.shape,
+                        np.nan,
+                        dtype=np.float64,
+                    )
+                    saved_band_ref = np.asarray(
+                        refcal.get('fghz', []),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    if resolved_ref_freq.ndim == 3:
+                        nband_ref = min(
+                            resolved_ref_freq.shape[2],
+                            saved_band_ref.size,
+                        )
+                        resolved_ref_freq[:, :, :nband_ref] = (
+                            saved_band_ref[:nband_ref][None, None, :]
+                        )
                 use_resolved_tables = bool(
-                    not force_lo_hi_smooth_extrap
+                    (use_npz_bph_sbd or not force_lo_hi_smooth_extrap)
                     and resolved_bph.ndim == 3
                     and resolved_sbd.ndim == 3
                     and resolved_flag.ndim == 3
+                    and resolved_ref_freq.ndim == 3
+                    and resolved_ref_freq.shape == resolved_bph.shape
                 )
                 smooth_sbd = None
                 if use_npz_smooth_model or use_npz_bph_sbd:
@@ -377,6 +511,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 calamp = np.zeros((nspw, nant - 1, 2))
                 mbd_ref_ghz = float(cfreq_spw0) * 1e-9
                 phase_flag_spw = np.ones((nant - 1, 2, nspw), dtype=np.int32)
+                bps_candidate_spw = np.zeros((nant - 1, 2, nspw), dtype=np.uint8)
                 selected_npz_models = set()
                 band_phase = np.asarray(refcal.get('band_phase_rad', []), dtype=np.float64)
                 band_phase_flag = np.asarray(refcal.get('band_phase_flag', []), dtype=np.int32)
@@ -415,19 +550,59 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                     and n < resolved_flag.shape[0]
                                     and p < resolved_flag.shape[1]
                                     and band_i < resolved_flag.shape[2]
+                                    and n < resolved_ref_freq.shape[0]
+                                    and p < resolved_ref_freq.shape[1]
+                                    and band_i < resolved_ref_freq.shape[2]
                                 ):
                                     ph = resolved_bph[n, p, band_i]
                                     sb = resolved_sbd[n, p, band_i]
                                     fl = resolved_flag[n, p, band_i]
+                                    source_ref_freq_ghz = (
+                                        resolved_ref_freq[n, p, band_i]
+                                    )
                                 else:
                                     ph = 0.0
                                     sb = np.nan
                                     fl = 1.0
-                                flagged = bool(fl) or not np.isfinite(sb)
+                                    source_ref_freq_ghz = np.nan
+                                flagged = (
+                                    bool(fl)
+                                    or not np.isfinite(sb)
+                                    or not np.isfinite(source_ref_freq_ghz)
+                                )
                                 phase_flag_spw[n, p, s] = 1 if flagged else 0
-                                phase_rad = 0.0 if (flagged or not np.isfinite(ph)) else float(ph)
+                                phase_rad = (
+                                    0.0
+                                    if (flagged or not np.isfinite(ph))
+                                    else recenter_bph_rad(
+                                        ph,
+                                        sb,
+                                        source_ref_freq_ghz,
+                                        float(cfreqs_spw[s]) * 1e-9,
+                                    )
+                                )
+                                if not np.isfinite(phase_rad):
+                                    flagged = True
+                                    phase_flag_spw[n, p, s] = 1
+                                    phase_rad = 0.0
                                 para_sbd.append(0.0 if flagged else float(sb))
-                                selected_npz_models.add('resolved_tables')
+                                source = 'resolved_tables'
+                                if use_npz_bph_sbd:
+                                    if (
+                                        isinstance(resolved_source, np.ndarray)
+                                        and resolved_source.ndim == 3
+                                        and n < resolved_source.shape[0]
+                                        and p < resolved_source.shape[1]
+                                        and band_i < resolved_source.shape[2]
+                                    ):
+                                        source = str(
+                                            resolved_source[n, p, band_i]
+                                        )
+                                    if not flagged:
+                                        bps_candidate_spw[n, p, s] = (
+                                            _bps_candidate_code_for_source(source)
+                                        )
+                                selected_npz_models.add(source)
                             elif band_triplet:
                                 phase_rad = _triplet_value(
                                     band_triplet, 'phi_band_rad', n, p, band_i, default=np.nan
@@ -493,6 +668,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                 if flagged or not np.isfinite(phase_rad):
                                     phase_rad = 0.0
                                 para_sbd.append(0.0 if flagged else float(sbd_ns))
+                                if not flagged:
+                                    bps_candidate_spw[n, p, s] = (
+                                        _bps_candidate_code_for_source(source)
+                                    )
                                 selected_npz_models.add(source)
                             else:
                                 phase_rad = pha[n, p, band_i]
@@ -625,6 +804,83 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 refcal_gaintables = [caltb_pha]
                 gaintables.append(caltb_pha)
                 spwmaps.append([])
+                if use_npz_bph_sbd:
+                    caltb_bps = (
+                        dirname
+                        + t_ref.isot[:-4].replace(':', '').replace('-', '')
+                        + refcal_npz_suffix
+                        + '.refbps'
+                    )
+                    if os.path.exists(caltb_bps):
+                        shutil.rmtree(caltb_bps)
+                    bandpass(
+                        vis=msfile,
+                        caltable=caltb_bps,
+                        solint='inf',
+                        refant='eo01',
+                        minblperant=0,
+                        minsnr=0,
+                        bandtype='B',
+                        docallib=False,
+                    )
+                    bps_applied_slots = 0
+                    bps_measured_slots = 0
+                    tb.open(caltb_bps, nomodify=False)
+                    for ll in range(nspw):
+                        nchan_ll = int(bd_nchan[ll])
+                        freq_ghz = (
+                            np.asarray(
+                                chan_freqs_per_spw[ll],
+                                dtype=np.float64,
+                            ).reshape(-1)
+                            * 1e-9
+                        )
+                        if freq_ghz.size != nchan_ll:
+                            raise ValueError(
+                                'SPW {0:d} NUM_CHAN={1:d} but CHAN_FREQ has {2:d} values'.format(
+                                    ll,
+                                    nchan_ll,
+                                    freq_ghz.size,
+                                )
+                            )
+                        cp, fl, applied_count, measured_count = (
+                            _refcal_bps_payload_for_spw(
+                                refcal,
+                                bps_candidate_spw[:, :, ll],
+                                phase_flag_spw[:, :, ll],
+                                int(bd[ll]) + 1,
+                                freq_ghz,
+                                nant,
+                            )
+                        )
+                        bps_applied_slots += int(applied_count)
+                        bps_measured_slots += int(measured_count)
+                        cp_table = np.moveaxis(cp, 0, 2)
+                        flag_table = np.moveaxis(fl, 0, 2)
+                        tb.putcol('CPARAM', cp_table, ll * nant, nant)
+                        tb.putcol('FLAG', flag_table, ll * nant, nant)
+                        tb.putcol(
+                            'SNR',
+                            np.where(flag_table, 0.0, 100.0),
+                            ll * nant,
+                            nant,
+                        )
+                        paramerr = tb.getcol('PARAMERR', ll * nant, nant)
+                        tb.putcol('PARAMERR', paramerr * 0, ll * nant, nant)
+                    tb.close()
+                    gaintables.append(caltb_bps)
+                    refcal_gaintables.append(caltb_bps)
+                    spwmaps.append([])
+                    msg_prompt = (
+                        'Validated residual BPS applied to {0:d} of {1:d} '
+                        'measured-BPH antenna/pol/SPW slots; table={2}'
+                    ).format(
+                        bps_applied_slots,
+                        bps_measured_slots,
+                        os.path.basename(caltb_bps),
+                    )
+                    casalog.post(msg_prompt)
+                    print(msg_prompt)
                 if use_npz_triplets or use_npz_smooth_model or use_npz_bph_sbd or use_resolved_tables:
                     delay_table_kinds = [('sbd', para_sbd, 'sbd', True)]
                     if use_npz_triplets:
@@ -991,7 +1247,9 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
 
 
 def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
-                                applycal_error=None):
+                                applycal_error=None, bps=None,
+                                refcal_sql_mode='auto',
+                                gencal_calls=None):
     from . import task_calibeovsa as production
 
     scan_start = Time('2026-07-09 13:51:55.500')
@@ -1008,6 +1266,8 @@ def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
             self.path = ''
 
         def nrows(self):
+            if self.path.endswith('/ANTENNA'):
+                return 2
             return 1
 
         def getcol(self, name, *args, **kwargs):
@@ -1021,11 +1281,15 @@ def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
                 }[name]
             if self.path.endswith('/ANTENNA') and name == 'NAME':
                 return np.array(['eo01', 'eo02'])
+            if self.path.endswith('.refbps') and name == 'PARAMERR':
+                return np.zeros((2, 1, 2), dtype=np.float64)
             raise AssertionError('Unexpected getcol({0}) for {1}'.format(name, self.path))
 
         def getcell(self, name, row):
             if self.path.endswith('/SPECTRAL_WINDOW') and name == 'CHAN_FREQ':
                 return np.array([1.0e9])
+            if self.path.endswith('/SPECTRAL_WINDOW') and name == 'CHAN_WIDTH':
+                return np.array([1.0e8])
             if self.path.endswith('/OBSERVATION') and name == 'TIME_RANGE':
                 return np.array([scan_start.mjd, scan_end.mjd]) * 86400.0
             raise AssertionError('Unexpected getcell({0}) for {1}'.format(name, self.path))
@@ -1057,9 +1321,19 @@ def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
     monkeypatch.setattr(production, 'casalog', FakeCasaLog())
     monkeypatch.setattr(production, 'sql2refcalX', lambda *_args, **_kwargs: dict(legacy))
     monkeypatch.setattr(production, 'sql2refcal_bphsbdX', lambda *_args, **_kwargs: dict(bphsbd))
+    monkeypatch.setattr(production, 'sql2refcal_bpsX', lambda *_args, **_kwargs: bps)
     monkeypatch.setattr(production.db, 'get_reboot', lambda *_args, **_kwargs: [])
     monkeypatch.setattr(production.ch, 'read_calX', lambda *_args, **_kwargs: (None, None))
-    monkeypatch.setattr(production, 'gencal', lambda **_kwargs: None)
+    monkeypatch.setattr(
+        production,
+        'gencal',
+        lambda **kwargs: (
+            gencal_calls.append(kwargs)
+            if gencal_calls is not None
+            else None
+        ),
+    )
+    monkeypatch.setattr(production, 'bandpass', lambda **_kwargs: None)
     monkeypatch.setattr(production, 'clearcal', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(production, 'applycal', fake_applycal)
 
@@ -1069,7 +1343,7 @@ def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
         caltbdir=str(caltbdir) + '/',
         docalib=True,
         doflag=False,
-        refcal_sql_mode='bph_sbd',
+        refcal_sql_mode=refcal_sql_mode,
         refcal_provenance=provenance,
     )
 
@@ -1146,6 +1420,13 @@ def test_calibeovsa_reports_the_fresh_bph_sbd_refcal_actually_applied(monkeypatc
         'sql_record_time_utc': sql_record_time.iso,
         'refcal_time_utc': refcal_time.iso,
         'refcal_date_utc': '2026-07-09',
+        'bps_status': 'skipped',
+        'bps_reason': (
+            'no type-16 records exist in the lookup local day; selected '
+            'historical type-14-only BPH+SBD'
+        ),
+        'bps_sql_record_time_utc': None,
+        'bps_product_digest': None,
         'applied': True,
     }]
 
@@ -1181,3 +1462,693 @@ def test_calibeovsa_does_not_report_a_refcal_when_applycal_fails(monkeypatch, tm
     assert result is None
     assert len(applied) == 1
     assert provenance == []
+
+
+def _sql_bps_route_records(type16_parent_digest=None):
+    """Return a small, fully paired SQL BPH+SBD+BPS test product."""
+
+    sql_record_time = Time('2026-07-09 07:12:00.000')
+    refcal_time = Time('2026-07-09 12:52:53.000')
+    type14_digest = 'a' * 64
+    legacy = {
+        'pha': np.zeros((2, 2, 1), dtype=np.float64),
+        'amp': np.ones((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'fghz': np.array([1.05], dtype=np.float64),
+        'timestamp': sql_record_time,
+        't_bg': refcal_time,
+        't_ed': Time('2026-07-09 13:46:27.000'),
+    }
+    bphsbd = {
+        'bph_rad': np.zeros((2, 2, 1), dtype=np.float64),
+        'sbd_ns': np.zeros((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': sql_record_time,
+        't_refcal': refcal_time,
+        'type14_buffer_digest': type14_digest,
+    }
+    primary_phase = np.zeros((2, 2, 2), dtype=np.float64)
+    primary_phase[0, 0] = [-0.2, 0.2]
+    primary_phase[0, 1] = [0.1, -0.1]
+    candidate = np.zeros((2, 2, 1), dtype=np.uint8)
+    candidate[0, :, 0] = 1
+    authorized = np.zeros((2, 2, 1), dtype=np.uint8)
+    authorized[0, :, 0] = 1
+    bps = {
+        'timestamp': sql_record_time,
+        't_refcal': refcal_time,
+        't_bphsbd': sql_record_time,
+        'product_digest': 'b' * 64,
+        'type14_digest': (
+            type14_digest
+            if type16_parent_digest is None
+            else type16_parent_digest
+        ),
+        'bph_ref_frequency_ghz': np.array([1.05], dtype=np.float64),
+        'bps_candidate_code': candidate,
+        'bps_authorized': authorized,
+        'bps_primary': {
+            'frequency_ghz': np.array([1.0, 1.1], dtype=np.float64),
+            'band': np.array([1, 1], dtype=np.int32),
+            'phase_rad': primary_phase,
+            'channel_valid': np.ones(primary_phase.shape, dtype=np.uint8),
+        },
+        'bps_secondary': {
+            'frequency_ghz': np.zeros(0, dtype=np.float64),
+            'band': np.zeros(0, dtype=np.int32),
+            'phase_rad': np.zeros((2, 2, 0), dtype=np.float64),
+            'channel_valid': np.zeros((2, 2, 0), dtype=np.uint8),
+        },
+    }
+    return legacy, bphsbd, bps
+
+
+def test_calibeovsa_applies_fresh_matched_sql_residual_bps(monkeypatch, tmp_path):
+    """A paired type 16 must add the residual B table to the SQL route."""
+
+    legacy, bphsbd, bps = _sql_bps_route_records()
+    msfile, _, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch,
+        tmp_path,
+        legacy,
+        bphsbd,
+        bps=bps,
+    )
+
+    assert result == [msfile]
+    assert len(applied) == 1
+    assert any(
+        str(table).endswith('.refbps')
+        for table in applied[0]['gaintable']
+    )
+    assert provenance[0]['source'] == 'sql_bph_sbd'
+    assert provenance[0]['bps_status'] == 'applied'
+    assert provenance[0]['bps_reason'] is None
+    assert provenance[0]['bps_product_digest'] == 'b' * 64
+    assert provenance[0]['bps_applied_slots'] == 2
+    assert provenance[0]['bps_authorized_slots'] == 2
+
+
+def test_calibeovsa_skips_mismatched_sql_residual_bps(monkeypatch, tmp_path):
+    """Auto mode must not activate a type 14 from a partial family."""
+
+    legacy, bphsbd, bps = _sql_bps_route_records(
+        type16_parent_digest='c' * 64,
+    )
+    msfile, _, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch,
+        tmp_path,
+        legacy,
+        bphsbd,
+        bps=bps,
+    )
+
+    assert result == [msfile]
+    assert len(applied) == 1
+    assert not any(
+        str(table).endswith('.refbps')
+        for table in applied[0]['gaintable']
+    )
+    assert provenance[0]['source'] == 'sql_legacy_type8'
+
+
+def test_explicit_bph_sbd_rejects_incomplete_sql_family(monkeypatch, tmp_path):
+    """Explicit full-route mode must fail when type 16 does not match."""
+
+    legacy, bphsbd, bps = _sql_bps_route_records(
+        type16_parent_digest='c' * 64,
+    )
+    _, _, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch,
+        tmp_path,
+        legacy,
+        bphsbd,
+        bps=bps,
+        refcal_sql_mode='bph_sbd',
+    )
+
+    assert result is None
+    assert applied == []
+    assert provenance == []
+
+
+def test_sql_bps_pairing_searches_past_newer_orphan(monkeypatch):
+    """A newer partial-save orphan must not hide an exact older companion."""
+
+    from . import task_calibeovsa as production
+
+    _legacy, bphsbd, matching = _sql_bps_route_records()
+    orphan = dict(matching)
+    orphan['type14_digest'] = 'c' * 64
+    calls = []
+
+    def fake_loader(trange, **kwargs):
+        calls.append((trange, kwargs))
+        return [orphan, matching]
+
+    monkeypatch.setattr(production, 'sql2refcal_bpsX', fake_loader)
+    arrays, reason = production._valid_sql_bphsbd_arrays(bphsbd)
+    assert reason is None
+
+    companion, reason = production._sql_bps_companion_for_bphsbd(
+        Time('2026-07-09 18:00:00.000'),
+        bphsbd,
+        arrays,
+    )
+
+    assert reason is None
+    assert companion is not None
+    assert companion['type14_digest'] == 'a' * 64
+    assert len(calls) == 1
+    assert calls[0][1]['nrecords'] == 0
+    assert calls[0][1]['neat'] is False
+
+
+def test_sql_family_selects_older_complete_pair_past_newer_partials():
+    """The family selector must compare every same-day type-14/type-16 pair."""
+
+    from . import task_calibeovsa as production
+
+    _legacy, older_type14, older_type16 = _sql_bps_route_records()
+    newer_time = Time('2026-07-09 08:12:00.000')
+    newer_type14 = dict(older_type14)
+    newer_type14.update({
+        'timestamp': newer_time,
+        'type14_buffer_digest': 'd' * 64,
+    })
+    newer_type16 = dict(older_type16)
+    newer_type16.update({
+        'timestamp': newer_time,
+        't_bphsbd': newer_time,
+        'type14_digest': 'e' * 64,
+    })
+
+    selected = production._select_sql_refcal_family(
+        [older_type14, newer_type14],
+        [older_type16, newer_type16],
+        Time('2026-07-09 18:00:00.000'),
+    )
+
+    assert selected['status'] == 'complete'
+    assert selected['bphsbd_record']['type14_buffer_digest'] == 'a' * 64
+    assert selected['bps_companion']['type14_digest'] == 'a' * 64
+
+
+def test_sql_family_marks_unmatched_type16_day_partial():
+    """Any same-day type 16 blocks historical type-14-only activation."""
+
+    from . import task_calibeovsa as production
+
+    _legacy, bphsbd, bps = _sql_bps_route_records(
+        type16_parent_digest='c' * 64,
+    )
+    selected = production._select_sql_refcal_family(
+        bphsbd,
+        bps,
+        Time('2026-07-09 18:00:00.000'),
+    )
+
+    assert selected['status'] == 'partial'
+    assert selected['type16_records_present'] is True
+    assert selected['bphsbd_record'] is None
+    assert 'no complete digest-matched' in selected['reason']
+
+
+def test_sql_family_allows_historical_type14_only_when_day_has_no_type16():
+    """Auto-mode compatibility is limited to genuinely pre-type-16 days."""
+
+    from . import task_calibeovsa as production
+
+    _legacy, bphsbd, _bps = _sql_bps_route_records()
+    selected = production._select_sql_refcal_family(
+        bphsbd,
+        None,
+        Time('2026-07-09 18:00:00.000'),
+    )
+
+    assert selected['status'] == 'historical_type14'
+    assert selected['type16_records_present'] is False
+    assert selected['bphsbd_record'] is bphsbd
+
+
+def test_complete_sql_family_uses_type16_bph_pivot_not_type8_fghz(
+        monkeypatch, tmp_path):
+    """Type-8 band frequencies must not move a complete-family BPH phase."""
+
+    legacy, bphsbd, bps = _sql_bps_route_records()
+    legacy['fghz'] = np.array([9.0], dtype=np.float64)
+    bphsbd['sbd_ns'] = np.ones((2, 2, 1), dtype=np.float64)
+    gencal_calls = []
+
+    msfile, _, result, _, _ = _run_refcal_provenance_case(
+        monkeypatch,
+        tmp_path,
+        legacy,
+        bphsbd,
+        bps=bps,
+        refcal_sql_mode='bph_sbd',
+        gencal_calls=gencal_calls,
+    )
+
+    assert result == [msfile]
+    refpha = [
+        call for call in gencal_calls
+        if call.get('caltype') == 'ph'
+        and str(call.get('caltable', '')).endswith('.refpha')
+    ]
+    assert len(refpha) == 1
+    np.testing.assert_allclose(refpha[0]['parameter'], [-18.0, -18.0])
+
+
+def test_companion_sql_phacal_filter_rejects_old_sentinel_and_keeps_match():
+    """Companion SQL modes must not admit old one-sided ``t_ref`` rows."""
+    from . import task_calibeovsa as production
+
+    refcal_time = Time('2025-03-26 10:44:50.000')
+    phacals = np.array([
+        {'t_ref': Time('1903-12-31 23:59:59.000')},
+        {'t_ref': Time('2025-03-26 10:30:00.000')},
+        {'t_ref': Time('2025-03-26 11:20:00.000')},
+    ], dtype=object)
+
+    strict = production._phacal_reference_keep_mask(
+        phacals,
+        refcal_time,
+        require_absolute_match=True,
+    )
+    legacy = production._phacal_reference_keep_mask(
+        phacals,
+        refcal_time,
+        require_absolute_match=False,
+    )
+
+    np.testing.assert_array_equal(strict, [False, True, False])
+    np.testing.assert_array_equal(legacy, [True, True, False])
+
+
+def test_refcal_bps_payload_uses_same_measured_candidate_and_neutral_tiers():
+    """BPS follows measured-BPH provenance and leaves other tiers neutral."""
+    from . import task_calibeovsa as production
+
+    primary_phase = np.zeros((2, 2, 2), dtype=np.float64)
+    primary_phase[0, 0] = [-0.2, 0.2]
+    secondary_phase = np.zeros((2, 2, 2), dtype=np.float64)
+    secondary_phase[0, 1] = [0.3, -0.3]
+    primary = {
+        'bps_frequency_ghz': np.array([1.0, 1.1], dtype=np.float64),
+        'bps_band': np.array([1, 1], dtype=np.int32),
+        'bps_phase_rad': primary_phase,
+        'bps_valid': np.ones((2, 2, 1), dtype=np.uint8),
+    }
+    primary['secondary_bph_refcal'] = {
+        'bps_frequency_ghz': np.array([1.0, 1.1], dtype=np.float64),
+        'bps_band': np.array([1, 1], dtype=np.int32),
+        'bps_phase_rad': secondary_phase,
+        'bps_valid': np.ones((2, 2, 1), dtype=np.uint8),
+    }
+    candidate_code = np.array([[1, 2], [0, 1]], dtype=np.uint8)
+    phase_flag = np.array([[0, 0], [0, 1]], dtype=np.uint8)
+
+    cparam, flag, applied_slots, measured_slots = (
+        production._refcal_bps_payload_for_spw(
+            primary,
+            candidate_code,
+            phase_flag,
+            1,
+            np.array([1.0, 1.1], dtype=np.float64),
+            3,
+        )
+    )
+
+    assert production._bps_candidate_code_for_source('band_phase') == 1
+    assert production._bps_candidate_code_for_source('secondary_band_phase') == 2
+    assert production._bps_candidate_code_for_source('lo_model') == 1
+    assert production._bps_candidate_code_for_source('hi_model') == 1
+    assert production._bps_candidate_code_for_source('secondary_lo_model') == 2
+    assert production._bps_candidate_code_for_source('secondary_hi_model') == 2
+    assert production._bps_candidate_code_for_source('hi_smooth_extrap') == 0
+    assert applied_slots == 2
+    assert measured_slots == 2
+    np.testing.assert_allclose(cparam[0, 0], np.exp(1j * np.array([-0.2, 0.2])))
+    np.testing.assert_allclose(cparam[0, 1], np.exp(1j * np.array([0.3, -0.3])))
+    np.testing.assert_allclose(cparam[1], 1.0 + 0j)
+    np.testing.assert_allclose(np.abs(cparam), 1.0)
+    np.testing.assert_array_equal(flag[0], False)
+    np.testing.assert_array_equal(flag[1, 0], False)
+    np.testing.assert_array_equal(flag[1, 1], True)
+    np.testing.assert_array_equal(flag[2], True)
+
+
+def test_refcal_bps_payload_keeps_valid_bph_sbd_on_sampler_failure():
+    """Unsupported optional BPS must leave valid BPH+SBD unflagged."""
+    from . import task_calibeovsa as production
+
+    refcal = {
+        'bps_frequency_ghz': np.array([1.0, 1.1], dtype=np.float64),
+        'bps_band': np.array([1, 1], dtype=np.int32),
+        'bps_phase_rad': np.zeros((2, 2, 2), dtype=np.float64),
+        'bps_valid': np.ones((2, 2, 1), dtype=np.uint8),
+    }
+    candidate_code = np.array([[0, 0], [1, 0]], dtype=np.uint8)
+    phase_flag = np.zeros((2, 2), dtype=np.uint8)
+
+    cparam, flag, applied_slots, authorized_slots = (
+        production._refcal_bps_payload_for_spw(
+            refcal,
+            candidate_code,
+            phase_flag,
+            1,
+            np.array([0.9, 1.0], dtype=np.float64),
+            2,
+        )
+    )
+
+    assert authorized_slots == 1
+    assert applied_slots == 0
+    np.testing.assert_allclose(cparam[1, 0], 1.0 + 0j)
+    np.testing.assert_array_equal(flag[1, 0], False)
+
+
+def test_promoted_hi_model_source_does_not_apply_original_measured_bps():
+    """A promoted HI row must not reuse BPS from its original refcal data."""
+    from . import task_calibeovsa as production
+
+    hi_triplet = {
+        'phi_band_rad': np.array(
+            [[[0.2], [0.3]], [[0.8], [0.9]]],
+            dtype=np.float64,
+        ),
+        'tau_ib_ns': np.ones((2, 2, 1), dtype=np.float64) * 0.2,
+        'tau_mb_eff_ns': np.array(
+            [[0.04, 0.05], [0.07, 0.08]],
+            dtype=np.float64,
+        ),
+        'band_ref_freq_ghz': np.array([4.0], dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.uint8),
+    }
+    refcal = {
+        'band_phase_rad': np.array(
+            [[[0.1], [0.2]], [[2.4], [-2.2]]],
+            dtype=np.float64,
+        ),
+        'band_phase_flag': np.zeros((2, 2, 1), dtype=np.uint8),
+        'band_phase_quality_flag': np.zeros(
+            (2, 2, 1), dtype=np.uint8
+        ),
+        'smooth_bph_quality_flag': np.zeros(
+            (2, 2, 1), dtype=np.uint8
+        ),
+        'active_ns': np.array(
+            [[8.0, 7.0], [10.0, 9.0]], dtype=np.float64
+        ),
+        'delay_flag': np.zeros((2, 2), dtype=np.uint8),
+        'fghz': np.array([4.0], dtype=np.float64),
+        'gencal_triplets': {'hi': hi_triplet},
+        'operator_band_flag': np.zeros(
+            (2, 2, 1), dtype=np.uint8
+        ),
+        'promoted_antennas': {
+            '1': {'anchor_active_ns': [10.0, 9.0]}
+        },
+        'bps_frequency_ghz': np.array(
+            [3.95, 4.05], dtype=np.float64
+        ),
+        'bps_band': np.array([1, 1], dtype=np.int32),
+        'bps_phase_rad': np.array(
+            [
+                [[0.0, 0.0], [0.0, 0.0]],
+                [[-0.4, 0.4], [0.3, -0.3]],
+            ],
+            dtype=np.float64,
+        ),
+        'bps_valid': np.ones((2, 2, 1), dtype=np.uint8),
+    }
+    _, _, resolved_flag, source = resolve_bph_sbd_tables(
+        refcal,
+        nant=2,
+        nband=1,
+        return_sources=True,
+    )
+    codes = np.zeros((2, 2), dtype=np.uint8)
+    for ant_i in range(2):
+        for pol_i in range(2):
+            codes[ant_i, pol_i] = (
+                production._bps_candidate_code_for_slot(
+                    refcal,
+                    source[ant_i, pol_i, 0],
+                    ant_i,
+                    pol_i,
+                    0,
+                )
+            )
+
+    cparam, flag, applied_slots, measured_slots = (
+        production._refcal_bps_payload_for_spw(
+            refcal,
+            codes,
+            resolved_flag[:, :, 0],
+            1,
+            np.array([3.95, 4.05], dtype=np.float64),
+            3,
+        )
+    )
+
+    np.testing.assert_array_equal(source[1, :, 0], ['hi_model', 'hi_model'])
+    np.testing.assert_array_equal(codes[1], 0)
+    np.testing.assert_allclose(cparam[1], 1.0 + 0j)
+    np.testing.assert_array_equal(flag[1], False)
+    self_applied = int(np.count_nonzero(codes[0] == 1))
+    assert measured_slots == self_applied
+    assert applied_slots == self_applied
+
+    ant1_promoted = dict(refcal)
+    ant1_promoted['promoted_antennas'] = {
+        '0': {'anchor_active_ns': [8.0, 7.0]}
+    }
+    _, _, ant1_flag, ant1_source = resolve_bph_sbd_tables(
+        ant1_promoted,
+        nant=2,
+        nband=1,
+        return_sources=True,
+    )
+    ant1_codes = np.zeros((2, 2), dtype=np.uint8)
+    for ant_i in range(2):
+        for pol_i in range(2):
+            ant1_codes[ant_i, pol_i] = (
+                production._bps_candidate_code_for_slot(
+                    ant1_promoted,
+                    ant1_source[ant_i, pol_i, 0],
+                    ant_i,
+                    pol_i,
+                    0,
+                )
+            )
+    ant1_cparam, _, _, _ = production._refcal_bps_payload_for_spw(
+        ant1_promoted,
+        ant1_codes,
+        ant1_flag[:, :, 0],
+        1,
+        np.array([3.95, 4.05], dtype=np.float64),
+        3,
+    )
+    np.testing.assert_array_equal(
+        ant1_source[1, :, 0],
+        ['hi_model', 'hi_model'],
+    )
+    np.testing.assert_array_equal(ant1_codes[1], 0)
+    np.testing.assert_allclose(ant1_cparam[1], 1.0 + 0j)
+
+
+def _legacy_band14_grids():
+    width_hz = np.full(8, 40.625e6, dtype=np.float64)
+    lower_edge_hz = 5.325e9 + np.arange(8) * width_hz
+    return lower_edge_hz, width_hz, lower_edge_hz + width_hz / 2.0
+
+
+def _single_band_bps_refcal(center_hz):
+    phase = np.linspace(-0.35, 0.35, center_hz.size)
+    return {
+        'bps_frequency_ghz': center_hz * 1e-9,
+        'bps_band': np.full(center_hz.size, 14, dtype=np.int32),
+        'bps_phase_rad': np.broadcast_to(
+            phase,
+            (1, 2, phase.size),
+        ).copy(),
+        'bps_valid': np.ones((1, 2, 14), dtype=np.uint8),
+    }
+
+
+def test_legacy_eovsa_band14_grid_recovers_centers_for_bps():
+    """Legacy impteovsa lower edges must be sampled at physical centers."""
+
+    from . import task_calibeovsa as production
+
+    lower_edges_hz, channel_width_hz, expected_centers_hz = (
+        _legacy_band14_grids()
+    )
+    target_ghz = production._eovsa_bps_target_channel_centers(
+        'band14',
+        lower_edges_hz,
+        channel_width_hz,
+    ) * 1e-9
+
+    _, flag, applied_slots, measured_slots = (
+        production._refcal_bps_payload_for_spw(
+            _single_band_bps_refcal(expected_centers_hz),
+            np.ones((1, 2), dtype=np.uint8),
+            np.zeros((1, 2), dtype=np.uint8),
+            14,
+            target_ghz,
+            1,
+        )
+    )
+
+    np.testing.assert_allclose(target_ghz, expected_centers_hz * 1e-9)
+    np.testing.assert_array_equal(flag, False)
+    assert applied_slots == measured_slots == 2
+
+
+def test_standard_eovsa_band14_centers_are_not_shifted_twice():
+    """A standards-compliant EOVSA MS must pass through unchanged."""
+
+    from . import task_calibeovsa as production
+
+    _, channel_width_hz, centers_hz = _legacy_band14_grids()
+
+    target_hz = production._eovsa_bps_target_channel_centers(
+        'band14',
+        centers_hz,
+        channel_width_hz,
+    )
+
+    np.testing.assert_array_equal(target_hz, centers_hz)
+
+
+def test_raw_legacy_lower_edges_still_fail_closed_in_bps_sampler():
+    """The strict sampler must not extrapolate an unrecovered target grid."""
+
+    from . import task_calibeovsa as production
+
+    lower_edges_hz, _, centers_hz = _legacy_band14_grids()
+
+    phase, applied = production.sample_refcal_bps_for_band(
+        _single_band_bps_refcal(centers_hz),
+        0,
+        0,
+        14,
+        lower_edges_hz * 1e-9,
+    )
+
+    np.testing.assert_array_equal(phase, 0.0)
+    assert applied is False
+
+
+def test_recovered_legacy_grid_preserves_npz_sql_bps_14_of_14_parity():
+    """NPZ and normalized SQL candidates must apply the same 14 slots."""
+
+    from eovsapy import chan_util_52
+    from . import task_calibeovsa as production
+
+    authorized_slots = (
+        (2, 1, 7),
+        (4, 0, 14),
+        (4, 0, 15),
+        (4, 1, 7),
+        (5, 0, 7),
+        (5, 0, 8),
+        (5, 0, 14),
+        (5, 0, 21),
+        (5, 1, 11),
+        (5, 1, 15),
+        (7, 0, 7),
+        (7, 0, 25),
+        (7, 1, 7),
+        (7, 1, 13),
+    )
+    bands = sorted({band for _, _, band in authorized_slots})
+    authorization = np.zeros((8, 2, 52), dtype=np.uint8)
+    for ant_i, pol_i, band_id in authorized_slots:
+        authorization[ant_i, pol_i, band_id - 1] = 1
+
+    frequency_parts = []
+    band_parts = []
+    phase_parts = []
+    target_by_band = {}
+    for band_id in bands:
+        lower_edges_hz = np.asarray(
+            chan_util_52.start_freq(band_id),
+            dtype=np.float64,
+        ) * 1e9
+        channel_width_hz = np.asarray(
+            chan_util_52.sci_bw(band_id),
+            dtype=np.float64,
+        ) * 1e9
+        centers_ghz = production._eovsa_bps_target_channel_centers(
+            'band{0:02d}'.format(band_id),
+            lower_edges_hz,
+            channel_width_hz,
+        ) * 1e-9
+        target_by_band[band_id] = centers_ghz
+        frequency_parts.append(centers_ghz)
+        band_parts.append(
+            np.full(centers_ghz.size, band_id, dtype=np.int32)
+        )
+        phase_parts.append(
+            np.broadcast_to(
+                np.linspace(-0.3, 0.3, centers_ghz.size),
+                (8, 2, centers_ghz.size),
+            ).copy()
+        )
+
+    frequency = np.concatenate(frequency_parts)
+    channel_band = np.concatenate(band_parts)
+    phase = np.concatenate(phase_parts, axis=2)
+    npz_refcal = {
+        'bps_frequency_ghz': frequency,
+        'bps_band': channel_band,
+        'bps_phase_rad': phase,
+        'bps_valid': authorization,
+    }
+    sql_refcal, reason = production._normalized_sql_bps_group(
+        {
+            'frequency_ghz': frequency,
+            'band': channel_band,
+            'phase_rad': phase,
+            'channel_valid': np.ones(phase.shape, dtype=np.uint8),
+        },
+        (8, 2),
+        52,
+    )
+    assert reason is None
+    sql_refcal['bps_valid'] = authorization
+
+    totals = {'npz': [0, 0], 'sql': [0, 0]}
+    for band_id in bands:
+        codes = authorization[:, :, band_id - 1]
+        payloads = {}
+        for source, refcal in (
+                ('npz', npz_refcal),
+                ('sql', sql_refcal)):
+            cparam, flag, applied, measured = (
+                production._refcal_bps_payload_for_spw(
+                    refcal,
+                    codes,
+                    np.zeros((8, 2), dtype=np.uint8),
+                    band_id,
+                    target_by_band[band_id],
+                    8,
+                )
+            )
+            totals[source][0] += applied
+            totals[source][1] += measured
+            payloads[source] = (cparam, flag)
+        np.testing.assert_allclose(
+            payloads['npz'][0],
+            payloads['sql'][0],
+        )
+        np.testing.assert_array_equal(
+            payloads['npz'][1],
+            payloads['sql'][1],
+        )
+
+    assert totals == {'npz': [14, 14], 'sql': [14, 14]}

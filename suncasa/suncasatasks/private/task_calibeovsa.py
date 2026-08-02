@@ -17,6 +17,12 @@ from eovsapy import cal_header as ch
 from eovsapy import dbutil as db
 from eovsapy import pipeline_cal as pc
 from eovsapy.sqlutil import sql2refcalX, sql2phacalX, sql2refcal_bphsbdX, sql2refcal_bphaseX
+try:
+    from eovsapy.sqlutil import sql2refcal_bpsX
+except ImportError:
+    # Permit module import during rolling deployment, but fail the composite
+    # type-14+16 route closed until the caltype-16 reader is present.
+    sql2refcal_bpsX = None
 from .. import concateovsa
 from suncasa.eovsa.update_log import EOVSA15_UPGRADE_DATE, DCM_IF_FILTER_UPGRADE_DATE
 
@@ -46,9 +52,15 @@ from eovsapy.calibeovsa_bph_sbd import (
     _triplet_bph_sbd_terms_for_band,
     _bph_candidate_for_band,
     _bph_sbd_phase_base_for_band,
+    _promoted_hi_gauge_affected,
+    _promoted_hi_measurement_authorized,
+    sample_refcal_bps_for_band,
     smooth_phase_bandpass_for_freqs,
     load_calwidget_v2_npz,
+    frozen_resolved_bph_sbd_tables,
     _attach_secondary_bph_refcal,
+    resolve_bph_sbd_tables,
+    recenter_bph_rad,
     REFCAL_NPZ_MODES,
 )
 
@@ -102,6 +114,416 @@ def _single_sql_record(record):
     return record
 
 
+def _sql_times_match(left, right):
+    """Return whether two SQL locator times are exactly the same.
+
+    :param left: First time-like value.
+    :type left: object
+    :param right: Second time-like value.
+    :type right: object
+    :returns: True when both values resolve to the same LabVIEW timestamp.
+    :rtype: bool
+    """
+
+    if left is None or right is None:
+        return False
+    try:
+        left_lv = float(left.lv) if hasattr(left, 'lv') else float(Time(left).lv)
+        right_lv = float(right.lv) if hasattr(right, 'lv') else float(Time(right).lv)
+    except Exception:
+        return False
+    return bool(
+        np.isfinite(left_lv)
+        and np.isfinite(right_lv)
+        and left_lv == right_lv
+    )
+
+
+def _normalized_sql_bps_group(group, expected_antpol_shape, nband):
+    """Validate and normalize one native SQL residual-BPS channel group.
+
+    :param group: Decoded primary or secondary caltype-16 group.
+    :type group: dict
+    :param expected_antpol_shape: Expected ``(antenna, polarization)`` shape.
+    :type expected_antpol_shape: tuple[int, int]
+    :param nband: Number of bands represented by the paired type-14 record.
+    :type nband: int
+    :returns: ``(normalized, reason)``. ``normalized`` uses the keys consumed
+        by :func:`sample_refcal_bps_for_band`.
+    :rtype: tuple[dict or None, str or None]
+    """
+
+    if not isinstance(group, dict):
+        return None, 'channel group missing'
+    missing = [
+        key for key in ('frequency_ghz', 'band', 'phase_rad', 'channel_valid')
+        if key not in group
+    ]
+    if missing:
+        return None, 'channel group missing {0}'.format(','.join(missing))
+    try:
+        frequency = np.asarray(group['frequency_ghz'], dtype=np.float64)
+        band_raw = np.asarray(group['band'], dtype=np.float64)
+        phase = np.asarray(group['phase_rad'], dtype=np.float64)
+        channel_valid_raw = np.asarray(group['channel_valid'])
+    except Exception as exc:
+        return None, 'channel group conversion failed: {0}'.format(exc)
+    expected_antpol_shape = tuple(int(value) for value in expected_antpol_shape)
+    expected_phase_shape = expected_antpol_shape + (int(frequency.size),)
+    if frequency.ndim != 1 or band_raw.ndim != 1:
+        return None, 'channel-group frequency and band must be 1-D'
+    if frequency.shape != band_raw.shape:
+        return None, 'channel-group frequency/band length mismatch'
+    if phase.shape != expected_phase_shape:
+        return None, (
+            'channel-group phase shape {0} does not match {1}'
+        ).format(phase.shape, expected_phase_shape)
+    if channel_valid_raw.shape != phase.shape:
+        return None, (
+            'channel-group validity shape {0} does not match phase {1}'
+        ).format(channel_valid_raw.shape, phase.shape)
+    if not np.all(np.isfinite(frequency)):
+        return None, 'channel-group frequency contains non-finite values'
+    rounded_band = np.rint(band_raw)
+    if (
+        not np.all(np.isfinite(band_raw))
+        or not np.all(band_raw == rounded_band)
+        or np.any(rounded_band < 1)
+        or np.any(rounded_band > int(nband))
+    ):
+        return None, 'channel-group band identifiers are invalid'
+    try:
+        channel_valid_numeric = np.asarray(
+            channel_valid_raw,
+            dtype=np.float64,
+        )
+    except Exception as exc:
+        return None, 'channel-group validity conversion failed: {0}'.format(exc)
+    if (
+        not np.all(np.isfinite(channel_valid_numeric))
+        or not np.all(
+            (channel_valid_numeric == 0.0)
+            | (channel_valid_numeric == 1.0)
+        )
+    ):
+        return None, 'channel-group validity is not binary'
+    channel_valid = channel_valid_numeric != 0.0
+    if np.any(channel_valid & ~np.isfinite(phase)):
+        return None, 'authorized channel support contains non-finite phase'
+    return {
+        'bps_frequency_ghz': frequency,
+        'bps_band': rounded_band.astype(np.int32),
+        'bps_phase_rad': np.where(channel_valid, phase, np.nan),
+    }, None
+
+
+def _valid_sql_bps_companion(record, bphsbd_record, bphsbd_arrays):
+    """Validate a caltype-16 companion against its exact type-14 parent.
+
+    The type-16 authorization is already the producer's final decision.
+    This function validates serialization, shape, locator, and digest pairing;
+    it does not replay NPZ promotion or source-selection policy.
+
+    :param record: Decoded caltype-16 record.
+    :type record: dict
+    :param bphsbd_record: Decoded parent caltype-14 record.
+    :type bphsbd_record: dict
+    :param bphsbd_arrays: Validated ``(bph, sbd, flag)`` arrays.
+    :type bphsbd_arrays: tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]
+    :returns: ``(companion, reason)``.
+    :rtype: tuple[dict or None, str or None]
+    """
+
+    if not isinstance(record, dict):
+        return None, 'record missing'
+    if not isinstance(bphsbd_record, dict) or bphsbd_arrays is None:
+        return None, 'paired type-14 record missing'
+    required = (
+        'bps_candidate_code',
+        'bps_authorized',
+        'bph_ref_frequency_ghz',
+        'bps_primary',
+        'bps_secondary',
+        'product_digest',
+        'type14_digest',
+        't_refcal',
+        't_bphsbd',
+        'timestamp',
+    )
+    missing = [key for key in required if key not in record]
+    if missing:
+        return None, 'missing {0}'.format(','.join(missing))
+
+    parent_digest = str(
+        bphsbd_record.get('type14_buffer_digest') or ''
+    )
+    companion_digest = str(record.get('type14_digest') or '')
+    product_digest = str(record.get('product_digest') or '')
+    hex_chars = set('0123456789abcdef')
+    if len(parent_digest) != 64 or not set(parent_digest) <= hex_chars:
+        return None, 'paired type-14 buffer digest unavailable'
+    if len(companion_digest) != 64 or not set(companion_digest) <= hex_chars:
+        return None, 'type-16 parent digest is malformed'
+    if companion_digest != parent_digest:
+        return None, 'type-16 parent digest does not match selected type 14'
+    if len(product_digest) != 64 or not set(product_digest) <= hex_chars:
+        return None, 'type-16 product digest is malformed'
+
+    parent_timestamp = bphsbd_record.get('timestamp')
+    parent_refcal_time = bphsbd_record.get('t_refcal')
+    if not _sql_times_match(record.get('timestamp'), parent_timestamp):
+        return None, 'type-16 SQL locator does not match selected type 14'
+    if not _sql_times_match(record.get('t_bphsbd'), parent_timestamp):
+        return None, 'type-16 parent locator does not match selected type 14'
+    if not _sql_times_match(record.get('t_refcal'), parent_refcal_time):
+        return None, 'type-16 t_refcal does not match selected type 14'
+
+    bph, sbd, flag = bphsbd_arrays
+    expected_shape = tuple(int(value) for value in bph.shape)
+    try:
+        candidate_raw = np.asarray(
+            record['bps_candidate_code'],
+            dtype=np.float64,
+        )
+        authorized_raw = np.asarray(record['bps_authorized'], dtype=np.float64)
+    except Exception as exc:
+        return None, 'authorization conversion failed: {0}'.format(exc)
+    if candidate_raw.shape != expected_shape:
+        return None, (
+            'candidate-code shape {0} does not match type 14 {1}'
+        ).format(candidate_raw.shape, expected_shape)
+    if authorized_raw.shape != expected_shape:
+        return None, (
+            'authorization shape {0} does not match type 14 {1}'
+        ).format(authorized_raw.shape, expected_shape)
+    candidate = np.rint(candidate_raw)
+    if (
+        not np.all(np.isfinite(candidate_raw))
+        or not np.all(candidate_raw == candidate)
+        or not np.all(
+            (candidate == 0.0)
+            | (candidate == 1.0)
+            | (candidate == 2.0)
+        )
+    ):
+        return None, 'candidate codes must be 0, 1, or 2'
+    if (
+        not np.all(np.isfinite(authorized_raw))
+        or not np.all((authorized_raw == 0.0) | (authorized_raw == 1.0))
+    ):
+        return None, 'BPS authorization must be binary'
+    candidate = candidate.astype(np.uint8)
+    authorized = authorized_raw != 0.0
+    if np.any(authorized & (candidate == 0)):
+        return None, 'identity-tier slots cannot authorize residual BPS'
+    parent_usable = np.isfinite(bph) & np.isfinite(sbd) & (flag == 0)
+    if np.any(authorized & ~parent_usable):
+        return None, 'BPS authorization includes an unusable type-14 slot'
+    try:
+        bph_ref_frequency = np.asarray(
+            record['bph_ref_frequency_ghz'],
+            dtype=np.float64,
+        )
+    except Exception as exc:
+        return None, 'BPH reference-frequency conversion failed: {0}'.format(
+            exc
+        )
+    expected_nband = int(expected_shape[2])
+    if bph_ref_frequency.shape != (expected_nband,):
+        return None, (
+            'BPH reference-frequency shape {0} does not match type 14 '
+            'band count {1}'
+        ).format(bph_ref_frequency.shape, expected_nband)
+    usable_band = np.any(parent_usable, axis=(0, 1))
+    if (
+        not np.all(np.isfinite(bph_ref_frequency))
+        or np.any(bph_ref_frequency < 0.0)
+        or np.any(bph_ref_frequency[usable_band] <= 0.0)
+    ):
+        return None, (
+            'BPH reference frequencies must be finite and positive for every '
+            'usable type-14 band'
+        )
+
+    primary, primary_reason = _normalized_sql_bps_group(
+        record['bps_primary'],
+        expected_shape[:2],
+        expected_shape[2],
+    )
+    if primary is None:
+        return None, 'primary {0}'.format(primary_reason)
+    secondary, secondary_reason = _normalized_sql_bps_group(
+        record['bps_secondary'],
+        expected_shape[:2],
+        expected_shape[2],
+    )
+    if secondary is None:
+        return None, 'secondary {0}'.format(secondary_reason)
+    if np.any(authorized & (candidate == 1)) and not primary[
+            'bps_frequency_ghz'].size:
+        return None, 'authorized primary BPS grid is empty'
+    if np.any(authorized & (candidate == 2)) and not secondary[
+            'bps_frequency_ghz'].size:
+        return None, 'authorized secondary BPS grid is empty'
+
+    primary['bps_valid'] = (
+        authorized & (candidate == 1)
+    ).astype(np.uint8)
+    secondary['bps_valid'] = (
+        authorized & (candidate == 2)
+    ).astype(np.uint8)
+    primary['secondary_bph_refcal'] = secondary
+    return {
+        'bps_candidate_code': candidate,
+        'bps_authorized': authorized,
+        'bps_refcal': primary,
+        'timestamp': record.get('timestamp'),
+        't_refcal': record.get('t_refcal'),
+        'product_digest': product_digest,
+        'type14_digest': companion_digest,
+        'bph_ref_frequency_ghz': bph_ref_frequency,
+    }, None
+
+
+def _sql_bps_companion_for_bphsbd(
+        sql_lookup_time, bphsbd_record, bphsbd_arrays):
+    """Load the fresh caltype-16 record paired to one selected type 14.
+
+    :param sql_lookup_time: SQL calibration lookup time.
+    :type sql_lookup_time: astropy.time.Time
+    :param bphsbd_record: Selected caltype-14 record.
+    :type bphsbd_record: dict
+    :param bphsbd_arrays: Validated type-14 arrays.
+    :type bphsbd_arrays: tuple
+    :returns: ``(companion, reason)``. Query or validation failures return no
+        companion and leave the caller free to use BPH+SBD only.
+    :rtype: tuple[dict or None, str or None]
+    """
+
+    if sql2refcal_bpsX is None:
+        return None, 'caltype-16 SQL reader is unavailable'
+    bday, eday = _sql_lookup_local_day_bounds(sql_lookup_time)
+    try:
+        records = sql2refcal_bpsX(
+            [bday, eday],
+            nrecords=0,
+            neat=False,
+            verbose=False,
+        )
+    except Exception as exc:
+        return None, 'query failed: {0}'.format(exc)
+    if isinstance(records, dict):
+        records = [records]
+    elif isinstance(records, np.ndarray):
+        records = records.tolist()
+    elif not isinstance(records, (list, tuple)):
+        records = []
+    reasons = []
+    # read_calX returns Timestamp-descending, Id-descending records when
+    # reverse=False.  Search the whole local day so a newer orphan from a
+    # partial retry cannot hide an older companion that exactly matches the
+    # selected type-14 digest.
+    for record in records:
+        fresh, fresh_reason = _sql_record_in_lookup_day(
+            record,
+            sql_lookup_time,
+            'SQL residual BPS',
+        )
+        if not fresh:
+            reasons.append(fresh_reason)
+            continue
+        companion, reason = _valid_sql_bps_companion(
+            record,
+            bphsbd_record,
+            bphsbd_arrays,
+        )
+        if companion is not None:
+            return companion, None
+        if reason:
+            reasons.append(reason)
+    if not records:
+        return None, 'no SQL residual-BPS record found in the lookup local day'
+    distinct = []
+    for reason in reasons:
+        text = str(reason or '').strip()
+        if text and text not in distinct:
+            distinct.append(text)
+    return None, (
+        'no exact type-16 companion matched selected type 14'
+        + (': ' + '; '.join(distinct[:3]) if distinct else '')
+    )
+
+
+def _attach_sql_bps_refcal(refcal, companion, reason=None):
+    """Attach matched SQL residual BPS and explicit selection provenance.
+
+    :param refcal: Runtime reference-calibration dictionary.
+    :type refcal: dict
+    :param companion: Validated companion, or None.
+    :type companion: dict or None
+    :param reason: Reason a companion was skipped.
+    :type reason: str or None
+    :returns: Updated reference-calibration dictionary.
+    :rtype: dict
+    """
+
+    if not isinstance(refcal, dict):
+        refcal = {}
+    if isinstance(companion, dict):
+        refcal['sql_bps_status'] = 'matched'
+        refcal['sql_bps_reason'] = None
+        refcal['sql_bps_timestamp'] = companion.get('timestamp')
+        refcal['sql_bps_product_digest'] = companion.get('product_digest')
+        refcal['sql_bps_candidate_code'] = companion[
+            'bps_candidate_code'
+        ]
+        refcal['sql_bps_authorized'] = companion['bps_authorized']
+        refcal['sql_bps_refcal'] = companion['bps_refcal']
+        refcal['sql_bph_ref_frequency_ghz'] = companion[
+            'bph_ref_frequency_ghz'
+        ]
+        candidate_shape = companion['bps_candidate_code'].shape
+        refcal['resolved_ref_frequency_ghz'] = np.broadcast_to(
+            companion['bph_ref_frequency_ghz'][None, None, :],
+            candidate_shape,
+        ).copy()
+    else:
+        refcal['sql_bps_status'] = 'skipped'
+        refcal['sql_bps_reason'] = str(reason or 'record unavailable')
+        refcal['sql_bps_timestamp'] = None
+        refcal['sql_bps_product_digest'] = None
+        refcal.pop('sql_bps_candidate_code', None)
+        refcal.pop('sql_bps_authorized', None)
+        refcal.pop('sql_bps_refcal', None)
+        refcal.pop('sql_bph_ref_frequency_ghz', None)
+        refcal.pop('resolved_ref_frequency_ghz', None)
+    return refcal
+
+
+def _phacal_reference_keep_mask(phacals, refcal_time, require_absolute_match):
+    """Return phase-cal rows compatible with one reference-cal time.
+
+    :param phacals: Phase-cal records containing ``t_ref`` values.
+    :type phacals: iterable
+    :param refcal_time: Reference-cal observation time.
+    :type refcal_time: astropy.time.Time
+    :param require_absolute_match: If true, reject records more than 30
+        minutes before or after ``refcal_time``. If false, preserve the
+        legacy one-sided "not more than 30 minutes after" rule.
+    :type require_absolute_match: bool
+    :returns: Boolean keep mask with one element per phase-cal record.
+    :rtype: numpy.ndarray
+    """
+
+    delta_days = np.asarray(
+        [phacal['t_ref'].jd - refcal_time.jd for phacal in phacals],
+        dtype=np.float64,
+    )
+    if require_absolute_match:
+        delta_days = np.abs(delta_days)
+    return delta_days <= 30. / 1440.
+
+
 def _sql_lookup_local_day_bounds(tim):
     try:
         dhr = tim.LocalTime.utcoffset().total_seconds() / 60. / 60.
@@ -123,6 +545,241 @@ def _sql_record_in_lookup_day(record, lookup_time, label):
     return False, (
         "{0} SQL timestamp {1} is outside lookup local day {2} to {3}"
     ).format(label, record_time.iso, bday.iso, eday.iso)
+
+
+def _sql_record_list(records):
+    """Normalize one SQL reader result to a list without changing order.
+
+    :param records: One decoded record, a record sequence, or ``None``.
+    :type records: object
+    :returns: Decoded records in their reader-provided order.
+    :rtype: list
+    """
+
+    if isinstance(records, dict):
+        return [records]
+    if isinstance(records, np.ndarray):
+        return records.tolist()
+    if isinstance(records, (list, tuple)):
+        return list(records)
+    return []
+
+
+def _sql_record_sort_key(record):
+    """Return a descending-sort key for one decoded SQL record.
+
+    :param record: Decoded SQL record.
+    :type record: dict
+    :returns: Finite LabVIEW timestamp or negative infinity.
+    :rtype: float
+    """
+
+    if not isinstance(record, dict):
+        return -np.inf
+    value = record.get('timestamp')
+    try:
+        value = float(value.lv) if hasattr(value, 'lv') else float(Time(value).lv)
+    except Exception:
+        return -np.inf
+    return value if np.isfinite(value) else -np.inf
+
+
+def _select_sql_refcal_family(
+        bphsbd_records, bps_records, sql_lookup_time):
+    """Select the newest safe type-14/type-16 reference-calibration family.
+
+    A complete family is an exact digest-, locator-, and observation-time
+    match. The whole lookup local day is searched, so a newer partial retry
+    cannot hide an older complete family. A type-14-only result is exposed as
+    ``historical_type14`` only when that day contains no type-16 records.
+
+    :param bphsbd_records: Decoded type-14 records for the lookup local day.
+    :type bphsbd_records: object
+    :param bps_records: Decoded type-16 records for the lookup local day.
+    :type bps_records: object
+    :param sql_lookup_time: SQL calibration lookup time.
+    :type sql_lookup_time: astropy.time.Time
+    :returns: Selection dictionary with ``status``, parent arrays, matched
+        companion, and a diagnostic ``reason``.
+    :rtype: dict
+    """
+
+    type14_reasons = []
+    valid_type14 = []
+    ordered_type14 = sorted(
+        _sql_record_list(bphsbd_records),
+        key=_sql_record_sort_key,
+        reverse=True,
+    )
+    for record in ordered_type14:
+        fresh, reason = _sql_record_in_lookup_day(
+            record,
+            sql_lookup_time,
+            'SQL BPH+SBD',
+        )
+        if not fresh:
+            if reason:
+                type14_reasons.append(reason)
+            continue
+        arrays, reason = _valid_sql_bphsbd_arrays(record)
+        if arrays is None:
+            if reason:
+                type14_reasons.append(reason)
+            continue
+        valid_type14.append((record, arrays))
+
+    type16_reasons = []
+    fresh_type16 = []
+    ordered_type16 = sorted(
+        _sql_record_list(bps_records),
+        key=_sql_record_sort_key,
+        reverse=True,
+    )
+    for record in ordered_type16:
+        fresh, reason = _sql_record_in_lookup_day(
+            record,
+            sql_lookup_time,
+            'SQL residual BPS',
+        )
+        if fresh:
+            fresh_type16.append(record)
+        elif reason:
+            type16_reasons.append(reason)
+
+    if fresh_type16:
+        for bphsbd_record, bphsbd_arrays in valid_type14:
+            for bps_record in fresh_type16:
+                companion, reason = _valid_sql_bps_companion(
+                    bps_record,
+                    bphsbd_record,
+                    bphsbd_arrays,
+                )
+                if companion is not None:
+                    return {
+                        'status': 'complete',
+                        'complete': True,
+                        'type16_records_present': True,
+                        'bphsbd_record': bphsbd_record,
+                        'bphsbd_arrays': bphsbd_arrays,
+                        'bps_companion': companion,
+                        'reason': None,
+                    }
+                if reason:
+                    type16_reasons.append(reason)
+        reasons = type14_reasons + type16_reasons
+        detail = []
+        for reason in reasons:
+            text = str(reason or '').strip()
+            if text and text not in detail:
+                detail.append(text)
+        return {
+            'status': 'partial',
+            'complete': False,
+            'type16_records_present': True,
+            'bphsbd_record': None,
+            'bphsbd_arrays': None,
+            'bps_companion': None,
+            'reason': (
+                'type-16 records exist but no complete digest-matched '
+                'type-14+16 family was found'
+                + (': ' + '; '.join(detail[:3]) if detail else '')
+            ),
+        }
+
+    if valid_type14:
+        bphsbd_record, bphsbd_arrays = valid_type14[0]
+        return {
+            'status': 'historical_type14',
+            'complete': False,
+            'type16_records_present': False,
+            'bphsbd_record': bphsbd_record,
+            'bphsbd_arrays': bphsbd_arrays,
+            'bps_companion': None,
+            'reason': (
+                'no type-16 records exist in the lookup local day; selected '
+                'historical type-14-only BPH+SBD'
+            ),
+        }
+
+    reasons = type14_reasons + type16_reasons
+    detail = []
+    for reason in reasons:
+        text = str(reason or '').strip()
+        if text and text not in detail:
+            detail.append(text)
+    return {
+        'status': 'missing',
+        'complete': False,
+        'type16_records_present': False,
+        'bphsbd_record': None,
+        'bphsbd_arrays': None,
+        'bps_companion': None,
+        'reason': (
+            'no usable type-14 BPH+SBD record found in the lookup local day'
+            + (': ' + '; '.join(detail[:3]) if detail else '')
+        ),
+    }
+
+
+def _load_sql_refcal_family(sql_lookup_time):
+    """Load and select one safe SQL type-14/type-16 family.
+
+    :param sql_lookup_time: SQL calibration lookup time.
+    :type sql_lookup_time: astropy.time.Time
+    :returns: Selection dictionary from :func:`_select_sql_refcal_family`.
+    :rtype: dict
+    """
+
+    bday, eday = _sql_lookup_local_day_bounds(sql_lookup_time)
+    try:
+        bphsbd_records = sql2refcal_bphsbdX(
+            [bday, eday],
+            nrecords=0,
+            neat=False,
+            verbose=False,
+        )
+    except Exception as exc:
+        return {
+            'status': 'query_failed',
+            'complete': False,
+            'type16_records_present': False,
+            'bphsbd_record': None,
+            'bphsbd_arrays': None,
+            'bps_companion': None,
+            'reason': 'type-14 query failed: {0}'.format(exc),
+        }
+    if sql2refcal_bpsX is None:
+        return {
+            'status': 'query_failed',
+            'complete': False,
+            'type16_records_present': False,
+            'bphsbd_record': None,
+            'bphsbd_arrays': None,
+            'bps_companion': None,
+            'reason': 'caltype-16 SQL reader is unavailable',
+        }
+    try:
+        bps_records = sql2refcal_bpsX(
+            [bday, eday],
+            nrecords=0,
+            neat=False,
+            verbose=False,
+        )
+    except Exception as exc:
+        return {
+            'status': 'query_failed',
+            'complete': False,
+            'type16_records_present': False,
+            'bphsbd_record': None,
+            'bphsbd_arrays': None,
+            'bps_companion': None,
+            'reason': 'type-16 query failed: {0}'.format(exc),
+        }
+    return _select_sql_refcal_family(
+        bphsbd_records,
+        bps_records,
+        sql_lookup_time,
+    )
 
 
 def _sql_smb_record_to_refcal(sql_lookup_time):
@@ -202,7 +859,7 @@ def _refcal_provenance_entry(msfile, lookup_time, cal_src, refcal,
         refcal_time = refcal.get('t_bg') or refcal.get('timestamp')
 
     refcal_time_utc = _time_iso_or_none(refcal_time)
-    return {
+    entry = {
         'vis': str(msfile),
         'lookup_time_utc': _time_iso_or_none(lookup_time),
         'source': source,
@@ -212,6 +869,16 @@ def _refcal_provenance_entry(msfile, lookup_time, cal_src, refcal,
         'refcal_date_utc': refcal_time_utc[:10] if refcal_time_utc else None,
         'applied': False,
     }
+    if cal_src == 'SQL BPH+SBD':
+        entry.update({
+            'bps_status': str(refcal.get('sql_bps_status') or 'skipped'),
+            'bps_reason': refcal.get('sql_bps_reason'),
+            'bps_sql_record_time_utc': _time_iso_or_none(
+                refcal.get('sql_bps_timestamp')
+            ),
+            'bps_product_digest': refcal.get('sql_bps_product_digest'),
+        })
+    return entry
 
 
 def _attach_sql_bphsbd_refcal(refcal, record, arrays):
@@ -263,6 +930,183 @@ def flag_phambd_by_spw(caltb, flagspw='0~1'):
     return True
 
 
+def _bps_candidate_code_for_source(source):
+    """Return the BPS candidate code for a resolved BPH source."""
+
+    if source in ('band_phase', 'lo_model', 'hi_model'):
+        return 1
+    if source in (
+        'secondary_band_phase',
+        'secondary_lo_model',
+        'secondary_hi_model',
+    ):
+        return 2
+    return 0
+
+
+def _bps_candidate_code_for_slot(
+        refcal, source, ant_i, pol_i, band_i):
+    """Return a nonzero owner only for a validated, co-gauge material BPS."""
+
+    code = _bps_candidate_code_for_source(source)
+    if code == 0 or int(ant_i) == 0:
+        return 0
+    candidate = refcal
+    if code == 2:
+        secondary = refcal.get('secondary_bph_refcal')
+        candidate = secondary if isinstance(secondary, dict) else {}
+    valid = np.asarray(candidate.get('bps_valid', []))
+    if (
+        valid.ndim != 3
+        or int(ant_i) < 0
+        or int(pol_i) < 0
+        or int(band_i) < 0
+        or int(ant_i) >= valid.shape[0]
+        or int(pol_i) >= valid.shape[1]
+        or int(band_i) >= valid.shape[2]
+        or valid[int(ant_i), int(pol_i), int(band_i)] != 1
+    ):
+        return 0
+    if _promoted_hi_gauge_affected(candidate, int(ant_i)):
+        centers = np.asarray(
+            candidate.get('fghz', []),
+            dtype=np.float64,
+        ).reshape(-1)
+        center_ghz = (
+            float(centers[int(band_i)])
+            if int(band_i) < centers.size
+            else np.nan
+        )
+        if (
+            not np.isfinite(center_ghz)
+            or center_ghz > 3.0
+        ) and not _promoted_hi_measurement_authorized(
+            candidate,
+            int(ant_i),
+            int(pol_i),
+            require_bps=True,
+        ):
+            return 0
+    return code
+
+
+def _refcal_bps_payload_for_spw(
+        refcal, candidate_code, phase_flag, band_id, target_freq_ghz, nant):
+    """Build one SPW's phase-only residual BPS payload.
+
+    :param refcal: Primary NPZ candidate or normalized SQL candidate.
+    :type refcal: dict
+    :param candidate_code: Per-antenna/polarization source codes; 1 selects
+        the primary residual grid, 2 selects the secondary residual grid, and
+        0 is an identity tier. For SQL these are already final-authorized by
+        the producer.
+    :type candidate_code: array-like
+    :param phase_flag: Per-antenna/polarization BPH invalid flags.
+    :type phase_flag: array-like
+    :param band_id: One-based EOVSA band identifier.
+    :type band_id: int
+    :param target_freq_ghz: Science channel frequencies in GHz.
+    :type target_freq_ghz: array-like
+    :param nant: Number of antenna rows in the CASA table.
+    :type nant: int
+    :returns: ``(cparam, flag, applied_slots, authorized_slots)`` with arrays
+        shaped ``(nant, 2, nchan)``.
+    :rtype: tuple[numpy.ndarray, numpy.ndarray, int, int]
+    """
+
+    target = np.asarray(target_freq_ghz, dtype=np.float64).reshape(-1)
+    cparam = np.ones((int(nant), 2, target.size), dtype=np.complex128)
+    flag = np.zeros((int(nant), 2, target.size), dtype=np.bool_)
+    codes = np.asarray(candidate_code)
+    invalid = np.asarray(phase_flag)
+    if (
+        codes.ndim != 2
+        or invalid.ndim != 2
+        or codes.shape[1] < 2
+        or invalid.shape[1] < 2
+    ):
+        flag[:] = True
+        return cparam, flag, 0, 0
+
+    covered_nant = min(int(nant), codes.shape[0], invalid.shape[0])
+    secondary = refcal.get('secondary_bph_refcal')
+    applied_slots = 0
+    authorized_slots = 0
+    for ant_i in range(covered_nant):
+        for pol_i in range(2):
+            if invalid[ant_i, pol_i] != 0:
+                flag[ant_i, pol_i, :] = True
+                continue
+            code = int(codes[ant_i, pol_i])
+            if code not in (1, 2):
+                continue
+            authorized_slots += 1
+            candidate = refcal if code == 1 else (
+                secondary if isinstance(secondary, dict) else {}
+            )
+            bps_phase, applied = sample_refcal_bps_for_band(
+                candidate,
+                ant_i,
+                pol_i,
+                band_id,
+                target,
+            )
+            if applied:
+                cparam[ant_i, pol_i, :] = np.exp(1j * bps_phase)
+                applied_slots += 1
+            # Residual BPS is optional. If its native support cannot be sampled
+            # on this science grid, retain the identity B table so the already
+            # valid BPH+SBD calibration remains applicable.
+    flag[covered_nant:, :, :] = True
+    return cparam, flag, applied_slots, authorized_slots
+
+
+def _eovsa_bps_target_channel_centers(
+        spw_name, channel_frequency_hz, channel_width_hz):
+    """Recover physical centers from the legacy 52-band impteovsa grid.
+
+    ``impteovsa`` supplied the nominal lower edge to CASA as the first channel
+    center, so legacy ``CHAN_FREQ`` values are lower edges.  Shift only the
+    exact EOVSA 52-band lower-edge fingerprint; standards-compliant center
+    grids and unknown MS layouts pass through unchanged.
+    """
+
+    frequency = np.asarray(
+        channel_frequency_hz,
+        dtype=np.float64,
+    ).reshape(-1)
+    width = np.asarray(channel_width_hz, dtype=np.float64).reshape(-1)
+    name = str(spw_name)
+    if (
+        not name.startswith('band')
+        or len(name) != 6
+        or not name[4:].isdigit()
+        or frequency.size == 0
+        or frequency.shape != width.shape
+        or not np.all(np.isfinite(frequency))
+        or not np.all(np.isfinite(width))
+        or np.any(width == 0.0)
+    ):
+        return frequency
+    band_id = int(name[4:])
+    if band_id < 1 or band_id > 52:
+        return frequency
+
+    nominal_lower_edge_hz = (
+        1.1 + (band_id - 1) * 0.325
+    ) * 1e9
+    expected_legacy_edges_hz = nominal_lower_edge_hz + np.concatenate(
+        ([0.0], np.cumsum(width[:-1], dtype=np.float64))
+    )
+    if not np.allclose(
+            frequency,
+            expected_legacy_edges_hz,
+            rtol=0.0,
+            atol=1.0):
+        return frequency
+    return frequency + width / 2.0
+
+
 def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, doflag=True, flagant='',
                flagspw='', doimage=False, imagedir=None, antenna='', timerange=None, spw=None, stokes=None,
                dosplit=False, outputvis=None, doconcat=False, concatvis=None, keep_orig_ms=True,
@@ -301,6 +1145,15 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
         cal_npz_refcal, cal_npz_phacals = load_calwidget_v2_npz(cal_npz)
         if secondary_npz and refcal_npz_mode == 'bph_sbd':
             _attach_secondary_bph_refcal(cal_npz_refcal, secondary_npz)
+        if (
+            cal_npz_refcal.get('frozen_relative_product_verified', False)
+            and refcal_npz_mode == 'bph_sbd'
+            and force_lo_hi_smooth_extrap
+        ):
+            raise ValueError(
+                'force_lo_hi_smooth_extrap cannot modify a reviewed '
+                'frozen-product NPZ.'
+            )
         cal_src = 'calwidget v2 NPZ'
         print('Loaded refcal + {0} phacal(s) from calwidget v2 NPZ {1}'.format(
             len(cal_npz_phacals), cal_npz))
@@ -363,6 +1216,17 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
             chan_freqs_per_spw = [
                 np.asarray(tb.getcell('CHAN_FREQ', s), dtype=np.float64).reshape(-1) for s in range(nspw)
             ]
+            chan_widths_per_spw = [
+                np.asarray(tb.getcell('CHAN_WIDTH', s), dtype=np.float64).reshape(-1) for s in range(nspw)
+            ]
+            bps_target_freqs_per_spw = [
+                _eovsa_bps_target_channel_centers(
+                    bdname[s],
+                    chan_freqs_per_spw[s],
+                    chan_widths_per_spw[s],
+                )
+                for s in range(nspw)
+            ]
 
             tb.close()
             tb.open(msfile + '/ANTENNA')
@@ -410,6 +1274,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
 
             if ('refpha' in caltype) or ('refamp' in caltype) or ('refcal' in caltype):
                 sql_smb_active = False
+                sql_bps_active = False
                 if cal_npz_refcal is not None:
                     refcal = cal_npz_refcal
                 elif refcal_sql_mode == 'legacy':
@@ -443,29 +1308,58 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     casalog.post(msg_prompt)
                     print(msg_prompt)
                 else:
-                    bphsbd_arrays = None
-                    try:
-                        bphsbd_rec = sql2refcal_bphsbdX(sql_lookup_time)
-                    except Exception as exc:
-                        bphsbd_rec = None
-                        bphsbd_reason = "query failed: {0}".format(exc)
-                    else:
-                        bphsbd_rec = _single_sql_record(bphsbd_rec)
-                        bphsbd_fresh, bphsbd_reason = _sql_record_in_lookup_day(
-                            bphsbd_rec, sql_lookup_time, "SQL BPH+SBD"
+                    sql_family = _load_sql_refcal_family(sql_lookup_time)
+                    family_status = sql_family.get('status')
+                    bphsbd_reason = sql_family.get('reason')
+                    use_historical_type14 = bool(
+                        refcal_sql_mode == 'auto'
+                        and family_status == 'historical_type14'
+                    )
+                    if (
+                        refcal_sql_mode == 'bph_sbd'
+                        and family_status != 'complete'
+                    ):
+                        raise ValueError(
+                            'refcal_sql_mode="bph_sbd" requires a complete '
+                            'digest-matched SQL type-14+16 family for {0}: '
+                            '{1}.'.format(
+                                sql_lookup_time.iso,
+                                bphsbd_reason or family_status,
+                            )
                         )
-                        if bphsbd_fresh:
-                            bphsbd_arrays, bphsbd_reason = _valid_sql_bphsbd_arrays(bphsbd_rec)
-                    if bphsbd_rec is not None and bphsbd_arrays is not None:
+                    if family_status == 'complete' or use_historical_type14:
+                        bphsbd_rec = sql_family['bphsbd_record']
+                        bphsbd_arrays = sql_family['bphsbd_arrays']
+                        sql_bps_companion = sql_family['bps_companion']
+                        sql_bps_active = family_status == 'complete'
+                        sql_bps_reason = (
+                            None
+                            if sql_bps_active
+                            else bphsbd_reason
+                        )
                         try:
                             refcal = sql2refcalX(sql_lookup_time)
                             type8_time = refcal.get("timestamp")
                             refcal = _attach_sql_bphsbd_refcal(refcal, bphsbd_rec, bphsbd_arrays)
+                            refcal = _attach_sql_bps_refcal(
+                                refcal,
+                                sql_bps_companion,
+                                sql_bps_reason,
+                            )
                             # Keep the legacy type-8 time for diagnostics only.  SQL BPH+SBD
                             # phacals are solved against the BPH+SBD t_refcal, so the phacal
                             # filter below must not use this legacy timestamp in this mode.
                             refcal["type8_timestamp"] = type8_time
-                            msg_prompt = "SQL BPH+SBD refcal tables found; superseding type-8 phase calibration"
+                            msg_prompt = (
+                                "Complete SQL type-14+16 BPH+SBD+BPS "
+                                "refcal family found"
+                                if sql_bps_active
+                                else (
+                                    "Historical SQL type-14-only BPH+SBD "
+                                    "refcal found"
+                                )
+                            )
+                            msg_prompt += "; superseding type-8 phase calibration"
                             if type8_time is not None:
                                 msg_prompt += " from type-8 refcal at {0}".format(type8_time.iso)
                             t_refcal = bphsbd_rec.get("t_refcal")
@@ -484,39 +1378,46 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                             msg_prompt += "."
                         except Exception as exc:
                             refcal = _attach_sql_bphsbd_refcal({}, bphsbd_rec, bphsbd_arrays)
+                            refcal = _attach_sql_bps_refcal(
+                                refcal,
+                                sql_bps_companion,
+                                sql_bps_reason,
+                            )
                             msg_prompt = (
                                 "SQL BPH+SBD refcal tables found and used without type-8 metadata "
                                 "because sql2refcalX failed: {0}."
                             ).format(exc)
+                        if sql_bps_active:
+                            msg_prompt += (
+                                " Matched SQL residual BPS companion selected."
+                            )
+                        else:
+                            msg_prompt += (
+                                " Residual BPS skipped; {0}."
+                            ).format(sql_bps_reason or "record unavailable")
                         cal_src = "SQL BPH+SBD"
                     else:
-                        if refcal_sql_mode == 'auto':
-                            smb_result = _sql_smb_record_to_refcal(sql_lookup_time)
-                            if smb_result[0] is not None:
-                                refcal, msg_prompt = smb_result
-                                sql_smb_active = True
-                                cal_src = 'SQL smooth bandpass (caltype 15)'
-                                msg_prompt = (
-                                    "SQL BPH+SBD tables not usable ({0}); "
-                                ).format(bphsbd_reason or "record missing") + msg_prompt
-                            else:
-                                refcal = sql2refcalX(sql_lookup_time)
-                                cal_src = 'SQL legacy type-8 BPH'
-                                msg_prompt = (
-                                    "SQL BPH+SBD tables not usable ({0}); SQL smooth-bandpass "
-                                    "not usable ({1}); using legacy SQL type-8 BPH + phacal MBD."
-                                ).format(
-                                    bphsbd_reason or "record missing",
-                                    smb_result[1] or "record missing",
-                                )
+                        smb_result = _sql_smb_record_to_refcal(sql_lookup_time)
+                        if smb_result[0] is not None:
+                            refcal, msg_prompt = smb_result
+                            sql_smb_active = True
+                            cal_src = 'SQL smooth bandpass (caltype 15)'
+                            msg_prompt = (
+                                "Complete SQL type-14+16 family not usable "
+                                "({0}); "
+                            ).format(
+                                bphsbd_reason or "record missing"
+                            ) + msg_prompt
                         else:
                             refcal = sql2refcalX(sql_lookup_time)
                             cal_src = 'SQL legacy type-8 BPH'
                             msg_prompt = (
-                                "SQL refcal BPH+SBD tables not usable ({0}); "
+                                "Complete SQL type-14+16 family not usable "
+                                "({0}); SQL smooth-bandpass not usable ({1}); "
                                 "using legacy SQL type-8 BPH + phacal MBD."
                             ).format(
-                                bphsbd_reason or "record missing"
+                                bphsbd_reason or "record missing",
+                                smb_result[1] or "record missing",
                             )
                     casalog.post(msg_prompt)
                     print(msg_prompt)
@@ -544,14 +1445,109 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 # per-channel B-table builder as the NPZ smooth_bandpass mode.
                 use_sql_smooth_bandpass = bool(cal_npz_refcal is None and sql_smb_active)
                 use_smooth_bandpass = bool(use_npz_smooth_bandpass or use_sql_smooth_bandpass)
-                resolved_bph = np.asarray(refcal.get('resolved_bph_rad', []), dtype=np.float64)
-                resolved_sbd = np.asarray(refcal.get('resolved_sbd_ns', []), dtype=np.float64)
-                resolved_flag = np.asarray(refcal.get('resolved_flag', []), dtype=np.float64)
+                use_sql_bps = bool(
+                    cal_npz_refcal is None
+                    and cal_src == 'SQL BPH+SBD'
+                    and sql_bps_active
+                )
+                use_residual_bps = bool(use_npz_bph_sbd or use_sql_bps)
+                sql_bps_candidate = np.asarray(
+                    refcal.get('sql_bps_candidate_code', []),
+                    dtype=np.uint8,
+                )
+                sql_bps_authorized = np.asarray(
+                    refcal.get('sql_bps_authorized', []),
+                    dtype=np.bool_,
+                )
+                resolved_source = None
+                use_frozen_npz_product = False
+                if use_npz_bph_sbd:
+                    resolved_nband = max(
+                        52,
+                        int(np.asarray(refcal.get('fghz', [])).size),
+                        max(bd) + 1 if bd else 0,
+                    )
+                    frozen_tables = frozen_resolved_bph_sbd_tables(
+                        refcal,
+                        nant=nant - 1,
+                        nband=resolved_nband,
+                    )
+                    if frozen_tables is not None:
+                        (
+                            resolved_bph,
+                            resolved_sbd,
+                            resolved_flag,
+                            resolved_source,
+                            resolved_ref_freq,
+                        ) = frozen_tables
+                        use_frozen_npz_product = True
+                    else:
+                        (
+                            resolved_bph,
+                            resolved_sbd,
+                            resolved_flag,
+                            resolved_source,
+                            resolved_ref_freq,
+                        ) = resolve_bph_sbd_tables(
+                            refcal,
+                            nant=nant - 1,
+                            nband=resolved_nband,
+                            force_lo_hi_smooth_extrap=(
+                                force_lo_hi_smooth_extrap
+                            ),
+                            return_sources=True,
+                            return_ref_freqs=True,
+                        )
+                else:
+                    resolved_bph = np.asarray(
+                        refcal.get('resolved_bph_rad', []),
+                        dtype=np.float64,
+                    )
+                    resolved_sbd = np.asarray(
+                        refcal.get('resolved_sbd_ns', []),
+                        dtype=np.float64,
+                    )
+                    resolved_flag = np.asarray(
+                        refcal.get('resolved_flag', []),
+                        dtype=np.float64,
+                    )
+                    resolved_ref_freq = np.asarray(
+                        refcal.get('resolved_ref_frequency_ghz', []),
+                        dtype=np.float64,
+                    )
+                    if resolved_ref_freq.shape != resolved_bph.shape:
+                        # Historical type-14-only records predate the
+                        # authoritative pivot vector. Preserve their legacy
+                        # auto-mode behavior by falling back to type-8 fghz.
+                        # A complete type-14+16 family never takes this path.
+                        resolved_ref_freq = np.full(
+                            resolved_bph.shape,
+                            np.nan,
+                            dtype=np.float64,
+                        )
+                        saved_band_ref = np.asarray(
+                            refcal.get('fghz', []),
+                            dtype=np.float64,
+                        ).reshape(-1)
+                        if resolved_ref_freq.ndim == 3:
+                            nband_ref = min(
+                                resolved_ref_freq.shape[2],
+                                saved_band_ref.size,
+                            )
+                            resolved_ref_freq[:, :, :nband_ref] = (
+                                saved_band_ref[:nband_ref][None, None, :]
+                            )
                 use_resolved_tables = bool(
-                    not force_lo_hi_smooth_extrap
+                    (
+                        use_npz_bph_sbd
+                        or cal_src == 'SQL BPH+SBD'
+                        or not force_lo_hi_smooth_extrap
+                    )
                     and resolved_bph.ndim == 3
                     and resolved_sbd.ndim == 3
                     and resolved_flag.ndim == 3
+                    and resolved_ref_freq.ndim == 3
+                    and resolved_ref_freq.shape == resolved_bph.shape
                 )
                 smooth_sbd = None
                 if use_npz_smooth_model or use_npz_bph_sbd:
@@ -608,6 +1604,7 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 calamp = np.zeros((nspw, nant - 1, 2))
                 mbd_ref_ghz = float(cfreq_spw0) * 1e-9
                 phase_flag_spw = np.ones((nant - 1, 2, nspw), dtype=np.int32)
+                bps_candidate_spw = np.zeros((nant - 1, 2, nspw), dtype=np.uint8)
                 selected_npz_models = set()
                 band_phase = np.asarray(refcal.get('band_phase_rad', []), dtype=np.float64)
                 band_phase_flag = np.asarray(refcal.get('band_phase_flag', []), dtype=np.int32)
@@ -646,19 +1643,83 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                     and n < resolved_flag.shape[0]
                                     and p < resolved_flag.shape[1]
                                     and band_i < resolved_flag.shape[2]
+                                    and n < resolved_ref_freq.shape[0]
+                                    and p < resolved_ref_freq.shape[1]
+                                    and band_i < resolved_ref_freq.shape[2]
                                 ):
                                     ph = resolved_bph[n, p, band_i]
                                     sb = resolved_sbd[n, p, band_i]
                                     fl = resolved_flag[n, p, band_i]
+                                    source_ref_freq_ghz = (
+                                        resolved_ref_freq[n, p, band_i]
+                                    )
                                 else:
                                     ph = 0.0
                                     sb = np.nan
                                     fl = 1.0
-                                flagged = bool(fl) or not np.isfinite(sb)
+                                    source_ref_freq_ghz = np.nan
+                                flagged = (
+                                    bool(fl)
+                                    or not np.isfinite(sb)
+                                    or not np.isfinite(source_ref_freq_ghz)
+                                )
                                 phase_flag_spw[n, p, s] = 1 if flagged else 0
-                                phase_rad = 0.0 if (flagged or not np.isfinite(ph)) else float(ph)
+                                phase_rad = (
+                                    0.0
+                                    if (flagged or not np.isfinite(ph))
+                                    else recenter_bph_rad(
+                                        ph,
+                                        sb,
+                                        source_ref_freq_ghz,
+                                        float(cfreqs_spw[s]) * 1e-9,
+                                    )
+                                )
+                                if not np.isfinite(phase_rad):
+                                    flagged = True
+                                    phase_flag_spw[n, p, s] = 1
+                                    phase_rad = 0.0
                                 para_sbd.append(0.0 if flagged else float(sb))
-                                selected_npz_models.add('resolved_tables')
+                                source = 'resolved_tables'
+                                if use_npz_bph_sbd:
+                                    if (
+                                        isinstance(resolved_source, np.ndarray)
+                                        and resolved_source.ndim == 3
+                                        and n < resolved_source.shape[0]
+                                        and p < resolved_source.shape[1]
+                                        and band_i < resolved_source.shape[2]
+                                    ):
+                                        source = str(
+                                            resolved_source[n, p, band_i]
+                                        )
+                                    if not flagged:
+                                        bps_candidate_spw[n, p, s] = (
+                                            _bps_candidate_code_for_slot(
+                                                refcal,
+                                                source,
+                                                n,
+                                                p,
+                                                band_i,
+                                            )
+                                        )
+                                elif (
+                                    use_sql_bps
+                                    and not flagged
+                                    and sql_bps_candidate.ndim == 3
+                                    and sql_bps_authorized.shape
+                                    == sql_bps_candidate.shape
+                                    and n < sql_bps_candidate.shape[0]
+                                    and p < sql_bps_candidate.shape[1]
+                                    and band_i < sql_bps_candidate.shape[2]
+                                    and sql_bps_authorized[
+                                        n,
+                                        p,
+                                        band_i,
+                                    ]
+                                ):
+                                    bps_candidate_spw[n, p, s] = (
+                                        sql_bps_candidate[n, p, band_i]
+                                    )
+                                selected_npz_models.add(source)
                             elif band_triplet:
                                 phase_rad = _triplet_value(
                                     band_triplet, 'phi_band_rad', n, p, band_i, default=np.nan
@@ -731,6 +1792,16 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                 if flagged or not np.isfinite(phase_rad):
                                     phase_rad = 0.0
                                 para_sbd.append(0.0 if flagged else float(sbd_ns))
+                                if not flagged:
+                                    bps_candidate_spw[n, p, s] = (
+                                        _bps_candidate_code_for_slot(
+                                            refcal,
+                                            source,
+                                            n,
+                                            p,
+                                            band_i,
+                                        )
+                                    )
                                 selected_npz_models.add(source)
                             else:
                                 phase_rad = pha[n, p, band_i]
@@ -766,7 +1837,13 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     ))
                 if use_resolved_tables:
                     print("{0} resolved BPH+SBD refcal tables selected by SPW: {1}".format(
-                        "NPZ" if cal_npz_refcal is not None else "SQL",
+                        (
+                            "NPZ frozen product"
+                            if use_frozen_npz_product
+                            else "NPZ"
+                            if cal_npz_refcal is not None
+                            else "SQL"
+                        ),
                         ",".join(sorted(selected_npz_models)) if selected_npz_models else "none",
                     ))
                 if use_npz_smooth_model:
@@ -906,6 +1983,102 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     refcal_gaintables = [caltb_pha]
                     gaintables.append(caltb_pha)
                     spwmaps.append([])
+                if use_residual_bps:
+                    bps_apply_refcal = (
+                        refcal
+                        if use_npz_bph_sbd
+                        else refcal.get('sql_bps_refcal', {})
+                    )
+                    caltb_bps = (
+                        dirname
+                        + t_ref.isot[:-4].replace(':', '').replace('-', '')
+                        + refcal_npz_suffix
+                        + '.refbps'
+                    )
+                    if os.path.exists(caltb_bps):
+                        shutil.rmtree(caltb_bps)
+                    bandpass(
+                        vis=msfile,
+                        caltable=caltb_bps,
+                        solint='inf',
+                        refant='eo01',
+                        minblperant=0,
+                        minsnr=0,
+                        bandtype='B',
+                        docallib=False,
+                    )
+                    bps_applied_slots = 0
+                    bps_authorized_slots = 0
+                    tb.open(caltb_bps, nomodify=False)
+                    for ll in range(nspw):
+                        nchan_ll = int(bd_nchan[ll])
+                        freq_ghz = (
+                            np.asarray(
+                                bps_target_freqs_per_spw[ll],
+                                dtype=np.float64,
+                            ).reshape(-1)
+                            * 1e-9
+                        )
+                        if freq_ghz.size != nchan_ll:
+                            raise ValueError(
+                                'SPW {0:d} NUM_CHAN={1:d} but CHAN_FREQ has {2:d} values'.format(
+                                    ll,
+                                    nchan_ll,
+                                    freq_ghz.size,
+                                )
+                            )
+                        cp, fl, applied_count, measured_count = (
+                            _refcal_bps_payload_for_spw(
+                                bps_apply_refcal,
+                                bps_candidate_spw[:, :, ll],
+                                phase_flag_spw[:, :, ll],
+                                int(bd[ll]) + 1,
+                                freq_ghz,
+                                nant,
+                            )
+                        )
+                        bps_applied_slots += int(applied_count)
+                        bps_authorized_slots += int(measured_count)
+                        cp_table = np.moveaxis(cp, 0, 2)
+                        flag_table = np.moveaxis(fl, 0, 2)
+                        tb.putcol('CPARAM', cp_table, ll * nant, nant)
+                        tb.putcol('FLAG', flag_table, ll * nant, nant)
+                        tb.putcol(
+                            'SNR',
+                            np.where(flag_table, 0.0, 100.0),
+                            ll * nant,
+                            nant,
+                        )
+                        paramerr = tb.getcol('PARAMERR', ll * nant, nant)
+                        tb.putcol('PARAMERR', paramerr * 0, ll * nant, nant)
+                    tb.close()
+                    gaintables.append(caltb_bps)
+                    refcal_gaintables.append(caltb_bps)
+                    spwmaps.append([])
+                    msg_prompt = (
+                        'Validated residual BPS applied to {0:d} of {1:d} '
+                        'authorized antenna/pol/SPW slots; source={2}; '
+                        'table={3}'
+                    ).format(
+                        bps_applied_slots,
+                        bps_authorized_slots,
+                        'SQL type 16' if use_sql_bps else 'NPZ',
+                        os.path.basename(caltb_bps),
+                    )
+                    casalog.post(msg_prompt)
+                    print(msg_prompt)
+                    if pending_refcal_provenance is not None and use_sql_bps:
+                        pending_refcal_provenance['bps_status'] = (
+                            'applied'
+                            if bps_applied_slots > 0
+                            else 'matched_no_target_slots'
+                        )
+                        pending_refcal_provenance['bps_applied_slots'] = int(
+                            bps_applied_slots
+                        )
+                        pending_refcal_provenance['bps_authorized_slots'] = int(
+                            bps_authorized_slots
+                        )
                 if use_npz_triplets or use_npz_smooth_model or use_npz_bph_sbd or use_resolved_tables:
                     delay_table_kinds = [('sbd', para_sbd, 'sbd', True)]
                     if use_npz_triplets:
@@ -1018,17 +2191,26 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                 if phacals.any() and len(phacals) > 0:
                     if cal_src == "SQL BPH+SBD":
                         phacal_ref_time = refcal.get('sql_bphsbd_t_refcal') or refcal['timestamp']
+                        require_absolute_phacal_match = True
                     elif cal_src == 'SQL smooth bandpass (caltype 15)':
                         phacal_ref_time = refcal.get('sql_smb_t_refcal') or refcal['timestamp']
+                        require_absolute_phacal_match = True
                     else:
                         phacal_ref_time = refcal.get('type8_timestamp') or refcal['timestamp']
-                    keep = np.array(
-                        [(phacal['t_ref'].jd - phacal_ref_time.jd) <= 30. / 1440. for phacal in phacals],
-                        dtype=bool,
+                        require_absolute_phacal_match = False
+                    keep = _phacal_reference_keep_mask(
+                        phacals,
+                        phacal_ref_time,
+                        require_absolute_phacal_match,
                     )
                     if not np.all(keep):
-                        print("Filtered out {0} phacal(s) with reference time >30 min after refcal {1}".format(
-                            int(np.count_nonzero(~keep)), phacal_ref_time.iso))
+                        relation = (
+                            "outside +/-30 min of"
+                            if require_absolute_phacal_match
+                            else ">30 min after"
+                        )
+                        print("Filtered out {0} phacal(s) with reference time {1} refcal {2}".format(
+                            int(np.count_nonzero(~keep)), relation, phacal_ref_time.iso))
                     phacals = phacals[keep]
                 if not phacals.any() or len(phacals) == 0:
                     print(f"Found no phacal records in {cal_src}, will skip phase calibration")
