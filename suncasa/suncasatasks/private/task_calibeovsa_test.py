@@ -1249,7 +1249,10 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
 def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
                                 applycal_error=None, bps=None,
                                 refcal_sql_mode='auto',
-                                gencal_calls=None):
+                                gencal_calls=None, sql_cal_time=None,
+                                caltype=None, interp=None, phacals=None,
+                                phacal_calls=None, reboot_calls=None,
+                                dcm_calls=None):
     from . import task_calibeovsa as production
 
     scan_start = Time('2026-07-09 13:51:55.500')
@@ -1322,8 +1325,24 @@ def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
     monkeypatch.setattr(production, 'sql2refcalX', lambda *_args, **_kwargs: dict(legacy))
     monkeypatch.setattr(production, 'sql2refcal_bphsbdX', lambda *_args, **_kwargs: dict(bphsbd))
     monkeypatch.setattr(production, 'sql2refcal_bpsX', lambda *_args, **_kwargs: bps)
-    monkeypatch.setattr(production.db, 'get_reboot', lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(production.ch, 'read_calX', lambda *_args, **_kwargs: (None, None))
+    def fake_get_reboot(*args, **kwargs):
+        if reboot_calls is not None:
+            reboot_calls.append((args, kwargs))
+        return []
+
+    def fake_read_cal(*args, **kwargs):
+        if dcm_calls is not None:
+            dcm_calls.append((args, kwargs))
+        return (None, None)
+
+    def fake_sql2phacal(*args, **kwargs):
+        if phacal_calls is not None:
+            phacal_calls.append((args, kwargs))
+        return [] if phacals is None else phacals
+
+    monkeypatch.setattr(production.db, 'get_reboot', fake_get_reboot)
+    monkeypatch.setattr(production.ch, 'read_calX', fake_read_cal)
+    monkeypatch.setattr(production, 'sql2phacalX', fake_sql2phacal)
     monkeypatch.setattr(
         production,
         'gencal',
@@ -1339,11 +1358,13 @@ def _run_refcal_provenance_case(monkeypatch, tmp_path, legacy, bphsbd,
 
     result = production.calibeovsa(
         str(msfile),
-        caltype=['refpha'],
+        caltype=['refpha'] if caltype is None else caltype,
+        interp=interp,
         caltbdir=str(caltbdir) + '/',
         docalib=True,
         doflag=False,
         refcal_sql_mode=refcal_sql_mode,
+        sql_cal_time=sql_cal_time,
         refcal_provenance=provenance,
     )
 
@@ -1572,6 +1593,45 @@ def test_calibeovsa_skips_mismatched_sql_residual_bps(monkeypatch, tmp_path):
     assert provenance[0]['source'] == 'sql_legacy_type8'
 
 
+def test_residual_bps_paramerr_initializes_appended_rows_without_reading_them():
+    """Appended CASA rows receive shaped PARAMERR zeros without getcol."""
+    from . import task_calibeovsa as production
+
+    class ParamerrTable:
+        def __init__(self):
+            self.calls = []
+
+        def getcol(self, name, startrow, nrow):
+            self.calls.append((name, startrow, nrow))
+            return np.ones((2, 1, nrow), dtype=np.float64)
+
+    table = ParamerrTable()
+    cp_rows = np.ones((2, 1, 16), dtype=np.complex128)
+    appended = production._residual_bps_paramerr(
+        table,
+        startrow=784,
+        nrow=16,
+        cp_rows=cp_rows,
+        new_rows=True,
+    )
+
+    assert appended.shape == cp_rows.shape
+    assert appended.dtype == np.float64
+    assert np.all(appended == 0.0)
+    assert table.calls == []
+
+    existing = production._residual_bps_paramerr(
+        table,
+        startrow=0,
+        nrow=16,
+        cp_rows=cp_rows,
+        new_rows=False,
+    )
+    assert existing.shape == cp_rows.shape
+    assert np.all(existing == 0.0)
+    assert table.calls == [('PARAMERR', 0, 16)]
+
+
 def test_explicit_bph_sbd_rejects_incomplete_sql_family(monkeypatch, tmp_path):
     """Explicit full-route mode must fail when type 16 does not match."""
 
@@ -1622,6 +1682,30 @@ def test_sql_bps_pairing_searches_past_newer_orphan(monkeypatch):
     assert len(calls) == 1
     assert calls[0][1]['nrecords'] == 0
     assert calls[0][1]['neat'] is False
+
+
+def test_sql_bps_preserve_sampler_contract_reaches_both_runtime_candidates():
+    """Contract 2 must survive SQL validation into both sampler groups."""
+
+    from . import task_calibeovsa as production
+
+    _legacy, bphsbd, bps = _sql_bps_route_records()
+    bps['sampler_contract_code'] = 2
+    arrays, reason = production._valid_sql_bphsbd_arrays(bphsbd)
+    assert reason is None
+
+    companion, reason = production._valid_sql_bps_companion(
+        bps,
+        bphsbd,
+        arrays,
+    )
+
+    assert reason is None
+    assert companion['sampler_contract_code'] == 2
+    assert companion['bps_refcal']['sampler_contract_code'] == 2
+    assert companion['bps_refcal']['secondary_bph_refcal'][
+        'sampler_contract_code'
+    ] == 2
 
 
 def test_sql_family_selects_older_complete_pair_past_newer_partials():
@@ -1744,6 +1828,131 @@ def test_companion_sql_phacal_filter_rejects_old_sentinel_and_keeps_match():
 
     np.testing.assert_array_equal(strict, [False, True, False])
     np.testing.assert_array_equal(legacy, [True, True, False])
+
+
+def test_cross_day_sql_effective_times_shift_without_mutating_source_records():
+    """Prior-day SQL records retain source times while effective clocks shift."""
+    from . import task_calibeovsa as production
+
+    source_day = Time('2026-08-29 18:00:00.000')
+    target_day = Time('2026-08-30 18:00:00.000')
+    assert production._sql_observing_day_offset(target_day, source_day) == 1
+
+    source_refcal = Time('2026-08-29 12:52:53.000')
+    effective_refcal = production._shift_time_by_observing_days(
+        source_refcal,
+        production._sql_observing_day_offset(target_day, source_day),
+    )
+    assert effective_refcal.iso == '2026-08-30 12:52:53.000'
+
+    phacals = np.array([
+        {
+            't_ref': source_refcal,
+            't_pha': Time('2026-08-29 10:00:00.000'),
+        },
+        {
+            't_ref': source_refcal,
+            't_pha': Time('2026-08-29 16:00:00.000'),
+        },
+    ], dtype=object)
+    source_phacal_times = [record['t_pha'].iso for record in phacals]
+    effective_phacal_times = production._effective_sql_phacal_times(phacals, 1)
+
+    assert [time.iso for time in effective_phacal_times] == [
+        '2026-08-30 10:00:00.000',
+        '2026-08-30 16:00:00.000',
+    ]
+    assert [record['t_pha'].iso for record in phacals] == source_phacal_times
+    assert [record['t_ref'].iso for record in phacals] == [
+        source_refcal.iso,
+        source_refcal.iso,
+    ]
+
+
+def test_cross_day_sql_calibration_retimes_phacal_interpolation_and_runtime_checks(
+        monkeypatch, tmp_path):
+    """Cross-day SQL uses source-day queries and target-day runtime clocks."""
+    source_record_time = Time('2026-07-08 07:12:00.000')
+    source_refcal_time = Time('2026-07-08 12:52:53.000')
+    legacy = {
+        'pha': np.zeros((2, 2, 1), dtype=np.float64),
+        'amp': np.ones((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': source_record_time,
+        't_bg': source_refcal_time,
+        't_ed': Time('2026-07-08 13:46:27.000'),
+    }
+    bphsbd = {
+        'bph_rad': np.zeros((2, 2, 1), dtype=np.float64),
+        'sbd_ns': np.zeros((2, 2, 1), dtype=np.float64),
+        'flag': np.zeros((2, 2, 1), dtype=np.int32),
+        'timestamp': source_record_time,
+        't_refcal': source_refcal_time,
+    }
+    phacals = np.array([
+        {
+            't_ref': source_refcal_time,
+            't_pha': Time('2026-07-08 10:00:00.000'),
+            'pslope': np.zeros((2, 2), dtype=np.float64),
+            'flag': np.zeros((2, 2), dtype=np.int32),
+        },
+        {
+            't_ref': source_refcal_time,
+            't_pha': Time('2026-07-08 16:00:00.000'),
+            'pslope': np.ones((2, 2), dtype=np.float64),
+            'flag': np.zeros((2, 2), dtype=np.int32),
+        },
+    ], dtype=object)
+    gencal_calls = []
+    phacal_calls = []
+    reboot_calls = []
+    dcm_calls = []
+    msfile, scan_start, result, applied, provenance = _run_refcal_provenance_case(
+        monkeypatch,
+        tmp_path,
+        legacy,
+        bphsbd,
+        gencal_calls=gencal_calls,
+        sql_cal_time=Time('2026-07-08 23:59:59.000'),
+        caltype=['refpha', 'phacal'],
+        interp='auto',
+        phacals=phacals,
+        phacal_calls=phacal_calls,
+        reboot_calls=reboot_calls,
+        dcm_calls=dcm_calls,
+    )
+
+    assert result == [msfile]
+    assert len(applied) == 1
+    assert provenance[0]['refcal_time_utc'] == source_refcal_time.iso
+    assert provenance[0]['refcal_date_utc'] == '2026-07-08'
+    assert len(phacal_calls) == 1
+    query_start, query_end = phacal_calls[0][0][0]
+    assert query_start.iso == '2026-07-08 07:00:00.000'
+    assert query_end.iso == '2026-07-09 07:00:00.000'
+
+    assert len(reboot_calls) == 1
+    reboot_times = reboot_calls[0][0][0]
+    assert reboot_times[0].iso == '2026-07-09 12:52:53.000'
+    assert reboot_times[1].iso == scan_start.iso
+    assert len(dcm_calls) == 1
+    dcm_times = dcm_calls[0][1]['t']
+    assert dcm_times[0].iso == '2026-07-09 12:52:53.000'
+    assert dcm_times[1].iso == scan_start.iso
+
+    phacal_tables = [
+        os.path.basename(call['caltable'])
+        for call in gencal_calls
+        if call.get('caltable', '').endswith(('.phambd', '.phambd_pha0'))
+    ]
+    assert any(table.startswith('20260709T100000') for table in phacal_tables)
+    assert any(table.startswith('20260709T160000') for table in phacal_tables)
+    assert any(table.startswith('20260709T1430') for table in phacal_tables)
+    assert any(
+        os.path.basename(table).startswith('20260709T1430')
+        for table in applied[0]['gaintable']
+    )
+    assert all('20260708' not in table for table in phacal_tables)
 
 
 def test_refcal_bps_payload_uses_same_measured_candidate_and_neutral_tiers():

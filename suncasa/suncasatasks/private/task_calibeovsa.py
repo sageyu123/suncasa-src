@@ -25,6 +25,10 @@ except ImportError:
     sql2refcal_bpsX = None
 from .. import concateovsa
 from suncasa.eovsa.update_log import EOVSA15_UPGRADE_DATE, DCM_IF_FILTER_UPGRADE_DATE
+from suncasa.utils.caltable_layout import (
+    append_missing_caltable_spw_rows,
+    resolve_caltable_spw_rows,
+)
 
 from ...casa_compat import import_casatools, import_casatasks
 
@@ -269,6 +273,22 @@ def _valid_sql_bps_companion(record, bphsbd_record, bphsbd_arrays):
     if len(product_digest) != 64 or not set(product_digest) <= hex_chars:
         return None, 'type-16 product digest is malformed'
 
+    sampler_raw = record.get('sampler_contract_code', 1)
+    try:
+        sampler_scalar = float(sampler_raw)
+    except (TypeError, ValueError):
+        return None, 'type-16 sampler contract is malformed'
+    sampler_allowed = tuple(
+        getattr(ch, 'REFCAL_BPS_SAMPLER_CONTRACT_CODES', (1,))
+    )
+    if (
+        not np.isfinite(sampler_scalar)
+        or sampler_scalar != np.rint(sampler_scalar)
+        or int(sampler_scalar) not in sampler_allowed
+    ):
+        return None, 'type-16 sampler contract is unsupported'
+    sampler_contract_code = int(sampler_scalar)
+
     parent_timestamp = bphsbd_record.get('timestamp')
     parent_refcal_time = bphsbd_record.get('t_refcal')
     if not _sql_times_match(record.get('timestamp'), parent_timestamp):
@@ -372,6 +392,8 @@ def _valid_sql_bps_companion(record, bphsbd_record, bphsbd_arrays):
     secondary['bps_valid'] = (
         authorized & (candidate == 2)
     ).astype(np.uint8)
+    primary['sampler_contract_code'] = sampler_contract_code
+    secondary['sampler_contract_code'] = sampler_contract_code
     primary['secondary_bph_refcal'] = secondary
     return {
         'bps_candidate_code': candidate,
@@ -381,6 +403,7 @@ def _valid_sql_bps_companion(record, bphsbd_record, bphsbd_arrays):
         't_refcal': record.get('t_refcal'),
         'product_digest': product_digest,
         'type14_digest': companion_digest,
+        'sampler_contract_code': sampler_contract_code,
         'bph_ref_frequency_ghz': bph_ref_frequency,
     }, None
 
@@ -474,6 +497,10 @@ def _attach_sql_bps_refcal(refcal, companion, reason=None):
         refcal['sql_bps_reason'] = None
         refcal['sql_bps_timestamp'] = companion.get('timestamp')
         refcal['sql_bps_product_digest'] = companion.get('product_digest')
+        refcal['sql_bps_sampler_contract_code'] = companion.get(
+            'sampler_contract_code',
+            1,
+        )
         refcal['sql_bps_candidate_code'] = companion[
             'bps_candidate_code'
         ]
@@ -492,6 +519,7 @@ def _attach_sql_bps_refcal(refcal, companion, reason=None):
         refcal['sql_bps_reason'] = str(reason or 'record unavailable')
         refcal['sql_bps_timestamp'] = None
         refcal['sql_bps_product_digest'] = None
+        refcal.pop('sql_bps_sampler_contract_code', None)
         refcal.pop('sql_bps_candidate_code', None)
         refcal.pop('sql_bps_authorized', None)
         refcal.pop('sql_bps_refcal', None)
@@ -531,6 +559,95 @@ def _sql_lookup_local_day_bounds(tim):
         dhr = -7.
     btime = Time(np.fix(tim.mjd + dhr / 24.) - dhr / 24., format='mjd')
     return btime, Time(btime.mjd + 1., format='mjd')
+
+
+def _sql_observing_day_offset(target_time, source_time):
+    """Return the integer observing-day offset between two SQL days.
+
+    The offset is measured using the EOVSA local observing-day boundaries,
+    rather than UTC calendar dates.  This keeps a prior-day SQL calibration
+    aligned with the target day's clock, including around local midnight.
+
+    :param target_time: Time in the observing day being calibrated.
+    :type target_time: astropy.time.Time
+    :param source_time: Time used to select the SQL calibration day.
+    :type source_time: astropy.time.Time
+    :returns: Number of observing days from the source day to the target day.
+    :rtype: int
+    """
+
+    target_day, _ = _sql_lookup_local_day_bounds(Time(target_time))
+    source_day, _ = _sql_lookup_local_day_bounds(Time(source_time))
+    return int(np.rint(target_day.mjd - source_day.mjd))
+
+
+def _shift_time_by_observing_days(time_value, day_offset):
+    """Shift a scalar or vector of times by whole observing days.
+
+    :param time_value: Time value(s) to shift.
+    :type time_value: astropy.time.Time or sequence
+    :param day_offset: Signed number of observing days to add.
+    :type day_offset: int
+    :returns: Shifted time value(s), represented as ``Time``.
+    :rtype: astropy.time.Time
+    """
+
+    return Time(
+        Time(time_value).mjd + int(day_offset),
+        format='mjd',
+    )
+
+
+def _effective_sql_phacal_times(phacals, day_offset):
+    """Return effective phase-cal times without mutating SQL records.
+
+    SQL phase-calibration records remain source-day objects so their original
+    ``t_ref`` values can be used for filtering and provenance.  Only their
+    effective ``t_pha`` clock is shifted for target-day interpolation.
+
+    :param phacals: Iterable of SQL phase-calibration records.
+    :type phacals: iterable
+    :param day_offset: Signed source-to-target observing-day offset.
+    :type day_offset: int
+    :returns: Effective ``t_pha`` values in the input order.
+    :rtype: astropy.time.Time
+    """
+
+    source_times = [phacal['t_pha'] for phacal in phacals]
+    if not source_times:
+        return Time([], format='mjd')
+    source_times = Time(source_times)
+    if int(day_offset) == 0:
+        return source_times
+    return _shift_time_by_observing_days(source_times, day_offset)
+
+
+def _residual_bps_paramerr(table_tool, startrow, nrow, cp_rows, new_rows):
+    """Build the ``PARAMERR`` payload for residual-BPS table rows.
+
+    CASA can leave array columns uninitialized on rows appended to repair a
+    sparse bandpass table.  New rows therefore receive a zero array matching
+    the CPARAM shape, while existing rows retain the established read-and-zero
+    behavior.
+
+    :param table_tool: Open CASA calibration-table tool.
+    :type table_tool: object
+    :param startrow: First table row in the payload.
+    :type startrow: int
+    :param nrow: Number of rows in the payload.
+    :type nrow: int
+    :param cp_rows: CPARAM payload whose array shape PARAMERR must match.
+    :type cp_rows: numpy.ndarray
+    :param new_rows: Whether these rows were appended by the sparse-table
+        repair path.
+    :type new_rows: bool
+    :returns: A zero-valued PARAMERR array with CASA's column shape.
+    :rtype: numpy.ndarray
+    """
+
+    if new_rows:
+        return np.zeros_like(cp_rows, dtype=np.float64)
+    return table_tool.getcol('PARAMERR', startrow, nrow) * 0
 
 
 def _sql_record_in_lookup_day(record, lookup_time, label):
@@ -1563,7 +1680,22 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     pha[np.where(phase_flag == 1)] = 0.
                 amp = refcal['amp']
                 amp[np.where(refcal['flag'] == 1)] = 1.
-                t_ref = refcal['timestamp']
+                source_t_ref = refcal['timestamp']
+                sql_day_offset = 0
+                effective_t_ref = source_t_ref
+                if cal_npz_refcal is None:
+                    sql_day_offset = _sql_observing_day_offset(
+                        btime,
+                        source_t_ref,
+                    )
+                    effective_t_ref = _shift_time_by_observing_days(
+                        source_t_ref,
+                        sql_day_offset,
+                    )
+                # Keep the SQL refcal timestamp untouched for provenance and
+                # source-day filtering.  Runtime table/DCM semantics use the
+                # target-day effective time when an older SQL day was chosen.
+                t_ref = effective_t_ref
                 pending_refcal_provenance = _refcal_provenance_entry(
                     msfile,
                     sql_lookup_time,
@@ -1572,17 +1704,29 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     refcal_npz_mode,
                     cal_npz_refcal is not None,
                 )
-                # find the start and end time of the local day when refcal is registered
-                try:
-                    dhr = t_ref.LocalTime.utcoffset().total_seconds() / 60. / 60.
-                except:
-                    dhr = -7.
-                bt = Time(np.fix(t_ref.mjd + dhr / 24.) - dhr / 24., format='mjd')
-                et = Time(bt.mjd + 1., format='mjd')
-                (yr, mon, day) = (bt.datetime.year, bt.datetime.month, bt.datetime.day)
+                # Query phase calibrations from the source SQL day.  The
+                # effective target-day bounds are used only for generated
+                # table placement and runtime calibration semantics.
+                source_bt, source_et = _sql_lookup_local_day_bounds(source_t_ref)
+                bt, et = source_bt, source_et
+                effective_bt, effective_et = _sql_lookup_local_day_bounds(t_ref)
+                (yr, mon, day) = (
+                    effective_bt.datetime.year,
+                    effective_bt.datetime.month,
+                    effective_bt.datetime.day,
+                )
+                if sql_day_offset:
+                    print(
+                        'Applying SQL calibration from source day {0} with '
+                        'effective target-day refcal time {1} '
+                        '(offset {2:+d} day(s)).'.format(
+                            source_t_ref.iso,
+                            t_ref.iso,
+                            sql_day_offset,
+                        )
+                    )
                 dirname = caltbdir + str(yr) + str(mon).zfill(2) + '/'
-                if not os.path.exists(dirname):
-                    os.mkdir(dirname)
+                os.makedirs(dirname, exist_ok=True)
                 # check if there is any ROACH reboot between the reference calibration found and the current data
                 t_rbts = db.get_reboot(Time([t_ref, btime]))
                 if not t_rbts:
@@ -2010,6 +2154,21 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     bps_applied_slots = 0
                     bps_authorized_slots = 0
                     tb.open(caltb_bps, nomodify=False)
+                    appended_spws = append_missing_caltable_spw_rows(
+                        tb,
+                        range(nspw),
+                        nant,
+                    )
+                    if appended_spws:
+                        msg_prompt = (
+                            'CASA bandpass omitted residual-BPS template rows '
+                            'for SPW(s) {0}; appended complete antenna row '
+                            'blocks for the authoritative Caleovsa/SQL values.'
+                        ).format(','.join(str(spw) for spw in appended_spws))
+                        casalog.post(msg_prompt, 'WARN')
+                        print(msg_prompt)
+                    caltable_spw_ids = tb.getcol('SPECTRAL_WINDOW_ID')
+                    caltable_antenna_ids = tb.getcol('ANTENNA1')
                     for ll in range(nspw):
                         nchan_ll = int(bd_nchan[ll])
                         freq_ghz = (
@@ -2041,16 +2200,46 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                         bps_authorized_slots += int(measured_count)
                         cp_table = np.moveaxis(cp, 0, 2)
                         flag_table = np.moveaxis(fl, 0, 2)
-                        tb.putcol('CPARAM', cp_table, ll * nant, nant)
-                        tb.putcol('FLAG', flag_table, ll * nant, nant)
-                        tb.putcol(
-                            'SNR',
-                            np.where(flag_table, 0.0, 100.0),
-                            ll * nant,
+                        row_layout = resolve_caltable_spw_rows(
+                            caltable_spw_ids,
+                            caltable_antenna_ids,
+                            ll,
                             nant,
                         )
-                        paramerr = tb.getcol('PARAMERR', ll * nant, nant)
-                        tb.putcol('PARAMERR', paramerr * 0, ll * nant, nant)
+                        if row_layout is None:
+                            msg_prompt = (
+                                'Residual BPS solver produced no calibration '
+                                'rows for SPW {0:d}; leaving that SPW without '
+                                'a residual-BPS solution.'
+                            ).format(ll)
+                            casalog.post(msg_prompt, 'WARN')
+                            print(msg_prompt)
+                            continue
+                        startrow, row_antennas = row_layout
+                        nrow = int(row_antennas.size)
+                        cp_rows = cp_table[:, :, row_antennas]
+                        flag_rows = flag_table[:, :, row_antennas]
+                        tb.putcol('CPARAM', cp_rows, startrow, nrow)
+                        tb.putcol('FLAG', flag_rows, startrow, nrow)
+                        tb.putcol(
+                            'SNR',
+                            np.where(flag_rows, 0.0, 100.0),
+                            startrow,
+                            nrow,
+                        )
+                        paramerr = _residual_bps_paramerr(
+                            tb,
+                            startrow,
+                            nrow,
+                            cp_rows,
+                            ll in appended_spws,
+                        )
+                        tb.putcol(
+                            'PARAMERR',
+                            paramerr,
+                            startrow,
+                            nrow,
+                        )
                     tb.close()
                     gaintables.append(caltb_bps)
                     refcal_gaintables.append(caltb_bps)
@@ -2216,15 +2405,18 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                     print(f"Found no phacal records in {cal_src}, will skip phase calibration")
                 else:
                     # first generate all phacal calibration tables if not already exist
-                    t_phas = Time([phacal['t_pha'] for phacal in phacals])
+                    source_t_phas = Time([phacal['t_pha'] for phacal in phacals])
                     # sort the array in ascending order by t_pha
-                    sinds = t_phas.mjd.argsort()
-                    t_phas = t_phas[sinds]
+                    sinds = source_t_phas.mjd.argsort()
                     phacals = phacals[sinds]
+                    t_phas = _effective_sql_phacal_times(
+                        phacals,
+                        sql_day_offset,
+                    )
                     caltbs_phambd = []
                     caltbs_phambd_pha0 = []
                     for i, phacal in enumerate(phacals):
-                        t_pha = phacal['t_pha']
+                        t_pha = t_phas[i]
                         phambd_ns = phacal['pslope']
                         for n in range(2):
                             phambd_ns[:, n] -= phambd_ns[0, n]
@@ -2303,8 +2495,8 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                             bphacal = phacals[bt_ind[-1]]
                             ephacal = phacals[et_ind[0]]
                             # generate a new table interpolating between two daily phase calibrations
-                            dt_obs = t_mid.mjd - bphacal['t_pha'].mjd
-                            dt_pha = ephacal['t_pha'].mjd - bphacal['t_pha'].mjd
+                            dt_obs = t_mid.mjd - t_phas[bt_ind[-1]].mjd
+                            dt_pha = t_phas[et_ind[0]].mjd - t_phas[bt_ind[-1]].mjd
                             phambd_diff = ephacal['pslope'] - bphacal['pslope']
                             phambd_ns = bphacal['pslope'] + dt_obs / dt_pha * phambd_diff
                             for n in range(2):
@@ -2330,8 +2522,14 @@ def calibeovsa(vis=None, caltype=None, caltbdir='', interp=None, docalib=True, d
                                    antenna=antennas, parameter=pha0[:nant-1, :].flatten().tolist())
                             if flagspw != '':
                                 flag_phambd_by_spw(caltb_phambd_interp_pha0, flagspw=flagspw)
-                            print("Using phase calibration table interpolated between records at " + bphacal[
-                                't_pha'].iso + ' and ' + ephacal['t_pha'].iso + f" [source: {cal_src}]")
+                            print(
+                                "Using phase calibration table interpolated between "
+                                "target-day records at "
+                                + t_phas[bt_ind[-1]].iso
+                                + ' and '
+                                + t_phas[et_ind[0]].iso
+                                + f" [source: {cal_src}]"
+                            )
                             gaintables.append(caltb_phambd_interp)
                             # spwmaps.append(nspw * [0])
                             spwmaps.append([])

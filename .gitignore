@@ -175,3 +175,8 @@ obsolete/
 
 dev/
 scripts/deploy_suncasa_to_pipeline.sh
+
+# Temporary Python source backups
+*.py.bak*
+*.py.pre_*
+*.py.pre-*

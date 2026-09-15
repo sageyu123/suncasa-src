@@ -9,6 +9,33 @@ from suncasa.io import ndfits
 
 imgfitsdir = '/data1/eovsa/fits/synoptic/'
 
+PRODUCT_VERSIONS = (
+    'v1.0',
+    'v2.0',
+    'v2.0_alt',
+    'v2.1',
+    'v2.1_alt',
+    'legacy_v2.0',
+)
+
+
+def normalize_product_version(version):
+    """Validate and return the canonical product directory name.
+
+    :param version: Product-version selector.
+    :type version: str
+    :returns: The unchanged canonical selector.
+    :rtype: str
+    :raises ValueError: If ``version`` is a retired or unknown selector.
+    """
+    if version not in PRODUCT_VERSIONS:
+        raise ValueError(
+            'Product version {0} is not supported. Valid versions are {1}.'.format(
+                version, ', '.join(PRODUCT_VERSIONS)
+            )
+        )
+    return version
+
 
 #
 # def write_compress_image_fits(fname, data, header, mask=None, **kwargs):
@@ -42,8 +69,9 @@ imgfitsdir = '/data1/eovsa/fits/synoptic/'
 #     hdulnew.writeto(fname, output_verify='fix')
 
 
-def synoptic_product_dir(dateobj, version='v3.0', create=False, fallback=True):
+def synoptic_product_dir(dateobj, version='v2.0', create=False, fallback=True):
     datestrdir = dateobj.strftime("%Y/%m/%d")
+    version = normalize_product_version(version)
     versioned_dir = os.path.join(imgfitsdir, datestrdir, version)
     if create:
         os.makedirs(versioned_dir, exist_ok=True)
@@ -63,7 +91,7 @@ def fits_tag_infix(fits_tag):
 
 
 def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False, overwritefits=False,
-                     version='v3.0', fits_tag=''):
+                     version='v2.0', fits_tag=''):
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
     imgindir = synoptic_product_dir(dateobj, version=version, fallback=True)
     imgoutdir = synoptic_product_dir(dateobj, version=version, create=True, fallback=False)
@@ -105,7 +133,7 @@ def rewriteImageFits(datestr, verbose=False, writejp2=False, overwritejp2=False,
                 ndfits.write_j2000_image(fj2name, data[::-1, :], header)
     return
 
-def main(dateobj=None, ndays=1, overwritejp2=False, overwritefits=False, version='v3.0', fits_tag=''):
+def main(dateobj=None, ndays=1, overwritejp2=False, overwritefits=False, version='v2.0', fits_tag=''):
     """
     Main pipeline for creating compressed FITS and JP2 files of EOVSA daily full-disk images.
 
@@ -171,7 +199,7 @@ if __name__ == '__main__':
         help='Overwrite existing EOVSA FITS files.'
     )
     parser.add_argument(
-        '--version', type=str, default='v3.0',
+        '--version', type=str, default='v2.0',
         help='Synoptic imaging product version folder to process.'
     )
     parser.add_argument(

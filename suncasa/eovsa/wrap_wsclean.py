@@ -101,6 +101,7 @@ class WSClean:
             'local_rms_strength': 1.0,  # default local rms strength
             'local_rms_window': 25,  # Size of window for creating the RMS background map, in number of PSFs. Default: 25 psfs
             'fits_mask': None,  # If not None, the FITS mask file to use
+            'make_psf': False,  # write a PSF even when niter is zero
         }
 
     def setup(self, **kwargs):
@@ -147,6 +148,8 @@ class WSClean:
             Suppress output
         circular_beam : bool, optional
             Use circular beam
+        make_psf : bool, optional
+            Always write a PSF, including for dirty-image-only runs.
         """
         # Handle size parameter specially
         if 'size' in kwargs:
@@ -230,6 +233,9 @@ class WSClean:
 
         if self.params['no_update_model']:
             cmd.append('-no-update-model-required')
+
+        if self.params['make_psf']:
+            cmd.append('-make-psf')
 
         if self.params['no_negative']:
             cmd.append('-no-negative')

@@ -20,7 +20,9 @@ That error is the reason this pipeline should stay pinned to the known-
 working wrapper unless the full runtime stack has been revalidated.
 '''
 import argparse
+import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -55,7 +57,9 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS
 from sunpy.coordinates import Helioprojective, propagate_with_solar_surface, sun
+from sunpy.physics.differential_rotation import solar_rotate_coordinate
 from scipy import constants
+from suncasa.eovsa import s00_imaging_policy as s00qa
 from suncasa.eovsa.update_log import EOVSA15_UPGRADE_DATE, DCM_IF_FILTER_UPGRADE_DATE
 
 hostname = socket.gethostname()
@@ -116,7 +120,48 @@ def _resolve_wsclean_bin():
     return 'wsclean'
 
 
+def _remove_existing_path_or_raise(path, description):
+    """Remove a replacement destination and fail closed if cleanup fails.
+
+    ``shutil.move`` treats an existing directory destination as a container
+    and moves the source inside it.  That is unsafe for generated CASA
+    sidecars such as ``.flagversions``: a failed cleanup would therefore
+    produce a nested directory and a less useful permission error later.
+
+    :param path: Destination path that must be absent before a replacement.
+    :type path: str
+    :param description: Human-readable description of the destination.
+    :type description: str
+    :raises PermissionError: If the existing destination cannot be removed.
+    :raises RuntimeError: If the destination remains after cleanup.
+    """
+    if not os.path.lexists(path):
+        return
+
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    except OSError as exc:
+        raise PermissionError(
+            f"Unable to replace existing {description} {path}; "
+            "remove it or grant write permission to its parent directory."
+        ) from exc
+
+    if os.path.lexists(path):
+        raise RuntimeError(
+            f"Unable to replace existing {description} {path}: "
+            "the destination still exists after cleanup."
+        )
+
+
 WSCLEAN_BIN = _resolve_wsclean_bin()
+# ``WSClean`` owns its own command string, so keep the imported wrapper in
+# lockstep with the path selected here.  Without this assignment the two
+# modules can log different binaries and the wrapper can silently fall back
+# to a missing ``wsclean-eovsa`` command.
+ww.WSCLEAN_BIN = WSCLEAN_BIN
 logging.info("Using wsclean executable: %s", WSCLEAN_BIN)
 
 # ============================================================
@@ -270,6 +315,43 @@ FINAL_IMAGING_CONFIG = {
     'interval_multipliers': {0: 2.4, 1: 1.2, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1},
 }
 
+S00_FINAL_CONFIG = {
+    # July 22 tests support a central 5 h product with 4 h as the safer
+    # fallback.  Every date still has to pass its own coverage, PSF, and
+    # differential-rotation gates before either duration is selected.
+    'candidate_hours': (5.0, 4.0, 3.0),
+    'psf_sidelobe_max': 0.15,
+    'smear_beam_max': 1.0,
+    # Coverage is a coarse guard, not a substitute for the PSF measured from
+    # the actual sampled visibilities.  The July 22 benchmark contains one
+    # 20.5-minute gap yet its 5 h PSF is 11.7%; admit that case while still
+    # rejecting windows missing more than 15% of their nominal samples or a
+    # contiguous half hour at the normal one-minute cadence.
+    'min_coverage_fraction': 0.85,
+    'max_gap_factor': 30.0,
+    # The long-track init model is deliberately shallow.  Retain only
+    # repeatable positive support, then dilate far enough to cover one beam
+    # and the permitted source motion without opening the full solar disk.
+    'support_sigma': 7.0,
+    'support_peak_fraction': 0.02,
+    'support_dilation_beams': 3.0,
+    # Residual-mask retry gates.  A single full-image residual can only
+    # trigger held-out tests; it can never authorize its own mask expansion.
+    'residual_snr_trigger': 7.0,
+    'residual_peak_ratio_trigger': 0.10,
+    'half_snr_min': 5.0,
+    'centroid_beam_fraction': 0.5,
+    'max_mask_growth_fraction': 0.10,
+    'max_added_beams_per_candidate': 3.0,
+    'max_candidate_islands': 2,
+    'max_mask_image_fraction': 0.25,
+    'qa_clean_niter': 4000,
+    'retry_residual_drop_min': 0.50,
+    'retry_energy_drop_min': 0.20,
+    'retry_rms_worsen_max': 0.05,
+    'retry_source_flux_change_max': 0.10,
+}
+
 UV_CONFIG = {
     'uvmax_baseline_m': 15,
     'uvmin_baseline_m': 110,
@@ -404,7 +486,7 @@ def _set_daily_reference_time_keywords(fitsfile, reftime):
     return fitsfile
 
 
-def _set_imaging_antenna_keywords(fitsfile, n_ant_img, n_ant_total):
+def _set_imaging_antenna_keywords(fitsfile, n_ant_img, n_ant_total, antenna_ids=None):
     """Stamp the solar antenna availability used for imaging into a FITS file."""
     if n_ant_img is None or n_ant_total is None:
         return fitsfile
@@ -416,8 +498,108 @@ def _set_imaging_antenna_keywords(fitsfile, n_ant_img, n_ant_total):
                            'unflagged solar antennas available for imaging')
             hdu.header.set('NANTTOT', int(n_ant_total),
                            'total solar antennas for this observing epoch')
+            if antenna_ids is not None:
+                hdu.header.set('ANTUSED', ','.join(str(int(ant)) for ant in antenna_ids),
+                               'one-based unflagged solar antennas used')
             break
     return fitsfile
+
+
+def _write_imaging_antenna_manifest(fitsfile, n_ant_total, antenna_ids):
+    """Publish exact unflagged imaging antennas next to one FITS product."""
+    if n_ant_total is None or antenna_ids is None:
+        return None
+    manifest_path = fitsfile + '.antennas.json'
+    tmp_path = manifest_path + '.tmp.{}'.format(os.getpid())
+    payload = {
+        'schema_version': 1,
+        'source': 'unflagged_imaging_input',
+        'expected': int(n_ant_total),
+        'used': [int(ant) for ant in antenna_ids],
+    }
+    with open(tmp_path, 'w') as outfile:
+        json.dump(payload, outfile, sort_keys=True)
+        outfile.write('\n')
+    os.replace(tmp_path, manifest_path)
+    return manifest_path
+
+
+def _promote_imaging_antenna_manifest(source_fitsfiles, target_fitsfile):
+    """Combine current-run antenna provenance for a merged daily product.
+
+    :param source_fitsfiles: Interval FITS files supplied to the daily merge.
+    :type source_fitsfiles: list(str)
+    :param target_fitsfile: Merged daily FITS receiving the sidecar.
+    :type target_fitsfile: str
+    :returns: Written manifest path, or ``None`` when no valid source manifest
+        is available.
+    :rtype: str or None
+    """
+    expected = None
+    used = set()
+    for source_fitsfile in source_fitsfiles:
+        manifest_path = source_fitsfile + '.antennas.json'
+        try:
+            with open(manifest_path) as infile:
+                manifest = json.load(infile)
+            if (manifest.get('schema_version') != 1
+                    or manifest.get('source') != 'unflagged_imaging_input'
+                    or not isinstance(manifest.get('expected'), int)
+                    or not isinstance(manifest.get('used'), list)):
+                continue
+            manifest_expected = manifest['expected']
+            manifest_used = manifest['used']
+            if (manifest_expected < 1
+                    or any(not isinstance(ant, int)
+                           or isinstance(ant, bool)
+                           or ant < 1
+                           or ant > manifest_expected
+                           for ant in manifest_used)):
+                continue
+            if expected is None:
+                expected = manifest_expected
+            elif manifest_expected != expected:
+                continue
+            used.update(manifest_used)
+        except (OSError, TypeError, ValueError):
+            continue
+    if expected is None:
+        return None
+    return _write_imaging_antenna_manifest(
+        target_fitsfile, expected, sorted(used))
+
+
+def _synoptic_merge_inputs(out_key, synfits_manifest, imgoutdir, date_str,
+                            spwstr, fits_tag='', merge_existing=False):
+    """Resolve interval FITS for one daily merge without mixing pipeline runs.
+
+    Normal imaging uses only paths recorded by the current run.  The broad
+    filesystem lookup is reserved for explicit ``mergeFITSonly`` operation,
+    where no current-run imaging manifest exists.
+
+    :param out_key: Coarse or fine product key.
+    :type out_key: int or str
+    :param synfits_manifest: Interval FITS paths produced by the current run.
+    :type synfits_manifest: dict
+    :param imgoutdir: Synoptic FITS output directory.
+    :type imgoutdir: str
+    :param date_str: Observing date in ``YYYYMMDD`` form.
+    :type date_str: str
+    :param spwstr: Formatted spectral-window range.
+    :type spwstr: str
+    :param fits_tag: Optional output-route tag.
+    :type fits_tag: str
+    :param merge_existing: Whether to discover existing interval products.
+    :type merge_existing: bool
+    :returns: Ordered interval FITS paths for the daily merge.
+    :rtype: list(str)
+    """
+    if not merge_existing:
+        return list(synfits_manifest.get(out_key, []))
+    post_tag = f'.{fits_tag}' if fits_tag else ''
+    return sorted(glob(os.path.join(
+        imgoutdir,
+        f"eovsa.synoptic{post_tag}.{date_str[:-1]}?T??????Z.s{spwstr}.tb.fits")))
 
 
 @contextmanager
@@ -2056,10 +2238,149 @@ def _remove_fine_spectral_products(imgoutdir, date_str, fine_spwstr, fits_tag=''
                           f"{traceback.format_exc()}")
 
 
+def _s00_route_identity(fits_tag=''):
+    """Return exact and filesystem-safe identifiers for one s00 route.
+
+    ``fits_tag`` is the exact route identifier available to the imaging
+    pipeline.  The namespace includes a digest so tags that sanitize to the
+    same text cannot share masks, QA artifacts, or archived source models.
+
+    :param fits_tag: FITS/output tag identifying the calibration route.
+    :type fits_tag: str
+    :returns: Mapping with exact ``fits_tag``/``route_id`` and safe
+        ``namespace`` values.
+    :rtype: dict
+    """
+    exact_tag = str(fits_tag or '')
+    route_id = exact_tag or 'production'
+    safe_label = re.sub(r'[^A-Za-z0-9._-]+', '-', route_id).strip('._-') or 'route'
+    if exact_tag:
+        digest = hashlib.sha256(exact_tag.encode('utf-8')).hexdigest()[:12]
+        namespace = f'{safe_label[:48]}-{digest}'
+    else:
+        namespace = 'production'
+    return {
+        'fits_tag': exact_tag,
+        'route_id': route_id,
+        'namespace': namespace,
+    }
+
+
+def _remove_s00_route_products(imgoutdir, date_str, spwstr='00-01', fits_tag=''):
+    """Remove stale s00 science products for one exact output route.
+
+    The observing day can produce interval files on either UTC date around
+    the local-day boundary, so both ``date_str`` and the following UTC date
+    are checked.  Products with another ``fits_tag`` are never matched.
+
+    :param imgoutdir: Synoptic FITS output directory.
+    :type imgoutdir: str
+    :param date_str: Pipeline date in ``YYYYMMDD`` form.
+    :type date_str: str
+    :param spwstr: Formatted s00 spectral-window label.
+    :type spwstr: str
+    :param fits_tag: Exact output-route tag.
+    :type fits_tag: str
+    :returns: Paths successfully removed.
+    :rtype: list(str)
+    """
+    tag = f'.{fits_tag}' if fits_tag else ''
+    interval_dates = [str(date_str)]
+    try:
+        next_date = (
+            datetime.strptime(str(date_str), '%Y%m%d') + timedelta(days=1)
+        ).strftime('%Y%m%d')
+        interval_dates.append(next_date)
+    except ValueError:
+        pass
+    patterns = [
+        os.path.join(
+            imgoutdir,
+            f'eovsa.synoptic{tag}.{interval_date}T??????Z.s{spwstr}.tb*.fits')
+        for interval_date in interval_dates
+    ]
+    patterns.append(os.path.join(
+        imgoutdir,
+        f'eovsa.synoptic_daily{tag}.{date_str}T200000Z.s{spwstr}.tb*.fits'))
+
+    removed = []
+    failures = []
+    for product in sorted({path for pattern in patterns for path in glob(pattern)}):
+        try:
+            os.remove(product)
+            removed.append(product)
+        except OSError as exc:
+            failures.append((product, str(exc)))
+            log_print('WARNING',
+                      f"[s00_policy] failed to remove stale route product {product}.\n"
+                      f"{traceback.format_exc()}")
+    if failures:
+        failed_paths = ', '.join(path for path, _reason in failures)
+        raise RuntimeError(
+            f"Unable to withhold stale s00 route product(s): {failed_paths}")
+    return removed
+
+
+def _begin_s00_attempt(s00_policy_by_key, synfits_manifest, sidx,
+                       imgoutdir, date_str, spwstr, fits_tag=''):
+    """Mark an adaptive s00 attempt before any fallible preparation step.
+
+    Membership in ``s00_policy_by_key`` makes post-processing use only the
+    current-run manifest.  Initializing that manifest to empty before policy
+    preparation prevents a failed attempt from falling back to the generic
+    glob of prior interval FITS.
+
+    :param s00_policy_by_key: Current-run adaptive-s00 policy mapping.
+    :type s00_policy_by_key: dict
+    :param synfits_manifest: Current-run interval FITS manifest.
+    :type synfits_manifest: dict
+    :param sidx: Coarse spectral-window index.
+    :type sidx: int
+    :param imgoutdir: Synoptic FITS output directory.
+    :type imgoutdir: str
+    :param date_str: Pipeline date in ``YYYYMMDD`` form.
+    :type date_str: str
+    :param spwstr: Formatted s00 spectral-window label.
+    :type spwstr: str
+    :param fits_tag: Exact output-route tag.
+    :type fits_tag: str
+    :returns: Stale same-route products removed before the attempt.
+    :rtype: list(str)
+    """
+    s00_policy_by_key[sidx] = None
+    synfits_manifest[sidx] = []
+    return _remove_s00_route_products(
+        imgoutdir, date_str, spwstr=spwstr, fits_tag=fits_tag)
+
+
 def _is_default_52_parent_plan(spws):
     """Return whether ``spws`` is the unchanged seven-group 52-band plan."""
     return ([_spw_range_bounds(spw) for spw in spws]
             == [_spw_range_bounds(spw) for spw in SPWS_52BAND])
+
+
+def _adaptive_s00_enabled(adaptive_s00, spw, tr_series_time):
+    """Return whether the explicit adaptive s00 route may be used.
+
+    The historical segmented full-track route remains the default.  The
+    adaptive route is deliberately restricted to an explicit opt-in, the
+    s00-01 group, and an absent imaging time-range filter.
+
+    :param adaptive_s00: Explicit request for the adaptive s00 route.
+    :type adaptive_s00: bool
+    :param spw: Spectral-window group or range understood by
+        :func:`_spw_range_bounds`.
+    :type spw: str or tuple or list
+    :param tr_series_time: Parsed imaging time-range filter, or ``None``.
+    :type tr_series_time: list or None
+    :returns: Whether adaptive s00 imaging is enabled for this group.
+    :rtype: bool
+    """
+    return bool(
+        adaptive_s00
+        and _spw_range_bounds(spw) == (0, 1)
+        and tr_series_time is None
+    )
 
 
 def _write_fine_bootstrap_parent_marker(msfile):
@@ -2252,8 +2573,8 @@ def _caltable_has_unflagged_solutions(caltable):
         return False
 
 
-def count_unflagged_solar_antennas(msfile, spw_index, n_ant_total, row_chunk=4096):
-    """Count solar antennas with at least one unflagged sample in the imaging SPWs.
+def unflagged_solar_antenna_ids(msfile, spw_index, n_ant_total, row_chunk=4096):
+    """Return one-based solar antennas with unflagged data in the imaging SPWs.
 
     Antenna indices are CASA zero-based.  Solar antennas are indices
     ``0..n_ant_total-1``; the 27-m calibration antenna is intentionally excluded.
@@ -2288,13 +2609,20 @@ def count_unflagged_solar_antennas(msfile, spw_index, n_ant_total, row_chunk=409
                     subtable.close()
         finally:
             tb.close()
-        return len(available)
+        return [ant + 1 for ant in sorted(available)]
     except Exception:
         log_print('WARNING',
                   f"Unable to count unflagged solar antennas for imaging label: "
                   f"{_format_log_state(msfile=msfile, spw_index=spw_index, n_ant_total=n_ant_total)}\n"
                   f"{traceback.format_exc()}")
         return None
+
+
+def count_unflagged_solar_antennas(msfile, spw_index, n_ant_total, row_chunk=4096):
+    """Count solar antennas with at least one unflagged sample in the imaging SPWs."""
+    antenna_ids = unflagged_solar_antenna_ids(
+        msfile, spw_index, n_ant_total, row_chunk=row_chunk)
+    return None if antenna_ids is None else len(antenna_ids)
 
 
 def _default_config_index_for_spw(spw, default_spws):
@@ -2867,6 +3195,182 @@ def clean_junk(imname, junks=['dirty', 'model', 'psf', 'residual']):
                     os.remove(f)
 
 
+def _central_wsclean_interval(wsclean_intervals, reftime, duration_hours,
+                              min_coverage_fraction=0.90, max_gap_factor=5.0):
+    """Build one end-exclusive WSClean interval around the daily reference time.
+
+    :param wsclean_intervals: Time-grid manager for the active measurement set.
+    :type wsclean_intervals: WSCleanTimeIntervals
+    :param reftime: Desired center of the synthesis window.
+    :type reftime: astropy.time.Time
+    :param duration_hours: Requested full window duration in hours.
+    :type duration_hours: float
+    :param min_coverage_fraction: Minimum sampled/expected timestamp fraction.
+    :type min_coverage_fraction: float
+    :param max_gap_factor: Largest accepted internal gap in nominal cadences.
+    :type max_gap_factor: float
+    :returns: Candidate dictionary containing ``valid``, ``interval``, ``ri``,
+        coverage metrics, and an explanatory ``reason``.
+    :rtype: dict
+    """
+    tim = Time(wsclean_intervals.tim)
+    center = Time(reftime)
+    duration_hours = float(duration_hours)
+    mjd = np.asarray(tim.mjd, dtype=float)
+    result = s00qa.central_time_indices(
+        mjd, center.mjd, duration_hours,
+        min_coverage_fraction=min_coverage_fraction,
+        max_gap_factor=max_gap_factor)
+    result['ri'] = None
+    selected = np.asarray(result.pop('indices'), dtype=int)
+    if selected.size < 2:
+        return result
+
+    selected_time = tim[selected]
+    midpoint = Time([float(np.nanmean(selected_time.mjd))], format='mjd')
+    timerange = (
+        selected_time[0].datetime.strftime('%Y/%m/%d/%H:%M:%S') + '~' +
+        selected_time[-1].datetime.strftime('%Y/%m/%d/%H:%M:%S')
+    )
+    ri = {
+        'N1': 1,
+        'N2': 1,
+        'time_intervals': [selected_time],
+        'time_intervals_major_avg': midpoint,
+        'time_intervals_minor_avg': [midpoint],
+        'timeranges': [timerange],
+    }
+    result.update({
+        'ri': ri,
+    })
+    return result
+
+
+def _s00_source_coordinates(model_fits, reftime, peak_fraction=0.02,
+                            threshold_sigma=7.0):
+    """Return helioprojective centroids of strong positive init-model islands.
+
+    The input is the shallow, long-integration CLEAN model at the daily
+    reference epoch.  When its WCS or support cannot be interpreted, a disk
+    center coordinate is returned so the subsequent Howard-motion gate remains
+    conservative and deterministic.
+
+    :param model_fits: Path to the native WSClean model FITS.
+    :type model_fits: str
+    :param reftime: Daily reference time for the helioprojective frame.
+    :type reftime: astropy.time.Time
+    :param peak_fraction: Minimum positive component relative to model peak.
+    :type peak_fraction: float
+    :param threshold_sigma: Robust significance threshold for nonzero support.
+    :type threshold_sigma: float
+    :returns: One or more helioprojective source coordinates.
+    :rtype: astropy.coordinates.SkyCoord
+    """
+    center = Time(reftime)
+    fallback = SkyCoord(
+        0.0 * u.arcsec, 0.0 * u.arcsec,
+        frame=Helioprojective(observer='earth', obstime=center),
+    )
+    if not model_fits or not os.path.exists(model_fits):
+        return fallback
+    try:
+        with fits.open(model_fits, memmap=False) as hdul:
+            image_hdu = next(hdu for hdu in hdul if hdu.data is not None and 'CDELT1' in hdu.header)
+            data = np.asarray(image_hdu.data, dtype=float).squeeze()
+            header = image_hdu.header.copy()
+        if data.ndim != 2 or not np.any(np.isfinite(data)):
+            return fallback
+        finite = data[np.isfinite(data)]
+        positive = finite[finite > 0]
+        if positive.size == 0:
+            return fallback
+        median = float(np.nanmedian(finite))
+        sigma = float(1.4826 * np.nanmedian(np.abs(finite - median)))
+        peak = float(np.nanmax(positive))
+        threshold = float(peak_fraction) * peak
+        if np.isfinite(sigma) and sigma > 0:
+            threshold = max(threshold, median + float(threshold_sigma) * sigma)
+        seed = np.isfinite(data) & (data >= threshold)
+        labels, nlabels = ndimage.label(seed)
+        if nlabels < 1:
+            return fallback
+
+        centroids = []
+        for label_id in range(1, nlabels + 1):
+            island = labels == label_id
+            weights = np.where(island, np.clip(data, 0.0, None), 0.0)
+            if not np.any(weights > 0):
+                continue
+            y, x = ndimage.center_of_mass(weights)
+            if np.isfinite(x) and np.isfinite(y):
+                centroids.append((float(x), float(y)))
+        if not centroids:
+            return fallback
+
+        xpix = np.asarray([item[0] for item in centroids], dtype=float)
+        ypix = np.asarray([item[1] for item in centroids], dtype=float)
+        # A registered helioprojective model carries the observer and solar
+        # distance needed by SunPy.  Converting a native RA/Dec WSClean image
+        # directly would yield unit-spherical ICRS coordinates and an invalid
+        # heliocentric origin shift.
+        model_map = smap.Map(data, header)
+        hpc = model_map.pixel_to_world(xpix * u.pix, ypix * u.pix)
+        hpc = _solar_rotate_howard(hpc, center)
+        tx = np.asarray(hpc.Tx.to_value(u.arcsec), dtype=float)
+        ty = np.asarray(hpc.Ty.to_value(u.arcsec), dtype=float)
+        rsun = float(sun.angular_radius(center).to_value(u.arcsec))
+        good = np.isfinite(tx) & np.isfinite(ty) & (np.hypot(tx, ty) <= 1.05 * rsun)
+        return hpc[good] if np.any(good) else fallback
+    except Exception:
+        log_print('WARNING',
+                  f"[s00_window] could not derive source coordinates from {model_fits}; "
+                  f"using disk center for the motion gate.\n{traceback.format_exc()}")
+        return fallback
+
+
+def _solar_rotate_howard(coordinate, target_time):
+    """Rotate a coordinate with Howard rates across supported SunPy APIs."""
+    try:
+        return solar_rotate_coordinate(
+            coordinate, time=target_time, model='howard')
+    except TypeError as exc:
+        if "unexpected keyword argument 'model'" not in str(exc):
+            raise
+        return solar_rotate_coordinate(
+            coordinate, time=target_time, rot_type='howard')
+
+
+def _s00_howard_displacement_arcsec(source_coords, reftime, duration_hours):
+    """Measure maximum endpoint-to-endpoint Howard rotation displacement.
+
+    :param source_coords: Helioprojective source coordinates at ``reftime``.
+    :type source_coords: astropy.coordinates.SkyCoord
+    :param reftime: Center time of the synthesis window.
+    :type reftime: astropy.time.Time
+    :param duration_hours: Full synthesis duration in hours.
+    :type duration_hours: float
+    :returns: Largest projected displacement in arcseconds.
+    :rtype: float
+    """
+    center = Time(reftime)
+    half_window = float(duration_hours) * 0.5 * u.hour
+    try:
+        at_center = _solar_rotate_howard(source_coords, center)
+        at_start = _solar_rotate_howard(at_center, center - half_window)
+        at_end = _solar_rotate_howard(at_center, center + half_window)
+        dx = (at_end.Tx - at_start.Tx).to_value(u.arcsec)
+        dy = (at_end.Ty - at_start.Ty).to_value(u.arcsec)
+        displacement = np.hypot(dx, dy)
+        finite = np.asarray(displacement, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        return float(np.nanmax(finite)) if finite.size else np.inf
+    except Exception:
+        log_print('WARNING',
+                  f"[s00_window] Howard displacement failed; rejecting the candidate.\n"
+                  f"{traceback.format_exc()}")
+        return np.inf
+
+
 def _compute_round_intervals(wsclean_intervals, multiplier, base_interval=50, nintervals_minor=3):
     """Compute time intervals for one self-cal round."""
     wsclean_intervals.interval_length = base_interval * multiplier
@@ -3098,6 +3602,36 @@ def _ms_has_column(msfile, column):
         return column in tb.colnames()
     finally:
         tb.close()
+
+
+def _require_ms_column(msfile, column, operation):
+    """Fail before splitting when a requested MS data column is absent."""
+    if _ms_has_column(msfile, column):
+        return
+    raise RuntimeError(
+        f"{operation} requires {column} in {msfile}, but that column is absent. "
+        "The calibration/imaging stage did not produce a self-calibrated "
+        "measurement set; refusing to assemble an output from raw DATA."
+    )
+
+
+def _require_wsclean_available():
+    """Fail before mutating a measurement set when WSClean is unavailable."""
+    executable = WSCLEAN_BIN
+    if os.path.isabs(executable):
+        available = os.path.isfile(executable) and os.access(executable, os.X_OK)
+    else:
+        available = shutil.which(executable) is not None
+    if not available:
+        raise RuntimeError(
+            f"WSClean executable is unavailable: {executable!r}. "
+            "Install the pinned EOVSA WSClean runtime or make it available "
+            "on PATH before running imaging."
+        )
+    # Keep commands built by wrap_wsclean and this module identical even when
+    # a caller imported the wrapper before this module resolved its binary.
+    ww.WSCLEAN_BIN = executable
+    return executable
 
 
 def _run_disk_selfcal(msfile, sidx, spw, spwstr, sp_index, workdir, antenna,
@@ -3361,7 +3895,7 @@ def _apply_fine_spectral_quality_gate(fine_fitsfiles, coarse_fitsfiles, tag, cfg
 
 def _register_and_export_interval_fits(msfile, fitsfilefinal, ri_final, imgoutdir, spwstr,
                                        reftime_daily, date_str, is_segmented,
-                                       n_ant_img, solar_antenna_total,
+                                       n_ant_img, solar_antenna_total, antenna_ids=None,
                                        tr_series_time=None, fits_tag=''):
     """Register per-interval WSClean FITS to helioprojective and export synoptic FITS.
 
@@ -3426,7 +3960,10 @@ def _register_and_export_interval_fits(msfile, fitsfilefinal, ri_final, imgoutdi
         # tiled-compressed FITS files written below, and moving compression
         # earlier in the model/imaging path breaks later WSClean predict runs.
         _write_compressed_synoptic_fits(eofile, synfitsfile)
-        _set_imaging_antenna_keywords(synfitsfile, n_ant_img, solar_antenna_total)
+        _set_imaging_antenna_keywords(
+            synfitsfile, n_ant_img, solar_antenna_total, antenna_ids=antenna_ids)
+        _write_imaging_antenna_manifest(
+            synfitsfile, solar_antenna_total, antenna_ids)
         if not is_segmented:
             # Non-segmented daily product: content is aligned to the daily
             # reference epoch, but imreg stamps DATE-OBS with the timerange
@@ -3436,12 +3973,546 @@ def _register_and_export_interval_fits(msfile, fitsfilefinal, ri_final, imgoutdi
     return synfitsfiles
 
 
+def _fits_image_and_header(path):
+    """Read the first two-dimensional image and matching FITS header."""
+    with fits.open(path, memmap=False) as hdul:
+        for hdu in hdul:
+            if hdu.data is None or 'CDELT1' not in hdu.header:
+                continue
+            data = np.asarray(hdu.data, dtype=float).squeeze()
+            if data.ndim == 2:
+                return data, hdu.header.copy()
+    raise ValueError(f"No two-dimensional image HDU in {path}")
+
+
+def _write_s00_mask(mask, template_fits, output_fits):
+    """Write a plain WSClean-compatible FITS mask on a template image grid."""
+    _, header = _fits_image_and_header(template_fits)
+    os.makedirs(os.path.dirname(output_fits) or '.', exist_ok=True)
+    fits.writeto(output_fits, np.asarray(mask, dtype=np.float32), header, overwrite=True)
+    return output_fits
+
+
+def _fits_grids_match(path_a, path_b, atol=1.0e-7):
+    """Return whether two FITS images share an exact WSClean mask grid."""
+    data_a, header_a = _fits_image_and_header(path_a)
+    data_b, header_b = _fits_image_and_header(path_b)
+    if data_a.shape != data_b.shape:
+        return False
+    for key in ('CDELT1', 'CDELT2', 'CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2'):
+        if key not in header_a or key not in header_b:
+            return False
+        if not np.isclose(float(header_a[key]), float(header_b[key]), rtol=0.0, atol=atol):
+            return False
+    return True
+
+
+def _wsclean_product(prefix, kind):
+    """Resolve one WSClean FITS product with or without a time infix."""
+    exact = f"{prefix}-{kind}.fits"
+    if os.path.exists(exact):
+        return exact
+    matches = sorted(glob(f"{prefix}-t*-{kind}.fits"))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _slfcal_source_model_fits(slfcal_obj):
+    """Resolve the trusted long-integration model from one self-cal round.
+
+    The feature self-cal object only sets ``model_ref_name_str`` when its
+    models were explicitly rotated to the daily reference epoch.  The normal
+    pipeline's init round keeps the equally useful native WSClean model
+    instead, so resolve that exact one-interval product before falling back to
+    a new shallow seed CLEAN.
+    """
+    if slfcal_obj is None:
+        return None
+    reference_prefix = getattr(slfcal_obj, 'model_ref_name_str', None)
+    if reference_prefix:
+        exact = f"{reference_prefix}-t0000-model.fits"
+        if os.path.exists(exact):
+            return exact
+        matches = sorted(glob(f"{reference_prefix}-t*-model.fits"))
+        if len(matches) == 1:
+            return matches[0]
+
+    workdir = getattr(slfcal_obj, 'workdir', None)
+    msfile = getattr(slfcal_obj, 'msfile', None)
+    spw = getattr(slfcal_obj, 'spw', None)
+    marker = getattr(slfcal_obj, 'image_marker', None)
+    if not workdir or not msfile or spw is None:
+        return None
+    parts = ['eovsa', 'major', os.path.basename(msfile),
+             f"sp{format_spw(str(spw))}"]
+    if marker:
+        parts.append(str(marker))
+    native_prefix = os.path.join(workdir, '-'.join(parts))
+    exact = f"{native_prefix}-t0000-model.fits"
+    if os.path.exists(exact):
+        return exact
+    exact = f"{native_prefix}-model.fits"
+    if os.path.exists(exact):
+        return exact
+    matches = sorted(glob(f"{native_prefix}-t*-model.fits"))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _run_s00_wsclean(msfile, prefix, sp_index, interval, briggs_val, bmsize,
+                     pols, data_column, fits_mask=None, niter=20000,
+                     no_update_model=False, auto_threshold=1,
+                     make_psf=False):
+    """Run one isolated, single-window s00 WSClean image.
+
+    :returns: Mapping from standard WSClean product names to FITS paths, with
+        integer ``status``.
+    :rtype: dict
+    """
+    clean_junk(prefix, junks=['dirty', 'model', 'psf', 'residual', 'image'])
+    clean_obj = ww.WSClean(msfile)
+    # WSClean requires the automask threshold to be strictly higher than the
+    # final auto-threshold.  The shallow source-model pass deliberately uses a
+    # higher final threshold than the science/review passes, so derive the
+    # automask threshold here instead of silently creating an invalid pair.
+    auto_mask = max(2.0, float(auto_threshold) + 1.0)
+    clean_obj.setup(
+        size=1024, scale="2.5asec", pol=pols,
+        weight_briggs=briggs_val,
+        niter=int(niter), mgain=0.85, gain=0.2,
+        data_column=data_column,
+        name=prefix,
+        multiscale=bool(niter > 0), multiscale_gain=0.3,
+        multiscale_scale_bias=0.6,
+        auto_mask=auto_mask, auto_threshold=auto_threshold,
+        minuv_l=200,
+        interval=list(interval), intervals_out=1,
+        no_negative=False, quiet=True,
+        circular_beam=True, beam_size=bmsize,
+        fits_mask=fits_mask,
+        no_update_model=bool(no_update_model),
+        make_psf=bool(make_psf),
+        spws=sp_index,
+    )
+    status = clean_obj.run(dryrun=False)
+    products = {'status': int(status), 'prefix': prefix}
+    for kind in ('dirty', 'model', 'psf', 'residual', 'image'):
+        products[kind] = _wsclean_product(prefix, kind)
+    return products
+
+
+def _s00_disk_clip_mask(template_fits, disk_mask_fits, reftime):
+    """Load the broad disk mask or recreate its 1.1-Rsun geometry."""
+    data, header = _fits_image_and_header(template_fits)
+    if disk_mask_fits and os.path.exists(disk_mask_fits):
+        try:
+            disk, _ = _fits_image_and_header(disk_mask_fits)
+            if disk.shape == data.shape:
+                return disk > 0
+        except Exception:
+            log_print('WARNING',
+                      f"[s00_mask] could not read broad disk mask {disk_mask_fits}; "
+                      f"recreating it from WCS.\n{traceback.format_exc()}")
+    pixel_arcsec = abs(float(header['CDELT1'])) * 3600.0
+    rsun_pix = float(sun.angular_radius(Time(reftime)).to_value(u.arcsec)) / pixel_arcsec
+    crpix1 = float(header.get('CRPIX1', data.shape[1] / 2.0 + 1.0)) - 1.0
+    crpix2 = float(header.get('CRPIX2', data.shape[0] / 2.0 + 1.0)) - 1.0
+    yy, xx = np.indices(data.shape)
+    return np.hypot(xx - crpix1, yy - crpix2) <= 1.1 * rsun_pix
+
+
+def _prepare_s00_final_policy(msfile, msname, sp_index, workdir, imgoutdir,
+                              wsclean_intervals, reftime_daily, model_fits,
+                              disk_mask_fits, briggs_val, bmsize, pols,
+                              data_column, fits_tag='', config=None):
+    """Select a central s00 window and construct its compact support mask.
+
+    :param fits_tag: Exact output-route tag used to isolate work and QA state.
+    :type fits_tag: str
+    :returns: Policy dictionary consumed by :func:`_run_final_imaging`, or
+        ``None`` when no conservative source support can be constructed.
+    :rtype: dict or None
+    """
+    cfg = dict(S00_FINAL_CONFIG)
+    if config:
+        cfg.update(config)
+    route = _s00_route_identity(fits_tag)
+    route_namespace = route['namespace']
+    artifact_stem = f"eovsa-{msname}-sp00-01-s00-{route_namespace}"
+    qa_dir = os.path.join(imgoutdir, 'qa', 's00', route_namespace)
+    os.makedirs(qa_dir, exist_ok=True)
+    seed_motion_model_fits = None
+
+    if not model_fits or not os.path.exists(model_fits):
+        archived_models = [
+            path for path in sorted(glob(os.path.join(
+                qa_dir, f"*{msname}*init*model.fits")))
+            if not path.endswith('model.helio.fits')
+        ]
+        if len(archived_models) == 1:
+            model_fits = archived_models[0]
+            log_print(
+                'INFO',
+                f"[s00_policy] reusing archived long-integration source model "
+                f"{model_fits} for imaging-only QA.")
+
+    if not model_fits or not os.path.exists(model_fits):
+        seed_candidate = _central_wsclean_interval(
+            wsclean_intervals, reftime_daily, max(cfg['candidate_hours']),
+            min_coverage_fraction=0.0, max_gap_factor=np.inf)
+        if not seed_candidate.get('interval'):
+            log_print('ERROR', '[s00_policy] no time support for a shallow source model.')
+            return None
+        seed_prefix = os.path.join(workdir, f"{artifact_stem}-seed")
+        seed = _run_s00_wsclean(
+            msfile, seed_prefix, sp_index, seed_candidate['interval'],
+            briggs_val, bmsize, pols, data_column,
+            niter=100, no_update_model=True, auto_threshold=3)
+        model_fits = seed.get('model') or seed.get('image')
+        if seed['status'] != 0 or not model_fits:
+            log_print('ERROR', '[s00_policy] shallow source-model run failed; skipping s00.')
+            return None
+
+        if model_fits.endswith('model.fits'):
+            seed_motion_model_fits = model_fits.replace(
+                'model.fits', 'model.helio.fits')
+        else:
+            seed_motion_model_fits = model_fits.replace(
+                '.fits', '.helio.fits')
+        try:
+            hf.imreg(
+                vis=msfile, imagefile=model_fits,
+                fitsfile=seed_motion_model_fits,
+                timerange=seed_candidate['ri']['timeranges'][0])
+        except Exception:
+            seed_motion_model_fits = None
+            log_print(
+                'WARNING',
+                f"[s00_window] could not register the shallow source model; "
+                f"using the conservative disk-center motion estimate.\n"
+                f"{traceback.format_exc()}")
+
+    motion_model_fits = (seed_motion_model_fits or
+                         model_fits.replace('model.fits', 'model.helio.fits'))
+    if not os.path.exists(motion_model_fits):
+        motion_model_fits = model_fits
+    source_coords = _s00_source_coordinates(
+        motion_model_fits, reftime_daily,
+        peak_fraction=cfg['support_peak_fraction'],
+        threshold_sigma=cfg['support_sigma'])
+    candidates = []
+    probe_prefixes = []
+    for hours in cfg['candidate_hours']:
+        candidate = _central_wsclean_interval(
+            wsclean_intervals, reftime_daily, hours,
+            min_coverage_fraction=cfg['min_coverage_fraction'],
+            max_gap_factor=cfg['max_gap_factor'])
+        motion_arcsec = _s00_howard_displacement_arcsec(source_coords, reftime_daily, hours)
+        candidate['motion_arcsec'] = motion_arcsec
+        candidate['motion_beams'] = motion_arcsec / float(bmsize)
+        candidate['psf_sidelobe'] = np.inf
+        candidate['probe_psf'] = None
+        if candidate.get('interval'):
+            probe_prefix = os.path.join(
+                workdir, f"{artifact_stem}-probe-{float(hours):g}h")
+            probe = _run_s00_wsclean(
+                msfile, probe_prefix, sp_index, candidate['interval'],
+                briggs_val, bmsize, pols, data_column,
+                niter=0, no_update_model=True, make_psf=True)
+            probe_prefixes.append(probe_prefix)
+            if probe['status'] == 0 and probe.get('psf'):
+                psf_data, psf_header = _fits_image_and_header(probe['psf'])
+                beam_pix = float(bmsize) / (abs(float(psf_header['CDELT1'])) * 3600.0)
+                candidate['psf_sidelobe'] = s00qa.measure_psf_sidelobe(psf_data, beam_pix)
+                candidate['probe_psf'] = probe['psf']
+        candidate['coverage_ok'] = bool(candidate['valid'])
+        candidate['motion_ok'] = bool(candidate['motion_beams'] < cfg['smear_beam_max'])
+        candidate['psf_ok'] = bool(candidate['psf_sidelobe'] <= cfg['psf_sidelobe_max'])
+        candidate['accepted'] = bool(
+            candidate['coverage_ok'] and candidate['motion_ok'] and candidate['psf_ok'])
+        candidates.append(candidate)
+
+    selected = next((item for item in candidates if item['accepted']), None)
+    precondition_state = None
+    if selected is None:
+        usable = [item for item in reversed(candidates) if item.get('interval')]
+        if not usable:
+            log_print('ERROR', '[s00_policy] no central candidate contains usable samples.')
+            return None
+        selected = usable[0]
+        if not selected['coverage_ok']:
+            precondition_state = s00qa.FAIL_COVERAGE
+        elif not selected['motion_ok']:
+            precondition_state = s00qa.FAIL_MOTION
+        elif not selected['psf_ok']:
+            precondition_state = s00qa.FAIL_PSF
+        else:
+            precondition_state = s00qa.FAIL_COVERAGE
+
+    if selected.get('probe_psf') and not _fits_grids_match(model_fits, selected['probe_psf']):
+        log_print(
+            'ERROR',
+            f"[s00_policy] init model grid does not match the selected final-imaging "
+            f"grid; refusing to resample a CLEAN mask ({model_fits} vs "
+            f"{selected['probe_psf']}).")
+        return None
+
+    model_data, model_header = _fits_image_and_header(model_fits)
+    pixel_arcsec = abs(float(model_header['CDELT1'])) * 3600.0
+    beam_pix = float(bmsize) / pixel_arcsec
+    disk_clip = _s00_disk_clip_mask(model_fits, disk_mask_fits, reftime_daily)
+    try:
+        support_mask, support_metrics = s00qa.build_support_mask(
+            model_data, beam_pix,
+            motion_pix=float(selected['motion_arcsec']) / pixel_arcsec,
+            threshold_sigma=cfg['support_sigma'],
+            peak_fraction=cfg['support_peak_fraction'],
+            dilation_beams=cfg['support_dilation_beams'],
+            clip_mask=disk_clip)
+    except Exception:
+        log_print('ERROR',
+                  f"[s00_policy] compact support-mask construction failed; skipping s00.\n"
+                  f"{traceback.format_exc()}")
+        return None
+
+    support_mask_fits = os.path.join(
+        workdir, f"{artifact_stem}-support-mask.fits")
+    _write_s00_mask(support_mask, model_fits, support_mask_fits)
+    disk_clip_fits = os.path.join(
+        workdir, f"{artifact_stem}-disk-clip-mask.fits")
+    _write_s00_mask(disk_clip, model_fits, disk_clip_fits)
+    log_print(
+        'INFO',
+        f"[s00_policy] selected {selected['duration_hours']:.1f} h central window | "
+        f"coverage={selected['coverage_fraction']:.3f}, "
+        f"psf={selected['psf_sidelobe']:.3f}, "
+        f"motion={selected['motion_beams']:.3f} beam, "
+        f"precondition_state={precondition_state or 'pass'}")
+    return {
+        'config': cfg,
+        'fits_tag': route['fits_tag'],
+        'route_id': route['route_id'],
+        'route_namespace': route_namespace,
+        'artifact_stem': artifact_stem,
+        'qa_dir': qa_dir,
+        'interval': selected['interval'],
+        'ri': selected['ri'],
+        'selected': selected,
+        'candidates': candidates,
+        'precondition_state': precondition_state,
+        'support_mask': support_mask,
+        'support_mask_fits': support_mask_fits,
+        'disk_clip_mask': disk_clip,
+        'disk_clip_mask_fits': disk_clip_fits,
+        'support_metrics': support_metrics,
+        'source_model_fits': model_fits,
+        'motion_model_fits': motion_model_fits,
+        'beam_fwhm_pix': beam_pix,
+        'probe_prefixes': probe_prefixes,
+        'artifact_prefixes': [],
+    }
+
+
+def _json_safe(value):
+    """Convert nested pipeline QA state into JSON-safe primitives."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()
+                if key not in ('ri', 'support_mask', 'disk_clip_mask')}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, Time):
+        return value.isot.tolist() if not value.isscalar else value.isot
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, (int, str, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _copy_s00_products(prefixes, extra_files, qa_dir):
+    """Copy the permanent s00 model/PSF/residual review bundle."""
+    os.makedirs(qa_dir, exist_ok=True)
+    copied = []
+    for prefix in prefixes:
+        for kind in ('dirty', 'model', 'psf', 'residual', 'image'):
+            source = _wsclean_product(prefix, kind)
+            if not source or not os.path.exists(source):
+                continue
+            destination = os.path.join(qa_dir, os.path.basename(source))
+            shutil.copy2(source, destination)
+            copied.append(destination)
+    for source in extra_files:
+        if source and os.path.exists(source):
+            destination = os.path.join(qa_dir, os.path.basename(source))
+            if os.path.abspath(source) != os.path.abspath(destination):
+                shutil.copy2(source, destination)
+            copied.append(destination)
+    return copied
+
+
+def _stamp_s00_qa(fitsfile, qa):
+    """Stamp compact deterministic s00 QA fields into a synoptic FITS."""
+    if not fitsfile or not os.path.exists(fitsfile):
+        return
+    selected = qa.get('selected') or {}
+    state = str(qa.get('state') or s00qa.FAIL_AMBIGUOUS_SOURCE)
+    def finite_metric(key):
+        value = float(selected.get(key, -1.0))
+        return value if np.isfinite(value) else -1.0
+
+    with fits.open(fitsfile, mode='update') as hdul:
+        for hdu in hdul:
+            if 'CDELT1' not in hdu.header:
+                continue
+            hdr = hdu.header
+            hdr.set('QASTATE', state, 'deterministic s00 imaging QA state')
+            hdr.set('S00WINH', finite_metric('duration_hours'),
+                    'selected central s00 window [h]')
+            hdr.set('S00PSF', finite_metric('psf_sidelobe'),
+                    'max abs PSF sidelobe outside 2 FWHM')
+            hdr.set('S00SMEAR', finite_metric('motion_beams'),
+                    'Howard source displacement / restoring beam')
+            hdr.set('S00EXP', bool(state == s00qa.PASS_EXPANDED_MASK),
+                    'support mask expanded after held-out QA')
+            hdr.set('S00RNS', str(qa.get('route_namespace', 'production')),
+                    'route-isolated s00 QA namespace')
+            hdr.add_history('s00 CLEAN constrained by deterministic source-support mask')
+            break
+
+
+def _evaluate_s00_residual_policy(msfile, base_products, policy, sp_index,
+                                  briggs_val, bmsize, pols, data_column):
+    """Run held-out residual tests and at most one rollback-safe mask retry."""
+    cfg = policy['config']
+    required = ('residual', 'psf', 'model', 'image')
+    if any(not base_products.get(key) for key in required):
+        policy['state'] = s00qa.FAIL_AMBIGUOUS_SOURCE
+        policy['assessment'] = {'triggered': True, 'reason': 'missing_base_products'}
+        return base_products['prefix'], policy
+
+    residual, _ = _fits_image_and_header(base_products['residual'])
+    psf, _ = _fits_image_and_header(base_products['psf'])
+    model, _ = _fits_image_and_header(base_products['model'])
+    restored, _ = _fits_image_and_header(base_products['image'])
+    support = policy['support_mask']
+    source_peak = float(np.nanmax(np.abs(restored[support]))) if np.any(support) else 0.0
+    assessment = s00qa.detect_residual_candidates(
+        residual, support, psf, policy['beam_fwhm_pix'],
+        source_model=model, in_mask_source_peak=source_peak,
+        snr_trigger=cfg['residual_snr_trigger'],
+        peak_ratio_trigger=cfg['residual_peak_ratio_trigger'])
+    policy['assessment'] = assessment
+    precondition = policy.get('precondition_state')
+    if precondition:
+        policy['state'] = precondition
+        return base_products['prefix'], policy
+    if not assessment['triggered']:
+        policy['state'] = s00qa.PASS_BASE_MASK
+        return base_products['prefix'], policy
+
+    i0, i1 = [int(value) for value in policy['interval']]
+    midpoint = i0 + (i1 - i0) // 2
+    if midpoint <= i0 or midpoint >= i1:
+        policy['state'] = s00qa.FAIL_AMBIGUOUS_SOURCE
+        policy['repeatability'] = {'validated': [], 'reason': 'interval_too_short'}
+        return base_products['prefix'], policy
+
+    diagnostic_products = []
+    half_residuals = []
+    half_psfs = []
+    for label, interval in (('half-a', [i0, midpoint]), ('half-b', [midpoint, i1])):
+        prefix = f"{base_products['prefix']}-{label}"
+        products = _run_s00_wsclean(
+            msfile, prefix, sp_index, interval, briggs_val, bmsize,
+            pols, data_column, fits_mask=policy['support_mask_fits'],
+            niter=cfg['qa_clean_niter'], no_update_model=True)
+        diagnostic_products.append(products)
+        policy['artifact_prefixes'].append(prefix)
+        if (products['status'] == 0 and products.get('residual')
+                and products.get('psf')):
+            half_residuals.append(_fits_image_and_header(products['residual'])[0])
+            half_psfs.append(_fits_image_and_header(products['psf'])[0])
+
+    frequency_residuals = []
+    frequency_psfs = []
+    spw_ids = [item for item in str(sp_index).split(',') if item]
+    for spw_id in spw_ids[:2]:
+        prefix = f"{base_products['prefix']}-spw{spw_id}"
+        products = _run_s00_wsclean(
+            msfile, prefix, spw_id, policy['interval'], briggs_val, bmsize,
+            pols, data_column, fits_mask=policy['support_mask_fits'],
+            niter=cfg['qa_clean_niter'], no_update_model=True)
+        diagnostic_products.append(products)
+        policy['artifact_prefixes'].append(prefix)
+        if (products['status'] == 0 and products.get('residual')
+                and products.get('psf')):
+            frequency_residuals.append(_fits_image_and_header(products['residual'])[0])
+            frequency_psfs.append(_fits_image_and_header(products['psf'])[0])
+
+    repeatability = s00qa.validate_candidate_repeatability(
+        assessment['candidates'], half_residuals, support,
+        policy['beam_fwhm_pix'], frequency_residuals=frequency_residuals,
+        time_half_psfs=half_psfs, frequency_psfs=frequency_psfs,
+        source_model=model, required_frequency_count=2,
+        sigma_min=cfg['half_snr_min'],
+        centroid_beam_fraction=cfg['centroid_beam_fraction'])
+    policy['repeatability'] = repeatability
+    if not repeatability['validated']:
+        policy['state'] = s00qa.REVIEW_PSF_RESIDUAL
+        return base_products['prefix'], policy
+
+    expanded_mask, growth = s00qa.expand_support_mask(
+        support, repeatability['validated'], policy['beam_fwhm_pix'],
+        max_growth_fraction=cfg['max_mask_growth_fraction'],
+        max_added_beams_per_candidate=cfg['max_added_beams_per_candidate'],
+        max_candidate_islands=cfg['max_candidate_islands'],
+        max_image_fraction=cfg['max_mask_image_fraction'],
+        clip_mask=policy['disk_clip_mask'])
+    policy['mask_growth'] = growth
+    if not growth['accepted']:
+        policy['state'] = s00qa.FAIL_AMBIGUOUS_SOURCE
+        return base_products['prefix'], policy
+    expanded_mask_fits = policy['support_mask_fits'].replace('.fits', '-expanded.fits')
+    _write_s00_mask(expanded_mask, base_products['image'], expanded_mask_fits)
+    policy['expanded_mask_fits'] = expanded_mask_fits
+
+    retry_prefix = f"{base_products['prefix']}-retry"
+    retry = _run_s00_wsclean(
+        msfile, retry_prefix, sp_index, policy['interval'], briggs_val, bmsize,
+        pols, data_column, fits_mask=expanded_mask_fits, niter=20000,
+        no_update_model=True)
+    policy['artifact_prefixes'].append(retry_prefix)
+    if retry['status'] != 0 or any(not retry.get(key) for key in required):
+        policy['state'] = s00qa.FAIL_AMBIGUOUS_SOURCE
+        policy['retry'] = {'accepted': False, 'reason': 'retry_imaging_failed'}
+        return base_products['prefix'], policy
+
+    retry_result = s00qa.validate_retry(
+        residual, _fits_image_and_header(retry['residual'])[0],
+        model, _fits_image_and_header(retry['model'])[0],
+        support, expanded_mask, repeatability['validated'],
+        policy['beam_fwhm_pix'],
+        residual_drop_min=cfg['retry_residual_drop_min'],
+        energy_drop_min=cfg['retry_energy_drop_min'],
+        rms_worsen_max=cfg['retry_rms_worsen_max'],
+        source_flux_change_max=cfg['retry_source_flux_change_max'])
+    policy['retry'] = retry_result
+    if retry_result['accepted']:
+        policy['state'] = s00qa.PASS_EXPANDED_MASK
+        policy['support_mask'] = expanded_mask
+        return retry_prefix, policy
+    policy['state'] = s00qa.FAIL_AMBIGUOUS_SOURCE
+    return base_products['prefix'], policy
+
+
 def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                        msname, ri_final, briggs_val, bmsize, pols,
                        reftime_daily, viz_timerange, date_str,
                        is_segmented, imaging_objs, freq_setup,
                        tr_series_time=None, fits_tag='', data_column='CORRECTED_DATA',
-                       solar_antenna_total=None):
+                       solar_antenna_total=None, s00_policy=None):
     """Run final imaging (segmented or non-segmented) and return output FITS paths.
 
     :param tr_series_time: List of (start_Time, end_Time) tuples to filter imaging intervals.
@@ -3450,10 +4521,15 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
         / ``eovsa.synoptic_daily`` in the output FITS filenames so alternate-source
         runs (e.g. calwidget_v2 NPZ calibration) do not collide with production
         artefacts.
+    :param s00_policy: Optional deterministic central-window/support-mask plan.
+        It is accepted only by the segmented s00 path; all other callers pass
+        ``None`` and retain the historical behavior.
+    :type s00_policy: dict or None
     """
     gain = 0.2
     reffreq, cdelt4_real, _ = freq_setup.get_reffreq_and_cdelt(spw, return_bmsize=True)
-    n_ant_img = count_unflagged_solar_antennas(msfile, sp_index, solar_antenna_total)
+    antenna_ids = unflagged_solar_antenna_ids(msfile, sp_index, solar_antenna_total)
+    n_ant_img = None if antenna_ids is None else len(antenna_ids)
     if n_ant_img is not None and solar_antenna_total is not None:
         log_print('INFO',
                   f"SPW {spwstr}: {n_ant_img}/{int(solar_antenna_total)} solar antennas "
@@ -3462,6 +4538,8 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
     with pipeline_stage("final_imaging", spw=spw, spwstr=spwstr, segmented=is_segmented):
         if is_segmented:
             imname_strlist = ["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']
+            if s00_policy is not None:
+                imname_strlist.append(f"s00-{s00_policy['route_namespace']}")
             imname = '-'.join(imname_strlist)
             final_prefix = os.path.join(workdir, imname)
             clean_junk(final_prefix, junks=['dirty', 'model', 'psf', 'residual', 'image'])
@@ -3475,9 +4553,12 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                             multiscale_scale_bias=0.6,
                             auto_mask=2, auto_threshold=1,
                             minuv_l=200,
-                            intervals_out=ri_final['N1'],
+                            interval=(s00_policy['interval'] if s00_policy else []),
+                            intervals_out=(1 if s00_policy else ri_final['N1']),
                             no_negative=False, quiet=True,
                             circular_beam=True, beam_size=bmsize,
+                            fits_mask=(s00_policy['support_mask_fits']
+                                       if s00_policy else None),
                             spws=sp_index)
             wsclean_status = clean_obj.run(dryrun=False)
             if wsclean_status != 0:
@@ -3487,11 +4568,41 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                 clean_junk(final_prefix)
                 return [], imaging_objs
 
-            fitsname = sorted(glob(os.path.join(workdir, imname + '-t*-image.fits')))
+            if s00_policy is not None:
+                base_products = {'status': 0, 'prefix': final_prefix}
+                for kind in ('dirty', 'model', 'psf', 'residual', 'image'):
+                    base_products[kind] = _wsclean_product(final_prefix, kind)
+                s00_policy['artifact_prefixes'].append(final_prefix)
+                chosen_prefix, s00_policy = _evaluate_s00_residual_policy(
+                    msfile, base_products, s00_policy, sp_index,
+                    briggs_val, bmsize, pols, data_column)
+                final_prefix = chosen_prefix
+                imname = os.path.basename(chosen_prefix)
+                qa_prefixes = (
+                    list(s00_policy.get('probe_prefixes', [])) +
+                    list(s00_policy.get('artifact_prefixes', [])))
+                qa_files = [
+                    s00_policy.get('support_mask_fits'),
+                    s00_policy.get('disk_clip_mask_fits'),
+                    s00_policy.get('expanded_mask_fits'),
+                    s00_policy.get('source_model_fits'),
+                    s00_policy.get('motion_model_fits'),
+                ]
+                copied = _copy_s00_products(
+                    qa_prefixes, qa_files, s00_policy['qa_dir'])
+                s00_policy['qa_files'] = copied
+                qa_json = os.path.join(
+                    s00_policy['qa_dir'],
+                    f"{msname}-s00-{s00_policy['route_namespace']}-imaging-qa.json")
+                with open(qa_json, 'w') as outfile:
+                    json.dump(_json_safe(s00_policy), outfile, indent=2, sort_keys=True)
+                s00_policy['qa_json'] = qa_json
+
+            fitsname = sorted(glob(final_prefix + '-t*-image.fits'))
             if not fitsname:
                 # wsclean omits the '-t????-' infix when intervals_out=1;
                 # fall back to the non-time-indexed output name.
-                fitsname = sorted(glob(os.path.join(workdir, imname + '-image.fits')))
+                fitsname = sorted(glob(final_prefix + '-image.fits'))
             fitsname_helio = [f.replace('image.fits', 'image.helio.fits') for f in fitsname]
             fitsname_helio_ref_daily = [f.replace('image.fits', 'image.helio.ref_daily.fits') for f in fitsname]
             try:
@@ -3576,12 +4687,25 @@ def _run_final_imaging(msfile, sidx, spw, spwstr, sp_index, workdir, imgoutdir,
                 fitsfilefinal = []
 
     clean_junk('-'.join(["eovsa", "major", f"{msname}", f"sp{spwstr}", 'final']))
+    if s00_policy is not None:
+        for prefix in set(s00_policy.get('probe_prefixes', []) +
+                          s00_policy.get('artifact_prefixes', [])):
+            # The permanent QA copies were written above.  Keep only a selected
+            # restored image until registration/export finishes below.
+            if prefix != final_prefix:
+                clean_junk(prefix, junks=['dirty', 'model', 'psf', 'residual', 'image'])
+            else:
+                clean_junk(prefix)
 
     synfitsfiles = _register_and_export_interval_fits(
         msfile, fitsfilefinal, ri_final, imgoutdir, spwstr,
         reftime_daily, date_str, is_segmented,
-        n_ant_img, solar_antenna_total,
+        n_ant_img, solar_antenna_total, antenna_ids=antenna_ids,
         tr_series_time=tr_series_time, fits_tag=fits_tag)
+
+    if s00_policy is not None:
+        for synfitsfile in synfitsfiles:
+            _stamp_s00_qa(synfitsfile, s00_policy)
 
     return synfitsfiles, imaging_objs
 
@@ -3849,7 +4973,9 @@ def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_inde
                   f"[fine_joint_imaging] {traceback.format_exc()}")
         return _FINE_JOINT_FALLBACK
 
-    n_ant_img = count_unflagged_solar_antennas(msfile, group_sp_index, solar_antenna_total)
+    antenna_ids = unflagged_solar_antenna_ids(
+        msfile, group_sp_index, solar_antenna_total)
+    n_ant_img = None if antenna_ids is None else len(antenna_ids)
     if n_ant_img is not None and solar_antenna_total is not None:
         log_print('INFO',
                   f"Group SPW {group_spwstr}: {n_ant_img}/{int(solar_antenna_total)} solar antennas "
@@ -3994,7 +5120,7 @@ def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_inde
             chunk_synfitsfiles[chunk['spw']] = _register_and_export_interval_fits(
                 msfile, fitsfilefinal, ri_final, imgoutdir, chunk['spwstr'],
                 reftime_daily, date_str, is_segmented,
-                n_ant_img, solar_antenna_total,
+                n_ant_img, solar_antenna_total, antenna_ids=antenna_ids,
                 tr_series_time=tr_series_time, fits_tag=fits_tag)
 
         # Ignore/delete the joint run's MFS outputs -- the coarse product still
@@ -4014,6 +5140,69 @@ def _run_fine_joint_imaging(msfile, sidx, group_spw, group_spwstr, group_sp_inde
     return chunk_synfitsfiles
 
 
+def _stage_pipeline_input(msfile, msname, workdir, preserve_input=False):
+    """Return a working MS, copying explicit inputs to pipeline-owned scratch."""
+    input_stage_dir = workdir
+    if preserve_input:
+        input_stage_dir = os.path.join(workdir, '.pipeline_reused_input')
+        os.makedirs(input_stage_dir, exist_ok=True)
+    msfile_copy = os.path.join(input_stage_dir, f'{msname}.ms')
+    if preserve_input and os.path.abspath(msfile) == os.path.abspath(msfile_copy):
+        input_stage_dir = os.path.join(workdir, '.pipeline_reused_input_copy')
+        os.makedirs(input_stage_dir, exist_ok=True)
+        msfile_copy = os.path.join(input_stage_dir, f'{msname}.ms')
+    if preserve_input and os.path.exists(msfile_copy):
+        shutil.rmtree(msfile_copy, ignore_errors=True)
+    if not os.path.exists(msfile_copy):
+        if msfile.lower().endswith('.ms'):
+            shutil.copytree(msfile, msfile_copy)
+        elif msfile.lower().endswith('.ms.tar.gz'):
+            subprocess.run(['tar', '-zxf', msfile, '-C', input_stage_dir], check=True)
+        else:
+            raise ValueError(f"Unsupported file format: {msfile}")
+    return msfile_copy
+
+
+def _path_is_within(path, directory):
+    """Return whether ``path`` is on or below ``directory``."""
+    path = os.path.abspath(path)
+    directory = os.path.abspath(directory)
+    return os.path.commonpath((path, directory)) == directory
+
+
+def _archive_and_publish_outputvis(staged_outputvis, durable_outputvis):
+    """Archive a scratch MS and atomically publish it to durable storage."""
+    staged_outputvis = os.path.abspath(staged_outputvis)
+    durable_outputvis = os.path.abspath(durable_outputvis)
+    staged_archive = staged_outputvis + '.tar.gz'
+    durable_archive = durable_outputvis + '.tar.gz'
+
+    log_print('INFO', f"Archiving scratch output MS {staged_outputvis} to {staged_archive} ...")
+    with tarfile.open(staged_archive, 'w:gz') as tar:
+        tar.add(staged_outputvis, arcname=os.path.basename(durable_outputvis))
+    if not os.path.exists(staged_archive) or os.path.getsize(staged_archive) <= 0:
+        raise RuntimeError(f"Output MS archive is empty or missing: {staged_archive}")
+
+    if staged_archive != durable_archive:
+        os.makedirs(os.path.dirname(durable_archive) or '.', exist_ok=True)
+        partial_archive = durable_archive + '.partial'
+        try:
+            if os.path.exists(partial_archive):
+                os.remove(partial_archive)
+            log_print('INFO', f"Publishing completed output archive to {durable_archive} ...")
+            shutil.copy2(staged_archive, partial_archive)
+            os.replace(partial_archive, durable_archive)
+        except Exception:
+            if os.path.exists(partial_archive):
+                os.remove(partial_archive)
+            raise
+        os.remove(staged_archive)
+
+    shutil.rmtree(staged_outputvis)
+    log_print('INFO', f"Published durable output archive {durable_archive}")
+    return durable_archive
+
+
 def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=None,
                  figoutdir=None, clearcache=False, clearlargecache=False,
                  pols='XX', verbose=True, hanning=False, do_sbdcal=False,
@@ -4021,7 +5210,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                  niter_init=None, ncpu='auto', tr_series_imaging=None,
                  spws_imaging=None, fits_tag='', fine_spectral_imaging=False,
                  fine_spectral_only=False, custom_spws=None, force_feature_selfcal=False,
-                 imaging_only=False):
+                 imaging_only=False, adaptive_s00=False, preserve_input=False):
     """
     Executes the EOVSA data processing pipeline for solar observation data.
 
@@ -4085,6 +5274,15 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         existing selfcal MS product. Fine imaging requires the seven-parent
         provenance marker written by the current pipeline.
     :type imaging_only: bool, optional
+    :param preserve_input: Stage ``vis`` as a pipeline-owned working copy so
+        preprocessing, selfcal, archiving, and cache cleanup cannot mutate or
+        remove the explicitly selected source artifact.
+    :type preserve_input: bool, optional
+    :param adaptive_s00: Opt in to the adaptive central-window s00 route.
+        The default ``False`` preserves historical segmented full-track s00
+        imaging. The opt-in is honored only for SPW ``(0, 1)`` when no
+        ``tr_series_imaging`` filter is supplied.
+    :type adaptive_s00: bool, optional
     :return: Dictionary mapping coarse indexes and fine SPW keys to output FITS file paths.
     :rtype: dict
     """
@@ -4119,10 +5317,21 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         fine_spectral_imaging=fine_spectral_imaging,
         fine_spectral_only=fine_spectral_only,
         imaging_only=imaging_only,
+        adaptive_s00=adaptive_s00,
+        preserve_input=preserve_input,
     ):
+        log_print(
+            'INFO',
+            "s00 imaging route: {0}; adaptive_s00={1}. "
+            "The historical segmented full-track route is the default; "
+            "adaptive central-window imaging requires explicit opt-in."
+            .format('adaptive opt-in' if adaptive_s00 else 'full-track default', adaptive_s00))
         if outputvis and os.path.exists(outputvis) and not overwrite and not fine_spectral_only:
             log_print('INFO', f"Output MS file {outputvis} already exists. Skipping processing.")
             return outputvis
+
+        if not mergeFITSonly:
+            _require_wsclean_available()
 
         # --- Handle clearcache / clearlargecache interaction ---
         if clearlargecache:
@@ -4179,15 +5388,23 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         else:
             raise ValueError(f"Unsupported file format: {basename}")
 
-        msfile_copy = os.path.join(workdir, f'{msname}.ms')
-        if not os.path.exists(msfile_copy):
-            if msfile.lower().endswith('.ms'):
-                shutil.copytree(msfile, msfile_copy)
-            elif msfile.lower().endswith('.ms.tar.gz'):
-                subprocess.run(['tar', '-zxf', msfile, '-C', workdir], check=True)
-            else:
-                raise ValueError(f"Unsupported file format: {msfile}")
+        msfile_copy = _stage_pipeline_input(
+            msfile, msname, workdir, preserve_input=True)
+        if preserve_input:
+            log_print('INFO', f"Staged explicit input without modifying source: {msfile} -> {msfile_copy}")
         msfile = msfile_copy
+        # Repair the verified Sep 1--9 no-Ant3 intervals for every input route,
+        # including a reused daily MS that bypassed calibration. Other dates
+        # and tracking intervals keep their existing flags.
+        from suncasa.eovsa.antenna_flagging import flag_ant3_stow
+        ant3_flag_report = flag_ant3_stow(
+            msfile, provenance_path=os.path.join(imgoutdir, msname + '.ant3_flags.json'))
+        log_print('INFO', 'Ant3 observing-state flags: ' + json.dumps(ant3_flag_report))
+        if ant3_flag_report.get('cells_newly_flagged', 0):
+            overwrite = True
+            for stale_path in (msfile + '.flagversions', msfile + '.hanning'):
+                if os.path.exists(stale_path):
+                    _remove_existing_path_or_raise(stale_path, 'pre-stow-flag cache')
         if fine_spectral_only or imaging_only:
             # Resume-mode archives are built by per-coarse-group split + concat,
             # which leaves the main table GROUP-BLOCKED: TIME is non-monotonic
@@ -4269,6 +5486,8 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
         bright_thresh_source = {}
         fits_mask = {}
         imaging_objs = {}
+        synfits_manifest = {}
+        s00_policy_by_key = {}
         fine_imaging_spws = {}
         fine_postprocess_items = []
         spws = freq_setup.spws
@@ -4281,24 +5500,11 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             fine_output_spws = _normalize_spw_list(FINE_SPECTRAL_SPWS_52BAND)
         if (imaging_only and fine_spectral_imaging and nbands == 52
                 and not _has_fine_bootstrap_parent_marker(msfile)):
-            log_print('WARNING',
-                      f"[fine_bootstrap] {msfile} predates the seven-parent checkpoint "
-                      f"provenance marker; skipping all fine products. Remint the archive "
-                      f"with the current seven-parent pipeline before an imaging-only fine rerun.")
-            parent_bounds = {_spw_range_bounds(spw) for spw in spws}
-            stale_fine_spws = fine_output_spws
-            if stale_fine_spws is None:
-                stale_fine_spws = [
-                    child
-                    for parent_spw in spws
-                    for child in _fine_spectral_children_for_parent(parent_spw)
-                ]
-            for fine_spw in stale_fine_spws:
-                if _spw_range_bounds(fine_spw) not in parent_bounds:
-                    _remove_fine_spectral_products(
-                        imgoutdir, date_str, format_spw(fine_spw), fits_tag=fits_tag)
-            fine_spectral_imaging = False
-            fine_output_spws = None
+            raise RuntimeError(
+                f"[fine_bootstrap] {msfile} lacks the seven-parent checkpoint provenance "
+                f"marker required for imaging-only fine products. Remint the archive with "
+                f"the current seven-parent pipeline before retrying."
+            )
 
         for sidx, sp_index in enumerate(spws_indices):
             config_idx = spw_config_indices[sidx]
@@ -4479,7 +5685,13 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                             no_negative=True, quiet=True,
                                             circular_beam=True, beam_size=bmsize,
                                             spws=sp_index)
-                            clean_obj.run(dryrun=False)
+                            wsclean_status = clean_obj.run(dryrun=False)
+                            if wsclean_status != 0:
+                                raise RuntimeError(
+                                    f"WSClean brightness check failed with status "
+                                    f"{wsclean_status} for SPW {spws[sidx]} using "
+                                    f"{WSCLEAN_BIN!r}."
+                                )
                             clean_junk(imname)
 
                         in_fits = os.path.join(workdir, f"{imname}-image.fits")
@@ -4607,15 +5819,63 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                   f"imaging_only=True: skipping brightness check, feature self-cal, and "
                                   f"disk self-cal for SPW {spws[sidx]}; proceeding directly to final imaging.")
 
+                    adaptive_s00_active = _adaptive_s00_enabled(
+                        adaptive_s00, spws[sidx], tr_series_time)
+                    s00_policy = None
+                    ri_final_coarse = ri_final
+                    if _spw_range_bounds(spws[sidx]) == (0, 1):
+                        if adaptive_s00_active:
+                            log_print(
+                                'INFO',
+                                "[s00_route] adaptive opt-in active for SPW (0, 1); "
+                                "using the central-window policy.")
+                        elif adaptive_s00 and tr_series_time is not None:
+                            log_print(
+                                'INFO',
+                                "[s00_route] full-track default for SPW (0, 1); "
+                                "adaptive opt-in suppressed by tr_series_imaging.")
+                        else:
+                            log_print(
+                                'INFO',
+                                "[s00_route] full-track default for SPW (0, 1); "
+                                "pass adaptive_s00=True for adaptive opt-in.")
+                    if adaptive_s00_active:
+                        removed_s00_products = _begin_s00_attempt(
+                            s00_policy_by_key, synfits_manifest, sidx,
+                            imgoutdir, date_str, spwstr, fits_tag=fits_tag)
+                        if removed_s00_products:
+                            log_print(
+                                'INFO',
+                                f"[s00_policy] removed {len(removed_s00_products)} stale "
+                                f"same-route product(s) before the current attempt.")
+                        init_obj = slfcal_init_objs[sidx]
+                        source_model_fits = _slfcal_source_model_fits(init_obj)
+                        s00_policy = _prepare_s00_final_policy(
+                            msfile, msname, sp_index, workdir, imgoutdir,
+                            wsclean_intervals, reftime_daily, source_model_fits,
+                            fits_mask.get(sidx), briggs[sidx], bmsize, pols,
+                            final_data_column, fits_tag=fits_tag)
+                        if s00_policy is None:
+                            log_print(
+                                'ERROR',
+                                f"[s00_policy] no conservative final-imaging plan for "
+                                f"SPW {spws[sidx]}; skipping this product rather than "
+                                f"falling back to unconstrained CLEAN.")
+                            continue
+                        ri_final_coarse = s00_policy['ri']
+                        s00_policy_by_key[sidx] = s00_policy
+
                     # --- Step 4: Final imaging ---
                     synfitsfiles, imaging_objs = _run_final_imaging(
                         msfile, sidx, spws[sidx], spwstr, sp_index, workdir, imgoutdir,
-                        msname, ri_final, briggs[sidx], bmsize, pols,
+                        msname, ri_final_coarse, briggs[sidx], bmsize, pols,
                         reftime_daily, viz_timerange, date_str,
                         segmented_imaging[sidx], imaging_objs, freq_setup,
                         tr_series_time=tr_series_time, fits_tag=fits_tag,
                         data_column=final_data_column,
-                        solar_antenna_total=solar_antenna_total)
+                        solar_antenna_total=solar_antenna_total,
+                        s00_policy=s00_policy)
+                    synfits_manifest[sidx] = list(synfitsfiles)
 
                     if not segmented_imaging[sidx] and len(synfitsfiles) > 0:
                         outfits_all[sidx] = synfitsfiles[0]
@@ -4637,6 +5897,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                             for fine_spw in fine_spws:
                                 fine_spwstr = format_spw(fine_spw)
                                 fine_key = f'fine:{fine_spwstr}'
+                                synfits_manifest[fine_key] = []
                                 _remove_fine_spectral_products(
                                     imgoutdir, date_str, fine_spwstr, fits_tag=fits_tag)
                                 source_sp_index = _spw_indices_for_range(fine_spw)
@@ -4689,6 +5950,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                     fine_synfitsfiles = _apply_fine_spectral_quality_gate(
                                         fine_synfitsfiles, synfitsfiles, fine_key,
                                         cfg=PIPELINE_CONFIG)
+                                synfits_manifest[fine_key] = list(fine_synfitsfiles)
                                 if fine_synfitsfiles:
                                     fine_postprocess_items.append(
                                         (fine_key, fine_spw, segmented_imaging[sidx]))
@@ -4706,6 +5968,9 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     # Split immediately after this group's final imaging so the
                     # archive holds exactly the state imaging consumed.
                     if outputvis and not fine_spectral_only and not imaging_only:
+                        _require_ms_column(
+                            msfile, 'CORRECTED_DATA',
+                            f"Checkpoint split for SPW {spws[sidx]}")
                         if os.path.exists(msfile_sp):
                             shutil.rmtree(msfile_sp, ignore_errors=True)
                         log_print('INFO',
@@ -4736,13 +6001,24 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                                    f'eovsa.synoptic_daily{post_tag}.{date_str}T200000Z.s{spwstr}.tb.fits')
             outfits_disk = outfits.replace('.tb.fits', '.tb.disk.fits')
             if is_segmented:
-                synfitsfiles = sorted(glob(os.path.join(imgoutdir,
-                                                        f"eovsa.synoptic{post_tag}.{date_str[:-1]}?T??????Z.s{spwstr}.tb.fits")))
+                synfitsfiles = _synoptic_merge_inputs(
+                    out_key, synfits_manifest, imgoutdir, date_str, spwstr,
+                    fits_tag=fits_tag, merge_existing=mergeFITSonly)
                 snr_threshold = 3
                 if len(synfitsfiles) > 0:
                     log_print('INFO', f"Merging synoptic images for SPW {spwstr} to {outfits} ...")
-                    merge_FITSfiles(synfitsfiles, outfits, overwrite=True, snr_threshold=snr_threshold,
-                                    reftime=reftime_daily)
+                    merge_kwargs = {}
+                    if out_key in s00_policy_by_key:
+                        # The adaptive s00 product is already one selected
+                        # central window.  Do not let the generic multi-frame
+                        # SNR selector reject that sole, policy-approved image.
+                        merge_kwargs['deselect_index'] = np.zeros(
+                            len(synfitsfiles), dtype=bool)
+                    merge_FITSfiles(
+                        synfitsfiles, outfits, overwrite=True,
+                        snr_threshold=snr_threshold, reftime=reftime_daily,
+                        **merge_kwargs)
+                    _promote_imaging_antenna_manifest(synfitsfiles, outfits)
                     outfits_all[out_key] = outfits
                     synfitsfiles_disk = [l.replace('.tb.fits', '.tb.disk.fits') for l in synfitsfiles]
                     try:
@@ -4783,8 +6059,7 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
             targetdir = os.path.dirname(outputvis) or '.'
             targetfile = os.path.join(targetdir, os.path.basename(msfile) + '.flagversions')
             if os.path.abspath(msfile + '.flagversions') != os.path.abspath(targetfile):
-                if os.path.exists(targetfile):
-                    shutil.rmtree(targetfile, ignore_errors=True)
+                _remove_existing_path_or_raise(targetfile, 'flagversions directory')
                 shutil.move(msfile + '.flagversions', targetfile)
 
         # --- Cache cleanup ---
@@ -4808,8 +6083,29 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
 
         # --- Assemble selfcal'd outputvis from per-spw splits via concat ---
         if outputvis and not fine_spectral_only and not imaging_only and not os.path.exists(outputvis):
-            log_print('INFO', f"Building selfcal'd outputvis {outputvis} from per-spw splits ...")
-            os.makedirs(os.path.dirname(outputvis) or '.', exist_ok=True)
+            _require_ms_column(
+                msfile, 'CORRECTED_DATA',
+                "End-of-run self-calibrated output assembly")
+            assembly_outputvis = outputvis
+            if not _path_is_within(outputvis, workdir):
+                assembly_dir = os.path.join(workdir, '.outputvis_staging')
+                os.makedirs(assembly_dir, exist_ok=True)
+                assembly_outputvis = os.path.join(
+                    assembly_dir,
+                    os.path.basename(outputvis),
+                )
+                if os.path.exists(assembly_outputvis):
+                    _remove_existing_path_or_raise(
+                        assembly_outputvis,
+                        'stale scratch outputvis',
+                    )
+                if os.path.exists(assembly_outputvis + '.tar.gz'):
+                    os.remove(assembly_outputvis + '.tar.gz')
+            log_print(
+                'INFO',
+                f"Building selfcal'd outputvis on processing storage: {assembly_outputvis}",
+            )
+            os.makedirs(os.path.dirname(assembly_outputvis) or '.', exist_ok=True)
             slfcaled_spw_ms_list = []
             used_end_of_run_checkpoint_fallback = False
             for sidx, sp_index in enumerate(spws_indices):
@@ -4832,33 +6128,24 @@ def pipeline_run(vis, outputvis='', workdir=None, slfcaltbdir=None, imgoutdir=No
                     log_print('WARNING', f"Split failed for SPW {spws[sidx]}; skipping in outputvis.")
             if slfcaled_spw_ms_list:
                 log_print('INFO',
-                          f"Concatenating {len(slfcaled_spw_ms_list)} per-spw MS files into {outputvis} ...")
+                          f"Concatenating {len(slfcaled_spw_ms_list)} per-spw MS files into {assembly_outputvis} ...")
                 # timesort=True: without it the concat output is group-blocked
                 # (TIME non-monotonic), which breaks wsclean -intervals-out when
                 # the archive is later consumed by --imaging-only/--fine-spectral-only.
-                concat(vis=slfcaled_spw_ms_list, concatvis=outputvis, freqtol='', dirtol='', timesort=True)
-                log_print('INFO', f"Selfcal'd outputvis saved to {outputvis}")
+                concat(vis=slfcaled_spw_ms_list, concatvis=assembly_outputvis, freqtol='', dirtol='', timesort=True)
+                log_print('INFO', f"Selfcal'd scratch outputvis saved to {assembly_outputvis}")
                 if (_is_default_52_parent_plan(spws)
                         and len(slfcaled_spw_ms_list) == len(spws)
                         and not used_end_of_run_checkpoint_fallback
                         and len(parent_checkpoints_current_run) == len(spws)):
                     try:
-                        _write_fine_bootstrap_parent_marker(outputvis)
+                        _write_fine_bootstrap_parent_marker(assembly_outputvis)
                     except OSError:
                         log_print('WARNING',
                                   f"Failed to write fine-bootstrap parent provenance marker in "
-                                  f"{outputvis}; imaging-only fine reruns will be disabled.\n"
+                                  f"{assembly_outputvis}; imaging-only fine reruns will be disabled.\n"
                                   f"{traceback.format_exc()}")
-                # Tar the outputvis and remove the MS directory
-                outputvis_tar = outputvis + '.tar.gz'
-                log_print('INFO', f"Archiving {outputvis} to {outputvis_tar} ...")
-                with tarfile.open(outputvis_tar, 'w:gz') as tar:
-                    tar.add(outputvis, arcname=os.path.basename(outputvis))
-                if os.path.exists(outputvis_tar) and os.path.getsize(outputvis_tar) > 0:
-                    shutil.rmtree(outputvis)
-                    log_print('INFO', f"Removed {outputvis} after successful archiving to {outputvis_tar}")
-                else:
-                    log_print('WARNING', f"Tar archive {outputvis_tar} appears empty or missing. Keeping {outputvis}.")
+                _archive_and_publish_outputvis(assembly_outputvis, outputvis)
             else:
                 log_print('WARNING', "No per-spw slfcaled MS files produced; outputvis not created.")
 
@@ -4926,6 +6213,10 @@ if __name__ == '__main__':
     parser.add_argument('--force-feature-selfcal', action='store_true',
                         help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
                              'bypassing the brightness gate. Default off.')
+    parser.add_argument('--adaptive-s00', action='store_true',
+                        help='Opt in to adaptive central-window imaging for s00-01 only. '
+                             'Default uses the historical segmented full-track route; '
+                             'the opt-in is suppressed when --tr_series_imaging is supplied.')
     parser.add_argument('--hanning', action='store_true', help='Applies Hanning smoothing to the data.')
     parser.add_argument('--do_sbdcal', action='store_true', help='Perform single-band delay calibration.')
     parser.add_argument('--debug_mode', action='store_true', help='Enables debug mode with finer control over parameters.')
@@ -4957,6 +6248,7 @@ if __name__ == '__main__':
         fine_spectral_imaging=args.fine_spectral_imaging,
         fine_spectral_only=args.fine_spectral_only,
         imaging_only=args.imaging_only,
+        adaptive_s00=args.adaptive_s00,
         force_feature_selfcal=args.force_feature_selfcal,
         hanning=args.hanning,
         do_sbdcal=args.do_sbdcal,

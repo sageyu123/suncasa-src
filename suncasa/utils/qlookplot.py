@@ -153,12 +153,15 @@ def get_normalization(vmin, vmax, scale):
     :type vmin: float
     :param vmax: Maximum value for normalization
     :type vmax: float
-    :param scale: Type of scaling, either 'linear' or 'log'
-    :type scale: str
+    :param scale: Scaling type, either ``'linear'`` or ``'log'``, or an existing normalization object.
+    :type scale: str or matplotlib.colors.Normalize
     :return: The normalization object based on the given scaling
     :rtype: colors.Normalize or colors.LogNorm
     :raises ValueError: If `scale` is not 'linear' or 'log'
     """
+    if isinstance(scale, colors.Normalize):
+        return scale
+
     # print(f"vmin: {vmin}, vmax: {vmax}, scale: {scale}")
     if scale.lower() == 'linear':
         norm = colors.Normalize(vmin=vmin, vmax=vmax)
@@ -170,6 +173,82 @@ def get_normalization(vmin, vmax, scale):
         raise ValueError('Only "linear" and "log" are accepted for scaling.')
 
     return norm
+
+
+def _resolve_radio_contour_levels(index, data, nclevels, clevels, clevelsfix, imin, imax):
+    """Resolve contour levels for one radio image.
+
+    :param index: Frequency/spectral-window index.
+    :type index: int
+    :param data: Radio image data in brightness-temperature units.
+    :type data: numpy.ndarray
+    :param nclevels: Number of equally spaced levels for an ``imin``/``imax`` range.
+    :type nclevels: int
+    :param clevels: Relative levels multiplied by the image maximum.
+    :type clevels: sequence or None
+    :param clevelsfix: Absolute levels, either one shared sequence or one sequence per frequency.
+    :type clevelsfix: sequence or None
+    :param imin: Absolute lower contour bound.
+    :type imin: float or None
+    :param imax: Absolute upper contour bound.
+    :type imax: float or None
+    :returns: Contour levels in the same units as ``data``.
+    :rtype: numpy.ndarray
+    """
+
+    if clevelsfix is not None:
+        try:
+            fixed_values = np.asarray(clevelsfix, dtype=float)
+        except (TypeError, ValueError):
+            fixed_values = None
+        if fixed_values is not None:
+            if fixed_values.ndim <= 1:
+                fixed = fixed_values.ravel()
+                if fixed.size:
+                    return fixed
+            elif index < fixed_values.shape[0]:
+                fixed = np.asarray(fixed_values[index], dtype=float).ravel()
+                if fixed.size:
+                    return fixed
+        else:
+            try:
+                candidate = clevelsfix[index]
+            except (IndexError, TypeError):
+                candidate = None
+            if candidate is not None:
+                fixed = np.asarray(candidate, dtype=float).ravel()
+                if fixed.size:
+                    return fixed
+
+    if imin is not None and imax is not None:
+        return np.linspace(float(imin), float(imax), nclevels)
+
+    if clevels is not None:
+        return np.asarray(clevels, dtype=float) * np.nanmax(data)
+
+    return np.linspace(0.5, 1.0, 2) * np.nanmax(data)
+
+
+def _update_time_span(span, begin, end):
+    """Move a dynamic-spectrum time-span artist to the current movie frame.
+
+    :param span: Artist returned by :meth:`matplotlib.axes.Axes.axvspan`.
+    :type span: matplotlib.artist.Artist
+    :param begin: Beginning x coordinate.
+    :type begin: float
+    :param end: Ending x coordinate.
+    :type end: float
+    """
+
+    if hasattr(span, 'set_x') and hasattr(span, 'set_width'):
+        span.set_x(begin)
+        span.set_width(end - begin)
+        return
+
+    xy = np.asarray(span.get_xy()).copy()
+    xy[:, 0][np.array([0, 1, 4])] = begin
+    xy[:, 0][np.array([2, 3])] = end
+    span.set_xy(xy)
 
 
 def read_imres(imresfile):
@@ -195,9 +274,9 @@ def read_imres(imresfile):
         iterop_ = imres.items()
     for k, v in iterop_:
         imres[k] = list(np.array(v))
-    Spw = sorted(list(set(imres['Spw'])))
+    spw_labels = sorted(list(set(imres['Spw'])))
     # Spw = [str(int(sp)) for sp in Spw]
-    Spw = [str(int(sp)) if '~' not in sp else sp for sp in Spw]
+    Spw = [str(int(sp)) if sp.isdigit() else sp for sp in spw_labels]
     nspw = len(Spw)
     imres['Freq'] = [list(ll) for ll in imres['Freq']]
     Freq = sorted(uniq(imres['Freq']))
@@ -212,7 +291,9 @@ def read_imres(imresfile):
     spws = np.array(imres['Spw'])
     obs = np.array(imres['Obs'])[0]
     vis = np.array(imres['Vis'])[0]
-    inds = btimes.argsort()
+    spw_rank = {spw: index for index, spw in enumerate(spw_labels)}
+    spw_order = np.array([spw_rank[spw] for spw in spws])
+    inds = np.lexsort((spw_order, btimes.mjd))
     images_sort = images[inds].reshape(ntime, nspw)
     btimes_sort = btimes[inds].reshape(ntime, nspw)
     etimes_sort = etimes[inds].reshape(ntime, nspw)
@@ -226,6 +307,24 @@ def read_imres(imresfile):
             'plttimes': Time(plttimes),
             'obs': obs,
             'vis': vis}
+
+
+def format_imaging_selection_label(selection):
+    """Return a sortable, filesystem-safe label for a CASA SPW selection.
+
+    :param selection: Whole-SPW or channel-qualified CASA selection.
+    :type selection: str
+    :returns: Zero-padded label suitable for movie image names and metadata.
+    :rtype: str
+    """
+
+    selection = str(selection)
+    if ':' in selection:
+        spw_selection, channel_selection = selection.split(':', 1)
+        spw_label = '~'.join(part.zfill(2) for part in spw_selection.split('~'))
+        channel_label = '-'.join(part.zfill(3) for part in channel_selection.split('~'))
+        return '{}ch{}'.format(spw_label, channel_label.replace(';', '_'))
+    return '~'.join(part.zfill(2) for part in selection.split('~'))
 
 
 def checkspecnan(spec):
@@ -339,9 +438,29 @@ def uniq(lst):
     return nlst
 
 
-def get_colorbar_params(fbounds, stepfactor=1):
-    cfq = fbounds['cfreqs']
+def get_colorbar_params(fbounds, stepfactor=1, use_selected_range=False):
+    """Return frequency colorbar ticks, bounds, limits, and masked ranges.
+
+    :param fbounds: Frequency metadata returned by ``mstools.get_bandinfo``.
+    :type fbounds: dict
+    :param stepfactor: Tick-density scale used for full-band SPW plots.
+    :type stepfactor: int or float
+    :param use_selected_range: Limit the colorbar to the selected frequencies.
+    :type use_selected_range: bool
+    :returns: Ticks, boundaries, maximum, minimum, and masked frequency ranges.
+    :rtype: tuple
+    """
+
+    cfq = np.asarray(fbounds['cfreqs'])
     nspws = len(cfq)
+    if use_selected_range:
+        cfq = np.sort(cfq)
+        fmin = float(cfq[0])
+        fmax = float(cfq[-1])
+        bounds = np.linspace(fmin, fmax, max(nspws, 2))
+        ticks = np.linspace(fmin, fmax, min(nspws, 6))[1:-1]
+        return ticks, bounds, fmax, fmin, []
+
     freqmask = []
     if 'bounds_lo' in fbounds.keys():
         # bounds = np.hstack((fbounds['bounds_lo'], fbounds['bounds_hi'][-1]))
@@ -383,6 +502,18 @@ def get_colorbar_params(fbounds, stepfactor=1):
     # if vmax not in ticks:
     #     ticks = np.hstack((ticks, vmax))
     return ticks, bounds, fmax, fmin, freqmask
+
+
+def _uses_selected_frequency_range(spws):
+    """Return whether selections represent individual frequency channels.
+
+    :param spws: CASA channel selections or filesystem-safe movie labels.
+    :type spws: iterable[str]
+    :returns: ``True`` when any selection identifies an individual channel.
+    :rtype: bool
+    """
+
+    return any(':' in str(selection) or 'ch' in str(selection) for selection in spws)
 
 
 def parse_trange(trange):
@@ -451,9 +582,13 @@ def download_aia_data(trange, wavelengths=[171], cadence=None, outdir='./'):
         # Attempt downloading using JP2 single downloader first
         try:
             for wave in wavelengths:
-                downloaded_files.append(
-                    download_single_jp2(trange.to_datetime(), wave, outdir, {wave: DataSource.AIA_171}))
-            return downloaded_files
+                downloaded = download_single_jp2(
+                    trange.to_datetime(), wave, outdir, data_sources_aia
+                )
+                if downloaded:
+                    downloaded_files.append(downloaded)
+            if downloaded_files:
+                return downloaded_files
         except Exception as e:
             print(f"Single JP2 download failed: {e}")
 
@@ -1165,28 +1300,30 @@ def mk_qlook_image(vis, ncpu=1, timerange='', twidth=12, stokes='I,V', antenna='
         # slfcalms = './' + msfilebs + '.rr'
         # split(msfile, outputvis=slfcalms, datacolumn='corrected', correlation='RR')
 
-    cfreqs = mstools.get_bandinfo(msfile, spws)
+    bdinfo = mstools.get_bandinfo(msfile, spw=spws, returnbdinfo=True)
+    cfreqs = bdinfo['cfreqs']
+    if len(cfreqs) != len(spws):
+        raise ValueError('Could not resolve frequency metadata for every imaging selection')
     if restoringbeam == ['']:
-        restoringbms = [''] * nspw
-    else:
         if observatory == 'EOVSA':
-            restoringbms = mstools.get_bmsize(cfreqs, refbmsize=refbmsize, reffreq=reffreq, minbmsize=minbmsize)
+            restoringbms = mstools.get_bmsize(cfreqs, refbmsize=refbmsize, reffreq=reffreq,
+                                              minbmsize=minbmsize)
         else:
-            restoringbms = [''] * nspw
+            restoringbms = [''] * len(spws)
+    else:
+        try:
+            restoringbms = [float(beam.replace('arcsec', '')) for beam in restoringbeam]
+        except Exception:
+            print('Error encountered while processing the provided restoring beam sizes. '
+                  'They should be specified in the format "numberarcsec" (e.g., "100arcsec"). '
+                  'Falling back to using circular beams calculated as proportional to 1/freq, '
+                  'based on provided reference beam size, reference frequency, '
+                  'and minimum beam size settings.')
+            restoringbms = mstools.get_bmsize(cfreqs, refbmsize=refbmsize, reffreq=reffreq,
+                                              minbmsize=minbmsize)
     for sp, spw in enumerate(spws):
-        spwran = [s.zfill(2) for s in spw.split('~')]
-
-        spw_ = spw.split('~')
-        if len(spw_) == 2:
-            freqran = [(spwInfo['{}'.format(s)]['RefFreq'] + spwInfo['{}'.format(s)]['TotalWidth'] / 2.0) / 1.0e9 for s
-                       in spw.split('~')]
-        elif len(spw_) == 1:
-            s = spw_[0]
-            freqran = np.array([0, spwInfo['{}'.format(s)]['TotalWidth']]) + spwInfo['{}'.format(s)]['RefFreq']
-            freqran = freqran / 1.0e9
-            freqran = list(freqran)
-        else:
-            raise ValueError("Keyword 'spw' in wrong format")
+        spwstr = format_imaging_selection_label(spw)
+        freqran = [float(bdinfo['bounds_lo'][sp]), float(bdinfo['bounds_hi'][sp])]
 
         if restoringbms[sp] == '':
             restoringbm = ['']
@@ -1200,11 +1337,6 @@ def mk_qlook_image(vis, ncpu=1, timerange='', twidth=12, stokes='I,V', antenna='
             else:
                 imsize = 1024
                 cell = ['2.5arcsec']
-        if len(spwran) == 2:
-            spwstr = spwran[0] + '~' + spwran[1]
-        else:
-            spwstr = spwran[0]
-
         imagesuffix = '.spw' + spwstr.replace('~', '-')
         # if cfreq > 10.:
         #     antenna = antenna + ';!0&1;!0&2'  # deselect the shortest baselines
@@ -1530,9 +1662,8 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                     Overrides `nclevels` if provided. For example, `[0.3, 0.5, 0.8]` plots contours at 30%, 50%,
                     and 80% of the maximum value for each spectral window.
     :type clevels: list, optional
-    :param clevelsfix: Fixed contour levels for each spectral window, calculated using `radio_image_clevels`.
-                       These levels are relative to the flare peak and defined as percentages of the peak value.
-                       Overrides both `nclevels` and `clevels` if provided.
+    :param clevelsfix: Absolute fixed contour levels for each spectral window, either one shared sequence or one
+                       sequence per frequency. Overrides both `nclevels` and `clevels` if provided.
     :type clevelsfix: list, optional
     :param aiafits: Path to AIA FITS files, defaults to ''.
     :type aiafits: str, optional
@@ -1623,7 +1754,6 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
         freqbounds = mstools.get_bandinfo(imres['vis'], spw=imres['spw'], returnbdinfo=True)
     cfreqs = freqbounds['cfreqs']
     cfreqs_all = freqbounds['cfreqs_all']
-    freq_dist = (cfreqs - cfreqs_all[0]) / (cfreqs_all[-1] - cfreqs_all[0])
     if wrapfits:
         # imresnew = {'images': [], 'btimes': [], 'etimes': [], 'spw': imres['spws'], 'vis': imres['vis'],
         # 'freq': imres['freq'], 'obs': imres['obs']}
@@ -1677,6 +1807,15 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
         suc_sort = suc[inds].reshape(ntime, nspw)
         spws_sort = spws[inds].reshape(ntime, nspw)
         btimes = btimes_sort[:, 0]
+
+    use_selected_frequency_range = _uses_selected_frequency_range(Spw)
+    if use_selected_frequency_range:
+        freq_scale_min = np.nanmin(cfreqs)
+        freq_scale_max = np.nanmax(cfreqs)
+    else:
+        freq_scale_min = cfreqs_all[0]
+        freq_scale_max = cfreqs_all[-1]
+    freq_dist = (cfreqs - freq_scale_min) / (freq_scale_max - freq_scale_min)
 
     if isinstance(timerange, str):
         if timerange == '':
@@ -1810,7 +1949,12 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                     if aiafile == []:
                         if verbose:
                             print('No SDO fits files found. Downloading SDO data...')
-                        downloaded = download_aia_data(trange=plttime, wavelengths=aiawave, cadence=dt * u.second)
+                        downloaded = download_aia_data(
+                            trange=plttime,
+                            wavelengths=aiawave,
+                            cadence=dt * u.second,
+                            outdir=aiadir or './',
+                        )
                         aiafile = downloaded[0] if downloaded else []
                         # print(f'download jp2: {aiafile}')
                     aiafiles.append(aiafile)
@@ -1919,10 +2063,7 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                     clb_spec.set_label('Flux [sfu]')
         else:
             for pol in range(npols):
-                xy = dspecvspans[pol].get_xy()
-                xy[:, 0][np.array([0, 1, 4])] = btimes[i].plot_date
-                xy[:, 0][np.array([2, 3])] = etimes[i].plot_date
-                dspecvspans[pol].set_xy(xy)
+                _update_time_span(dspecvspans[pol], btimes[i].plot_date, etimes[i].plot_date)
         if plotaia:
             # pdb.set_trace()
             aia_jp2 = False
@@ -2081,16 +2222,10 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                             rmap_blank_.imshow(axes=ax)
 
                     if not rmap_flag:
-                        try:
-                            clevels1 = np.array(clevelsfix[s])  # firstly try contour with clevelsfix if given
-                        except:
-                            try:
-                                clevels1 = np.linspace(iranges[pidx][0], iranges[pidx][1], nclevels)
-                            except:
-                                try:
-                                    clevels1 = np.array(clevels) * np.nanmax(rmap.data)
-                                except:
-                                    clevels1 = np.linspace(0.5, 1.0, 2) * np.nanmax(rmap.data)
+                        clevels1 = _resolve_radio_contour_levels(
+                            s, rmap.data, nclevels, clevels, clevelsfix,
+                            iranges[pidx][0], iranges[pidx][1]
+                        )
                         if np.any(clevels1):
                             if nspw > 1:
                                 if opencontour:
@@ -2173,7 +2308,12 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
         if i == 0 and plotaia:
             if nspw > 1:
                 import matplotlib.colorbar as colorbar
-                ticks, bounds, fmax, fmin, freqmask = get_colorbar_params(freqbounds)
+                ticks, bounds, fmax, fmin, freqmask = get_colorbar_params(
+                    freqbounds, use_selected_range=use_selected_frequency_range
+                )
+                tick_format = '%4.2f' if use_selected_frequency_range else '%4.1f'
+                if use_selected_frequency_range:
+                    ticks = np.hstack(([fmin], ticks, [fmax]))
 
                 for pidx in range(npols):
                     ax = axs[pidx]
@@ -2182,7 +2322,7 @@ def plt_qlook_image(imres, timerange='', spwplt=None, figdir='./qlookimgs/', spe
                     # cax_freq.tick_params(direction='out')
                     cb = colorbar.ColorbarBase(cax_freq, norm=colors.Normalize(vmin=fmin, vmax=fmax), cmap=icmap,
                                                orientation='vertical', boundaries=bounds, spacing='proportional',
-                                               ticks=ticks, format='%4.1f', alpha=alpha_cont)
+                                               ticks=ticks, format=tick_format, alpha=alpha_cont)
                     # Freqs = [np.mean(fq) for fq in Freq]
                     # mpl.colorbar.ColorbarBase(cax_freq, cmap=icmap, norm=colors.Normalize(vmax=Freqs[-1], vmin=Freqs[0]))
                     for fbd_lo, fbd_hi in freqmask:
@@ -2265,7 +2405,8 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
               goestime=None,
               mkmovie=False, ncpu=1, twidth=1, movieformat='html',
               cleartmpfits=True, overwrite=True,
-              clearmshistory=False, show_warnings=False, verbose=False, quiet=False, ds_normalised=False):
+              clearmshistory=False, show_warnings=False, verbose=False, quiet=False, ds_normalised=False,
+              aiatimetol=600.0):
     '''
     Generate quick-look plots and dynamic spectra for solar radio observations.
     Required inputs:
@@ -2329,9 +2470,11 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
             radio image plotting parameters:
                 nclevels: Number of contour levels for radio image plots.
                 clevels: Specific contour levels for radio image plots.
+                clevelsfix: Absolute fixed contour levels, shared or specified per spectral window.
                 opencontour: Boolean. Plots open contours if True; filled contours otherwise.
                 icmap: Color map (string or Colormap object) for radio images/contours.
-                imax, imin: Color scale range, defining normalization before color mapping.
+                imax, imin: Absolute contour range used to generate `nclevels` equally spaced levels;
+                            also define image normalization for single-SPW snapshot images.
                 inorm: Normalization method (string or Normalize object), overriding imax and imin.
 
             radio dynamic spectrum plotting parameters:
@@ -2344,6 +2487,7 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                 aiawave: AIA image passband or HMI alias to download and display.
                 aiafits: Directly plots SDO image from provided FITS file, skipping download. (note: users can provide any solar image FITS file for plotting).
                 aiadir: Searches this directory for AIA image files to skip download.
+                aiatimetol: Maximum AIA-to-radio time difference in seconds.
                 acmap: Color map (string or Colormap object) for AIA images.
                 amin, amax: Color scale range for AIA image normalization before color mapping.
                 anorm: Normalization method (string or Normalize object), overriding amax and amin.
@@ -2497,7 +2641,9 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
             spw = [spwselec]
     else:
         if type(spw) is list:
-            spwselec = ';'.join(spw)
+            # CASA separates complete SPW clauses with commas; semicolons join
+            # channel ranges within one clause (for example, ``0:1;3``).
+            spwselec = ','.join(spw)
         else:
             spwselec = spw
             if ';' in spw:
@@ -2523,7 +2669,14 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
     # print(freqbounds)
     cfreqs = bdinfo['cfreqs']
     cfreqs_all = bdinfo['cfreqs_all']
-    freq_dist = lambda fq: (fq - cfreqs_all[0]) / (cfreqs_all[-1] - cfreqs_all[0])
+    use_selected_frequency_range = _uses_selected_frequency_range(spw)
+    if use_selected_frequency_range:
+        freq_scale_min = np.nanmin(cfreqs)
+        freq_scale_max = np.nanmax(cfreqs)
+    else:
+        freq_scale_min = cfreqs_all[0]
+        freq_scale_max = cfreqs_all[-1]
+    freq_dist = lambda fq: (fq - freq_scale_min) / (freq_scale_max - freq_scale_min)
     staql = {'timerange': timerange, 'spw': spwselec}
     if ms.msselect(staql, onlyparse=True):
         ndx = ms.msselectedindices()
@@ -2643,10 +2796,11 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                                        dmax=dmax, dmin=dmin, dcmap=dcmap, dnorm=dnorm,
                                        sclfactor=sclfactor,
                                        aiafits=aiafits, aiawave=aiawave, aiadir=aiadir, plotaia=plotaia,
+                                       timtol=float(aiatimetol) / 86400.0,
                                        freqbounds=bdinfo, alpha_cont=calpha,
                                        opencontour=opencontour,
                                        nclevels=nclevels,
-                                       # clevelsfix = clevelsfix,
+                                       clevelsfix=clevelsfix,
                                        movieformat=movieformat, ds_normalised=ds_normalised)
 
     else:
@@ -3124,6 +3278,10 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                         else:
                             clvls[pol] = np.array(clevels)
 
+            use_absolute_radio_levels = (
+                clevelsfix is not None or (imin is not None and imax is not None)
+            )
+
             if 'aiamap' in vars() and aiamap is not None:
                 _anorm = _context_map_norm(aiamap, aiawave, aia_jp2, amin, amax, anorm)
 
@@ -3153,7 +3311,6 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                             continue
 
                     for pidx, pol in enumerate(pols):
-                        rcmap = [icmap(freq_dist(cfreqs[s]))] * len(clvls[pol])
                         if meta['naxis'] > 2:
                             rmap_plt = smap.Map(np.squeeze(datas[pol][s, :, :]), meta['header'])
                         else:
@@ -3163,18 +3320,26 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                         if rmap_data_max <= 0.0 or rmap_data_max is np.nan:
                             print(f'Warning: the max value of the map is {rmap_data_max}. Skip plotting this map.')
                             continue
+                        if use_absolute_radio_levels:
+                            contour_levels = _resolve_radio_contour_levels(
+                                s, rmap_plt.data, nclevels, clevels, clevelsfix, imin, imax
+                            )
+                        else:
+                            contour_levels = clvls[pol] * rmap_data_max
+                        rcmap = [icmap(freq_dist(cfreqs[s]))] * len(contour_levels)
                         if nspws > 1:
                             if opencontour:
                                 rmap_plt_.contour(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                  levels=clvls[pol][:1] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                  levels=contour_levels if use_absolute_radio_levels else contour_levels[:1],
+                                                  alpha=calpha,
                                                   zorder=10)
                             else:
                                 rmap_plt_.contourf(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                   levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                   levels=contour_levels, alpha=calpha,
                                                    zorder=10)
                         else:
                             rmap_plt_.contour(axes=[axs[pidx][0], axs[pidx][1]], cmap=cmaps[pol],
-                                              levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                              levels=contour_levels, alpha=calpha,
                                               zorder=10)
                         if draw_limb_grid_flag:
                             draw_limb_grid_flag = False
@@ -3204,7 +3369,12 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                         else:
                             rmap_plt = smap.Map(datas[pol], meta['header'])
                         rmap_plt_ = pmX.Sunmap(rmap_plt)
-                        rmap_plt_.imshow(axes=[axs[pidx][0], axs[pidx][1]], cmap=cmaps[pol], interpolation='nearest')
+                        if imin is not None and imax is not None:
+                            _inorm = get_normalization(imin, imax, inorm)
+                        else:
+                            _inorm = None
+                        rmap_plt_.imshow(axes=[axs[pidx][0], axs[pidx][1]], cmap=cmaps[pol],
+                                          norm=_inorm, interpolation='nearest')
                         axs[pidx][0].set_title(title + ' ' + pols[pidx], fontsize=9)
                         rmap_plt_.draw_limb(axes=[axs[pidx][0], axs[pidx][1]])
                         rmap_plt_.draw_grid(axes=[axs[pidx][0], axs[pidx][1]])
@@ -3222,16 +3392,23 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                             if sp not in spwplt:
                                 continue
                         for pidx, pol in enumerate(pols):
-                            rcmap = [cmaps[pol](freq_dist(cfreqs[s]))] * len(clvls[pol])
                             rmap_plt = smap.Map(np.squeeze(datas[pol][s, :, :]), meta['header'])
                             rmap_plt_ = pmX.Sunmap(rmap_plt)
+                            if use_absolute_radio_levels:
+                                contour_levels = _resolve_radio_contour_levels(
+                                    s, rmap_plt.data, nclevels, clevels, clevelsfix, imin, imax
+                                )
+                            else:
+                                contour_levels = clvls[pol] * np.nanmax(rmap_plt.data)
+                            rcmap = [cmaps[pol](freq_dist(cfreqs[s]))] * len(contour_levels)
                             if opencontour:
                                 rmap_plt_.contour(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                  levels=clvls[pol][:1] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                  levels=contour_levels if use_absolute_radio_levels else contour_levels[:1],
+                                                  alpha=calpha,
                                                   zorder=10)
                             else:
                                 rmap_plt_.contourf(axes=[axs[pidx][0], axs[pidx][1]], colors=rcmap,
-                                                   levels=clvls[pol] * np.nanmax(rmap_plt.data), alpha=calpha,
+                                                   levels=contour_levels, alpha=calpha,
                                                    zorder=10)
                             axs[pidx][0].set_title(title + ' ' + pols[pidx], fontsize=9)
                             rmap_plt_.draw_limb(axes=[axs[pidx][0], axs[pidx][1]])
@@ -3287,11 +3464,15 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                 cayheight = ax1_pos[3] - 0.05 - ax2_pos[1]
                 cax = plt.axes((caxcenter - caxwidth / 2.0, ax2_pos[1], caxwidth, cayheight))
 
-                ticks, bounds, vmax, vmin, freqmask = get_colorbar_params(bdinfo)
+                ticks, bounds, vmax, vmin, freqmask = get_colorbar_params(
+                    bdinfo, use_selected_range=use_selected_frequency_range
+                )
+                tick_format = '%4.2f' if use_selected_frequency_range else '%4.1f'
+                endpoint_format = '{:.2f}' if use_selected_frequency_range else '{:.1f}'
 
                 cb = colorbar.ColorbarBase(cax, norm=colors.Normalize(vmin=vmin, vmax=vmax), cmap=icmap,
                                            orientation='vertical', boundaries=bounds, spacing='proportional',
-                                           ticks=ticks, format='%4.1f', alpha=calpha)
+                                           ticks=ticks, format=tick_format, alpha=calpha)
 
                 for fbd_lo, fbd_hi in freqmask:
                     if fbd_hi is not None:
@@ -3305,8 +3486,10 @@ def qlookplot(vis, timerange=None, spw='', spwplt=None,
                 cax.tick_params(axis="y", pad=-20., length=0, colors='k', labelsize=8)
                 cax.axhline(vmin, xmin=1.0, xmax=1.2, color='k', clip_on=False)
                 cax.axhline(vmax, xmin=1.0, xmax=1.2, color='k', clip_on=False)
-                cax.text(1.25, 0.0, '{:.1f}'.format(vmin), fontsize=9, transform=cax.transAxes, va='center', ha='left')
-                cax.text(1.25, 1.0, '{:.1f}'.format(vmax), fontsize=9, transform=cax.transAxes, va='center', ha='left')
+                cax.text(1.25, 0.0, endpoint_format.format(vmin), fontsize=9, transform=cax.transAxes,
+                         va='center', ha='left')
+                cax.text(1.25, 1.0, endpoint_format.format(vmax), fontsize=9, transform=cax.transAxes,
+                         va='center', ha='left')
                 # cax2 = cax.twiny()
                 # cax2.set_visible(False)
                 # cax2.tick_params(axis="y", pad=0., length=10, colors='k', labelsize=8)

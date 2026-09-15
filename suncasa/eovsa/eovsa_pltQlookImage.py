@@ -1,3 +1,4 @@
+import json
 import os
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
@@ -24,15 +25,43 @@ HELIOVIEWER_TIMEOUT_LIMIT = 3
 QUERY_TIMEOUT_S = 5
 
 imgfitsdir = '/data1/eovsa/fits/synoptic/'
-imgfitstmpdir = '/data1/workdir/fitstmp/'
+imgfitstmpdir = os.path.join(os.environ.get('EOVSA_WORKDIR', '/data1/workdir'), 'fitstmp')
 pltfigdir = '/common/webplots/SynopticImg/eovsamedia/eovsa-browser/'
+
+PRODUCT_VERSIONS = (
+    'v1.0',
+    'v2.0',
+    'v2.0_alt',
+    'v2.1',
+    'v2.1_alt',
+    'legacy_v2.0',
+)
+
+
+def normalize_product_version(version):
+    """Validate and return the canonical product-version tag.
+
+    :param version: Product-version selector.
+    :type version: str
+    :returns: The unchanged canonical selector.
+    :rtype: str
+    :raises ValueError: If ``version`` is a retired or unknown selector.
+    """
+    if version not in PRODUCT_VERSIONS:
+        raise ValueError(
+            'Product version {0} is not supported. Valid versions are {1}.'.format(
+                version, ', '.join(PRODUCT_VERSIONS)
+            )
+        )
+    return version
 
 
 def synoptic_product_path(dateobj, filename, version=None):
     datestrdir = dateobj.strftime("%Y/%m/%d")
     candidates = []
     if version:
-        candidates.append(os.path.join(imgfitsdir, datestrdir, version, filename))
+        canonical = normalize_product_version(version)
+        candidates.append(os.path.join(imgfitsdir, datestrdir, canonical, filename))
     candidates.append(os.path.join(imgfitsdir, datestrdir, filename))
     for path in candidates:
         if os.path.exists(path):
@@ -44,10 +73,75 @@ def synoptic_preview_dir(dateobj, version=None, create=False):
     datestrdir = dateobj.strftime("%Y/%m/%d")
     outdir = os.path.join(pltfigdir, datestrdir)
     if version:
-        outdir = os.path.join(outdir, version)
+        outdir = os.path.join(outdir, normalize_product_version(version))
     if create:
         os.makedirs(outdir, exist_ok=True)
     return outdir
+
+
+def synoptic_pipeline_status_path(dateobj, version='v2.0'):
+    """Return the per-date synoptic pipeline status path.
+
+    :param dateobj: Pipeline date used to construct the status filename.
+    :type dateobj: datetime.datetime
+    :param version: Synoptic product version.
+    :type version: str
+    :returns: Absolute status JSON path.
+    :rtype: str
+    """
+    version = normalize_product_version(version)
+    datestr = dateobj.strftime('%Y%m%d')
+    datestrdir = dateobj.strftime('%Y/%m/%d')
+    canonical_path = os.path.join(
+        imgfitsdir,
+        datestrdir,
+        'eovsa.synoptic_pipeline_status.{}.{}.json'.format(datestr, version),
+    )
+    return canonical_path
+
+
+def eovsa_preview_review_label(dateobj, version='v2.0'):
+    """Return the visible review tag for a date/version, if needed.
+
+    :param dateobj: Pipeline date whose status metadata should be read.
+    :type dateobj: datetime.datetime
+    :param version: Synoptic product version.
+    :type version: str
+    :returns: Review label, or an empty string when no review is requested.
+    :rtype: str
+    """
+    statusfile = synoptic_pipeline_status_path(dateobj, version=version)
+    if not os.path.exists(statusfile):
+        return ''
+    try:
+        with open(statusfile, 'r') as infile:
+            status = json.load(infile)
+    except (OSError, TypeError, ValueError):
+        return ''
+    if not isinstance(status, dict):
+        return ''
+
+    pipeline_state = str(status.get('state') or '').strip()
+    qa_state = str(status.get('s00_qa_state') or '').strip()
+    qa_reason = str(status.get('s00_qa_reason') or '').strip()
+    qa_reason_code = qa_reason.split(':', 1)[0].strip()
+    requires_review = status.get('s00_qa_requires_review') is True
+    requires_review = requires_review or status.get('s00_qa_warning') is True
+    requires_review = requires_review or pipeline_state.lower() in (
+        'imaging_review_required',
+        'review_required',
+    )
+    requires_review = requires_review or qa_state.upper().startswith(
+        ('FAIL_', 'REVIEW_')
+    )
+    requires_review = requires_review or qa_reason_code.upper().startswith(
+        ('FAIL_', 'REVIEW_')
+    )
+    if not requires_review:
+        return ''
+
+    review_code = qa_state or qa_reason_code or pipeline_state or 'REQUIRED'
+    return 'REVIEW: {}'.format(review_code.upper().replace(' ', '_'))
 
 
 def fits_tag_infix(fits_tag):
@@ -86,12 +180,13 @@ def eovsa_preview_warning_label(eomap):
     return 'Provisional cal: {}'.format(str(cal_date).strip())
 
 
-def synoptic_daily_product_filename(dateobj, spwstr, version='v3.0', fits_tag=''):
+def synoptic_daily_product_filename(dateobj, spwstr, version='v2.0', fits_tag=''):
     datestr = dateobj.strftime('%Y%m%d')
     tag = fits_tag_infix(fits_tag)
+    version = normalize_product_version(version)
     if version == 'v1.0':
         return 'eovsa_{}.spw{}.tb.disk.fits'.format(datestr, spwstr)
-    if version == 'v2.0':
+    if version == 'legacy_v2.0':
         return f'eovsa.synoptic_daily{tag}.{datestr}T200000_UTC.s{spwstr}.tb.fits'
     return f'eovsa.synoptic_daily{tag}.{datestr}T200000Z.s{spwstr}.tb.disk.fits'
 
@@ -142,7 +237,7 @@ def _read_crval3_ghz(fits_path):
     raise KeyError('CRVAL3 not found in any HDU of {}'.format(fits_path))
 
 
-def _standard_band_anchor_ghz(dateobj=None, version='v3.0', fits_tag=''):
+def _standard_band_anchor_ghz(dateobj=None, version='v2.0', fits_tag=''):
     """Return the 7 standard-band anchor frequencies (GHz) for interp_band_scale().
 
     Attempts to read CRVAL3 from the actual standard-band (SPWS_52BAND)
@@ -322,7 +417,8 @@ def pltEmptyImage(datestr, spws, vmaxs, vmins, dpis_dict={'t': 32.0}):
     return
 
 
-def _render_eovsa_band_frame(eofile, ax, cmap, vmin, vmax, dpis_dict, imgoutdir, filename_fn, fig):
+def _render_eovsa_band_frame(eofile, ax, cmap, vmin, vmax, dpis_dict, imgoutdir, filename_fn, fig,
+                             review_label=''):
     """Render one EOVSA band FITS product into the shared preview axes and save it.
 
     Extracted, behavior-preserving, from the per-band body of
@@ -367,8 +463,12 @@ def _render_eovsa_band_frame(eofile, ax, cmap, vmin, vmax, dpis_dict, imgoutdir,
     ax.set_xticklabels([])
     ax.set_yticklabels([])
     warning_label = eovsa_preview_warning_label(eomap)
+    if review_label:
+        ax.text(0.02, 0.98, review_label,
+                transform=ax.transAxes, color='#ff6b6b', ha='left', va='top', fontsize=9,
+                bbox=dict(facecolor='black', alpha=0.55, edgecolor='none', pad=2.0))
     if warning_label:
-        ax.text(0.02, 0.98, warning_label,
+        ax.text(0.02, 0.88 if review_label else 0.98, warning_label,
                 transform=ax.transAxes, color='#ffd166', ha='left', va='top', fontsize=9,
                 bbox=dict(facecolor='black', alpha=0.45, edgecolor='none', pad=2.0))
     ax.text(0.02, 0.02,
@@ -414,7 +514,8 @@ def _discover_fineband_spw_tags(dateobj, version, fits_tag, standard_spwstrs):
     datestrdir = dateobj.strftime("%Y/%m/%d")
     candidates_dirs = []
     if version:
-        candidates_dirs.append(os.path.join(imgfitsdir, datestrdir, version))
+        canonical = normalize_product_version(version)
+        candidates_dirs.append(os.path.join(imgfitsdir, datestrdir, canonical))
     candidates_dirs.append(os.path.join(imgfitsdir, datestrdir))
 
     pattern = f'eovsa.synoptic_daily{tag}.{datestr}T200000Z.s*.tb.disk.fits'
@@ -434,12 +535,13 @@ def _discover_fineband_spw_tags(dateobj, version, fits_tag, standard_spwstrs):
 
 
 def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None, overwrite=False, verbose=False,
-                           version='v3.0', fits_tag='', include_fine_bands=True):
+                           version='v2.0', fits_tag='', include_fine_bands=True):
     from astropy.visualization.stretch import AsinhStretch
     from astropy.visualization import ImageNormalize
     plt.ioff()
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
     imgoutdir = synoptic_preview_dir(dateobj, version=version)
+    review_label = eovsa_preview_review_label(dateobj, version=version)
 
     cmap = plt.get_cmap('sdoaia304')
     cmap.set_bad(color='k')
@@ -463,7 +565,7 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
             figname = os.path.join(imgoutdir, eovsa_preview_filename(l, s + 1, fits_tag=fits_tag))
             fexists.append(os.path.exists(figname))
 
-        if overwrite or (False in fexists):
+        if overwrite or review_label or (False in fexists):
             ax.cla()
             eofile = synoptic_product_path(
                 dateobj,
@@ -476,7 +578,8 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
             try:
                 _render_eovsa_band_frame(
                     eofile, ax, cmap, vmins[s], vmaxs[s], dpis_dict, imgoutdir,
-                    lambda l, s=s: eovsa_preview_filename(l, s + 1, fits_tag=fits_tag), fig)
+                    lambda l, s=s: eovsa_preview_filename(l, s + 1, fits_tag=fits_tag), fig,
+                    review_label=review_label)
             except Exception as err:
                 print('Fail to plot {}'.format(eofile))
                 print(err)
@@ -503,7 +606,7 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
                 figname = os.path.join(imgoutdir, eovsa_fineband_preview_filename(l, spwstr, fits_tag=fits_tag))
                 fexists.append(os.path.exists(figname))
 
-            if not (overwrite or (False in fexists)):
+            if not (overwrite or review_label or (False in fexists)):
                 continue
 
             ax.cla()
@@ -520,7 +623,8 @@ def pltEovsaQlookImage_v3(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=N
                 vmin_i, vmax_i = interp_band_scale(freq_ghz, anchor_ghz=anchor_ghz)
                 _render_eovsa_band_frame(
                     eofile, ax, cmap, vmin_i, vmax_i, dpis_dict, imgoutdir,
-                    lambda l, spwstr=spwstr: eovsa_fineband_preview_filename(l, spwstr, fits_tag=fits_tag), fig)
+                    lambda l, spwstr=spwstr: eovsa_fineband_preview_filename(l, spwstr, fits_tag=fits_tag), fig,
+                    review_label=review_label)
             except Exception as err:
                 print('Fail to plot {}'.format(eofile))
                 print(err)
@@ -539,6 +643,7 @@ def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None
     plt.ioff()
     dateobj = datetime.strptime(datestr, "%Y-%m-%d")
     imgoutdir = synoptic_preview_dir(dateobj, version=version)
+    review_label = eovsa_preview_review_label(dateobj, version=version)
 
     cmap = plt.get_cmap('sdoaia304')
     cmap.set_bad(color='k')
@@ -559,7 +664,7 @@ def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None
             figname = os.path.join(imgoutdir, eovsa_preview_filename(l, s + 1, fits_tag=fits_tag))
             fexists.append(os.path.exists(figname))
 
-        if overwrite or (False in fexists):
+        if overwrite or review_label or (False in fexists):
             ax.cla()
             spwstr = '-'.join(['{:02d}'.format(int(sp_)) for sp_ in sp.split('~')])
             eofile = synoptic_product_path(
@@ -584,8 +689,12 @@ def pltEovsaQlookImage(datestr, spws, vmaxs, vmins, dpis_dict, fig=None, ax=None
                 ax.set_xticklabels([])
                 ax.set_yticklabels([])
                 warning_label = eovsa_preview_warning_label(eomap)
+                if review_label:
+                    ax.text(0.02, 0.98, review_label,
+                            transform=ax.transAxes, color='#ff6b6b', ha='left', va='top', fontsize=9,
+                            bbox=dict(facecolor='black', alpha=0.55, edgecolor='none', pad=2.0))
                 if warning_label:
-                    ax.text(0.02, 0.98, warning_label,
+                    ax.text(0.02, 0.88 if review_label else 0.98, warning_label,
                             transform=ax.transAxes, color='#ffd166', ha='left', va='top', fontsize=9,
                             bbox=dict(facecolor='black', alpha=0.45, edgecolor='none', pad=2.0))
                 ax.text(0.02, 0.02,
@@ -869,11 +978,11 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
     :type show_warning: bool, optional
     :param debug: If True, run the pipeline in debugging mode; default is False.
     :type debug: bool, optional
-    :param version: EOVSA product version to plot, or "all" for the legacy v1/v3 pair.
+    :param version: EOVSA product version to plot, or "all" for the public v1/v2 pair.
     :type version: str, optional
     :param fits_tag: Optional tag inserted after eovsa.synoptic_daily for alternate FITS products.
     :type fits_tag: str, optional
-    :param include_fine_bands: If True (default), the v3 daily plotting path additionally
+    :param include_fine_bands: If True (default), the v2 daily plotting path additionally
         discovers and plots any non-standard band-segmentation daily products found
         alongside the standard 7 bands, using frequency-interpolated color scaling.
         On dates where only the standard 7 bands exist this is a no-op (nothing extra
@@ -927,7 +1036,7 @@ def main(dateobj=None, ndays=1, clearcache=False, ovwrite_eovsa=False, ovwrite_s
             spws_v3 = spws
 
         datestr = dateobs.strftime("%Y-%m-%d")
-        eovsa_versions = ['v1.0', 'v3.0'] if version == 'all' else [version]
+        eovsa_versions = ['v1.0', 'v2.0'] if version == 'all' else [version]
         for eovsa_version in eovsa_versions:
             version_fits_tag = '' if eovsa_version == 'v1.0' else fits_tag
             if eovsa_version == 'v1.0':
@@ -998,7 +1107,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--version', type=str, default='all',
-        help='EOVSA product version to plot into vX.Y preview folders, or "all" for the legacy v1/v3 pair.'
+        help='EOVSA product version to plot into vX.Y preview folders, or "all" for the public v1/v2 pair.'
     )
     parser.add_argument(
         '--fits-tag', type=str, default='',
@@ -1007,7 +1116,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--no-fine-bands', dest='no_fine_bands', action='store_true',
         help='Disable discovery/plotting of non-standard band-segmentation daily products '
-             '(fine-spectral chunks, custom groups) in the v3 daily plotting path. By default '
+             '(fine-spectral chunks, custom groups) in the v2 daily plotting path. By default '
              '(flag absent) discovery is automatic: additional eovsa.synoptic_daily*.s*.tb.disk.fits '
              'tags beyond the standard 7 bands are found and plotted with frequency-interpolated '
              'color scaling; this flag is a kill-switch for production if that behavior is ever unwanted.'

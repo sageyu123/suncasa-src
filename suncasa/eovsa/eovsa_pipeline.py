@@ -10,12 +10,19 @@ from suncasa.suncasatasks import ptclean6 as ptclean
 from suncasa.suncasatasks import importeovsa
 # Import the private task directly (not the auto-generated CASA wrapper) so the
 # cal_npz / refcal_npz_mode / secondary_npz arguments are exposed.
-from suncasa.suncasatasks.private.task_calibeovsa import calibeovsa
+from suncasa.suncasatasks.private.task_calibeovsa import (
+    _select_sql_refcal_family,
+    calibeovsa,
+)
 
 import re
 import sys
 from eovsapy.dump_tsys import findfiles
 from eovsapy.sqlutil import sql2phacalX, sql2refcalX, sql2refcal_bphsbdX
+try:
+    from eovsapy.sqlutil import sql2refcal_bpsX
+except ImportError:
+    sql2refcal_bpsX = None
 from eovsapy.util import Time
 from eovsapy.spw_config import SPWS_52BAND_SELFCAL
 import os
@@ -26,7 +33,7 @@ from suncasa.casa_compat import import_casatasks, import_casatools
 from suncasa.eovsa.update_log import  EOVSA15_UPGRADE_DATE,DCM_IF_FILTER_UPGRADE_DATE
 
 tasks = import_casatasks('split', 'tclean', 'gencal', 'clearcal', 'applycal', 'gaincal',
-                         'delmod')
+                         'delmod', 'flagdata')
 split = tasks.get('split')
 tclean = tasks.get('tclean')
 gencal = tasks.get('gencal')
@@ -34,6 +41,7 @@ clearcal = tasks.get('clearcal')
 applycal = tasks.get('applycal')
 gaincal = tasks.get('gaincal')
 delmod = tasks.get('delmod')
+flagdata = tasks.get('flagdata')
 
 tools = import_casatools(['qatool', 'iatool', 'mstool', 'tbtool'])
 qatool = tools['qatool']
@@ -66,6 +74,98 @@ def get_tdate_from_basename(vis):
         raise ValueError("The basename does not match the expected format.")
 
 
+def normalize_reused_ms_input(input_ms, expected_date=None):
+    """Validate and normalize an explicitly reused MS or MS archive."""
+    if input_ms is None:
+        return None
+
+    input_ms = os.path.abspath(os.path.expanduser(os.path.normpath(input_ms)))
+    lower_path = input_ms.lower()
+    if lower_path.endswith('.ms.tar.gz'):
+        valid_type = os.path.isfile(input_ms)
+    elif lower_path.endswith('.ms'):
+        valid_type = os.path.isdir(input_ms)
+    else:
+        raise ValueError('input_ms must be an existing .ms directory or .ms.tar.gz archive.')
+    if not valid_type:
+        raise ValueError(f'input_ms does not exist or has the wrong type: {input_ms}')
+
+    input_date = get_tdate_from_basename(input_ms)
+    if expected_date is not None:
+        expected_date = Time(expected_date).datetime
+        if input_date.date() != expected_date.date():
+            raise ValueError(
+                'input_ms observing date {0} does not match requested date {1}: {2}'.format(
+                    input_date.strftime('%Y-%m-%d'),
+                    expected_date.strftime('%Y-%m-%d'),
+                    input_ms,
+                )
+            )
+    return input_ms
+
+
+def validate_reused_ms_options(input_ms, doimport=False, smart_cal_check=False,
+                               cal_npz=None, secondary_npz=None, sql_cal_time=None,
+                               end_time=None, force_lo_hi_smooth_extrap=False,
+                               ndays=1, version='v2.0', imaging_only=False):
+    """Reject options that would recalibrate or ambiguously validate a reused MS."""
+    if input_ms is None:
+        return
+    version = normalize_pipeline_version(version)
+    if ndays != 1:
+        raise ValueError('input_ms supports exactly one requested date; set ndays=1.')
+    if version not in WSCLEAN_PIPELINE_VERSIONS:
+        raise ValueError(
+            'input_ms reuse is supported only by WSClean pipeline versions: {0}'.format(
+                ', '.join(WSCLEAN_PIPELINE_VERSIONS)
+            )
+        )
+    if doimport:
+        raise ValueError('input_ms and doimport are mutually exclusive; use skip-import.')
+    if smart_cal_check:
+        raise ValueError(
+            'smart_cal_check validates calibration applied in the current run and cannot '
+            'verify a reused input_ms; disable smart_cal_check for explicit MS reuse.'
+        )
+
+    calibration_options = {
+        'cal_npz': cal_npz,
+        'secondary_npz': secondary_npz,
+        'sql_cal_time': sql_cal_time,
+        'end_time': end_time,
+        'force_lo_hi_smooth_extrap': force_lo_hi_smooth_extrap,
+    }
+    conflicts = [name for name, value in calibration_options.items() if value]
+    if conflicts:
+        raise ValueError(
+            'input_ms bypasses import and calibeovsa; remove calibration-only option(s): {0}'.format(
+                ', '.join(conflicts)
+            )
+        )
+
+    basename = os.path.basename(input_ms)
+    if basename.lower().endswith('.ms.tar.gz'):
+        stem = basename[:-len('.ms.tar.gz')]
+    else:
+        stem = basename[:-len('.ms')]
+    date_prefix = get_tdate_from_basename(input_ms).strftime('UDB%Y%m%d')
+    suffix = stem[len(date_prefix):]
+    expected_selfcal_prefix = f'.{get_pipeline_storage_version(version)}'
+    if imaging_only:
+        if not suffix.startswith(expected_selfcal_prefix):
+            raise ValueError(
+                'imaging_only input_ms must be the versioned selfcal product for {0}; '
+                'a calibrated daily MS must run without imaging_only so selfcal is not skipped: {1}'.format(
+                    version, input_ms
+                )
+            )
+    elif suffix:
+        raise ValueError(
+            'non-imaging-only input_ms must be the unversioned calibrated daily MS; '
+            'use imaging_only for a versioned selfcal product: {0}'.format(input_ms)
+        )
+
+
 def get_default_cal_tag(version, cal_tag=None):
     if cal_tag:
         return cal_tag
@@ -79,9 +179,79 @@ def remove_path(path):
         os.remove(path)
 
 
+def path_is_within(path, directory):
+    """Return whether ``path`` is inside ``directory`` after normalization."""
+    if path is None:
+        return False
+    path = os.path.abspath(path)
+    directory = os.path.abspath(directory)
+    return os.path.commonpath((path, directory)) == directory
+
+
+def clear_directory_preserving_path(directory, preserve_path):
+    """Clear directory contents except the child containing ``preserve_path``."""
+    directory = os.path.abspath(directory)
+    preserve_path = os.path.abspath(preserve_path)
+    if not path_is_within(preserve_path, directory):
+        raise ValueError(f'preserve_path is outside directory: {preserve_path}')
+    for name in os.listdir(directory):
+        child = os.path.join(directory, name)
+        if path_is_within(preserve_path, child):
+            continue
+        remove_path(child)
+
+
+def stage_calibration_inputs(invis, workdir, stage_tag=None, preserve_imports=False):
+    """Place mutable calibration inputs on the processing filesystem.
+
+    :param preserve_imports: Copy even inputs already on processing storage,
+        keeping reusable imports unchanged when applying observing-state flags.
+    :type preserve_imports: bool
+    """
+    stage_name = 'calibration_imported_ms'
+    if stage_tag:
+        stage_name += '_' + str(stage_tag)
+    stage_dir = os.path.join(workdir, stage_name)
+    os.makedirs(stage_dir, exist_ok=True)
+    staged = []
+    for src in invis:
+        src = os.path.normpath(src)
+        archived = src.endswith('.ms.tar.gz')
+        if path_is_within(src, workdir) and not preserve_imports and not archived:
+            print(f'Using UDB MS already staged on processing storage: {src}')
+            staged.append(src)
+            continue
+        basename = os.path.basename(src.rstrip('/'))
+        dst = os.path.join(stage_dir, basename[:-7] if archived else basename)
+        if os.path.realpath(src) == os.path.realpath(dst):
+            raise ValueError('Calibration staging destination is the preserved input: ' + src)
+        if os.path.exists(dst):
+            remove_path(dst)
+        print(f'Staging imported UDB MS for calibration: {src} -> {dst}')
+        if archived:
+            shutil.unpack_archive(src, stage_dir, 'gztar')
+            if not os.path.isdir(dst):
+                raise ValueError('Scan archive does not contain expected MS: ' + dst)
+        elif os.path.isdir(src):
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+        staged.append(dst)
+    return staged
+
+
 def stage_cal_npz_inputs(invis, workdir, cal_tag):
-    """Copy imported UDB scan MS inputs to scratch before calibeovsa mutates them."""
-    stage_dir = os.path.join(workdir, 'cal_npz_imported_ms_' + (cal_tag or 'untagged'))
+    """Backward-compatible NPZ wrapper for calibration input staging."""
+    return stage_calibration_inputs(invis, workdir, 'npz_' + (cal_tag or 'untagged'))
+
+
+def stage_time_cutoff_inputs(invis, workdir, end_time):
+    """Stage raw scan MS inputs and flag samples at or after ``end_time``."""
+    cutoff = Time(end_time)
+    cutoff_start = cutoff.datetime.strftime('%Y/%m/%d/%H:%M:%S')
+    cutoff_end = (cutoff.datetime + timedelta(days=1)).strftime('%Y/%m/%d/%H:%M:%S')
+    timerange = f'{cutoff_start}~{cutoff_end}'
+    stage_dir = os.path.join(workdir, 'time_cutoff_imported_ms_' + cutoff.datetime.strftime('%Y%m%d_%H%M%S'))
     os.makedirs(stage_dir, exist_ok=True)
     staged = []
     for src in invis:
@@ -89,11 +259,19 @@ def stage_cal_npz_inputs(invis, workdir, cal_tag):
         dst = os.path.join(stage_dir, os.path.basename(src.rstrip('/')))
         if os.path.exists(dst):
             remove_path(dst)
-        print(f'Staging imported UDB MS for NPZ calibration: {src} -> {dst}')
+        print(f'Staging imported UDB MS for end-time cutoff: {src} -> {dst}')
         if os.path.isdir(src):
             shutil.copytree(src, dst, symlinks=True)
         else:
             shutil.copy2(src, dst)
+        clearcal(vis=dst, addmodel=False)
+        print(f'Flagging staged MS data at or after {cutoff.iso}: {dst}')
+        try:
+            flagdata(vis=dst, mode='manual', timerange=timerange, flagbackup=False)
+        except RuntimeError as exc:
+            if 'MSSelectionNullSelection' not in str(exc):
+                raise
+            print(f'No staged MS samples at or after {cutoff.iso}: {dst}')
         staged.append(dst)
     return staged
 
@@ -111,6 +289,15 @@ else:
 
 
 class Path_config:
+    """Resolve EOVSA pipeline paths without modifying the filesystem.
+
+    Directories are created by the processing operation that writes to them,
+    not while this module is imported.
+
+    :param base_dir: Prefix used for paths without an environment override.
+    :type base_dir: str
+    """
+
     def __init__(self, base_dir=base_dir):
         self.paths = {}
 
@@ -125,20 +312,22 @@ class Path_config:
         self.qlookfitsdir = self._get_env_var('EOVSAQLOOKFITS', f'{base_dir}/data1/eovsa/fits/synoptic/')
         self.qlookfigdir = self._get_env_var('EOVSAQLOOKFIG', f'{base_dir}/common/webplots/qlookimg_10m/')
         self.synopticfigdir = self._get_env_var('EOVSASYNOPTICFIG', f'{base_dir}/common/webplots/SynopticImg/')
-        self.workdir_default = self._get_env_var('EOVSAWORKDIR', f'{base_dir}/data1/workdir/')
+        self.workdir_default = self._get_env_var('EOVSA_WORKDIR', f'{base_dir}/data1/workdir/')
 
         # Print a summary of paths
         self._print_summary()
 
     def _get_env_var(self, env_var, default_path):
+        """Return an environment path override or its configured default.
+
+        :param env_var: Environment variable containing an optional path.
+        :type env_var: str
+        :param default_path: Path returned when the variable is unset.
+        :type default_path: str
+        :returns: Resolved configured path without creating it.
+        :rtype: str
+        """
         path = os.getenv(env_var) or default_path
-        if not os.path.exists(path):
-            # if not is_on_server:
-            #     path = os.path.basename(default_path.rstrip('/')) + '/'
-            #     if not os.path.exists(path):
-            #         os.makedirs(path)
-            # else:
-            os.makedirs(path)
         self.paths[env_var] = path
         return path
 
@@ -163,25 +352,50 @@ qlookfigdir = pathconfig.qlookfigdir
 synopticfigdir = pathconfig.synopticfigdir
 workdir_default = pathconfig.workdir_default
 
+LEGACY_PIPELINE_VERSION = 'legacy_v2.0'
 SUPPORTED_PIPELINE_VERSIONS = (
     'v1.0',
     'v2.0',
-    'v3.0',
-    'v3.0_alt',
-    'v3.1',
-    'v3.1_alt',
+    LEGACY_PIPELINE_VERSION,
+    'v2.0_alt',
+    # Internal WSClean subversions. They retain the v2 naming family.
+    'v2.1',
+    'v2.1_alt',
 )
+PUBLIC_PIPELINE_VERSIONS = ('v1.0', 'v2.0')
 WSCLEAN_PIPELINE_VERSIONS = (
-    'v3.0',
-    'v3.0_alt',
-    'v3.1',
-    'v3.1_alt',
+    'v2.0',
+    'v2.0_alt',
+    'v2.1',
+    'v2.1_alt',
 )
 PROVISIONAL_SUCCESS_STATE = 'provisional_success'
 FALLBACK_RUNNING_STATE = 'running_with_fallback_calibration'
 FALLBACK_PARTIAL_STATE = 'partial_with_fallback_calibration'
+IMAGING_REVIEW_REQUIRED_STATE = 'imaging_review_required'
+S00_PASS_QA_STATES = frozenset(('PASS_BASE_MASK', 'PASS_EXPANDED_MASK'))
 PROVISIONAL_CALIBRATION_MODE = 'FALLBACK'
 SAME_DAY_CALIBRATION_MODE = 'SAME_DAY'
+
+
+def normalize_pipeline_version(version):
+    """Validate and return the canonical selector used for new outputs."""
+    if version not in SUPPORTED_PIPELINE_VERSIONS:
+        raise ValueError(
+            'Version {0} is not supported. Valid versions are {1}.'.format(
+                version, ', '.join(SUPPORTED_PIPELINE_VERSIONS)
+            )
+        )
+    return version
+
+
+def get_pipeline_storage_version(version):
+    """Return the internal self-cal MS suffix for a canonical selector.
+
+    Canonical WSClean products use their v2-family selector. The former
+    algorithm is kept separate under ``legacy_v2.0``.
+    """
+    return normalize_pipeline_version(version)
 
 
 def get_synoptic_day_output_dir(tim):
@@ -190,6 +404,7 @@ def get_synoptic_day_output_dir(tim):
 
 
 def get_synoptic_product_output_dir(tim, version):
+    version = normalize_pipeline_version(version)
     return os.path.join(get_synoptic_day_output_dir(tim), version)
 
 
@@ -204,7 +419,7 @@ def get_local_day_bounds(tim):
     return btime, etime
 
 
-def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
+def get_synoptic_output_info(tim, version='v2.0', fits_tag=''):
     """Return the expected synoptic daily FITS products and status file for one day.
 
     When ``fits_tag`` is a non-empty string (e.g. ``'test'`` for calwidget_v2
@@ -217,6 +432,7 @@ def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
         format_spw,
     )
 
+    version = normalize_pipeline_version(version)
     tim = Time(tim)
     date_str = tim.datetime.strftime('%Y%m%d')
     day_outdir = get_synoptic_day_output_dir(tim)
@@ -242,7 +458,7 @@ def get_synoptic_output_info(tim, version='v3.0', fits_tag=''):
     }
 
 
-def summarize_synoptic_outputs(tim, version='v3.0', fits_tag=''):
+def summarize_synoptic_outputs(tim, version='v2.0', fits_tag=''):
     """Summarize synoptic daily FITS availability for one pipeline day."""
     info = get_synoptic_output_info(tim, version=version, fits_tag=fits_tag)
     existing = [f for f in info['fitsfiles'] if os.path.exists(f)]
@@ -253,6 +469,99 @@ def summarize_synoptic_outputs(tim, version='v3.0', fits_tag=''):
         'fits_count': len(existing),
         'fits_expected_count': len(info['fitsfiles']),
     }
+
+
+def summarize_s00_imaging_qa(fitsfiles, require_qa=False):
+    """Read the deterministic imaging QA state from the daily s00 FITS.
+
+    Historical products without ``QASTATE`` remain eligible for the legacy
+    status path unless ``require_qa`` marks the product as freshly generated.
+    ``REVIEW_*`` states are advisory and remain visible in the status JSON
+    without blocking an otherwise complete run. ``FAIL_*``, an unrecognized
+    state, or an unreadable s00 FITS records a manual-review requirement while
+    leaving product publication enabled.
+
+    :param fitsfiles: Expected or existing daily synoptic FITS paths.
+    :type fitsfiles: list[str]
+    :param require_qa: Require a freshly generated s00 product to carry
+        ``QASTATE``.
+    :type require_qa: bool
+    :returns: Compact s00 QA fields for the per-day status JSON.
+    :rtype: dict
+    """
+    summary = {
+        's00_qa_state': None,
+        's00_qa_warning': False,
+        's00_qa_requires_review': False,
+        's00_qa_fitsfile': None,
+        's00_qa_reason': 's00_product_not_present',
+    }
+    s00_fitsfiles = [
+        path for path in fitsfiles
+        if re.search(r'\.s00-01\.', os.path.basename(path))
+    ]
+    if not s00_fitsfiles:
+        return summary
+
+    s00_fitsfile = s00_fitsfiles[0]
+    summary['s00_qa_fitsfile'] = s00_fitsfile
+    try:
+        with fits.open(s00_fitsfile, memmap=False) as hdul:
+            image_header = next(
+                (hdu.header for hdu in hdul if 'CDELT1' in hdu.header),
+                None,
+            )
+            if image_header is None:
+                raise ValueError('missing image HDU')
+            qa_state = str(image_header.get('QASTATE', '')).strip().upper()
+    except Exception as exc:
+        summary.update({
+            's00_qa_requires_review': True,
+            's00_qa_reason': 's00_fits_read_failed: {0}'.format(exc),
+        })
+        return summary
+
+    if not qa_state:
+        summary['s00_qa_requires_review'] = bool(require_qa)
+        summary['s00_qa_reason'] = 'qastate_not_present'
+        return summary
+
+    summary['s00_qa_state'] = qa_state
+    if qa_state in S00_PASS_QA_STATES:
+        summary['s00_qa_reason'] = 'pass'
+    elif qa_state.startswith('REVIEW_'):
+        summary['s00_qa_warning'] = True
+        summary['s00_qa_reason'] = qa_state.lower()
+    elif qa_state.startswith('FAIL_'):
+        summary['s00_qa_requires_review'] = True
+        summary['s00_qa_reason'] = qa_state.lower()
+    else:
+        summary['s00_qa_requires_review'] = True
+        summary['s00_qa_reason'] = 'unknown_qastate'
+    return summary
+
+
+def apply_s00_qa_to_pipeline_state(base_state, fitsfiles, require_qa=False):
+    """Attach s00 QA metadata without changing the outer pipeline state.
+
+    Imaging QA is advisory for product publication.  ``REVIEW_*``, ``FAIL_*``,
+    missing, unknown, and unreadable QA states remain visible in the status
+    JSON, but they must not suppress compression or browser-preview creation.
+
+    :param base_state: Pipeline state established by product completeness and
+        calibration provenance.
+    :type base_state: str
+    :param fitsfiles: Existing daily synoptic FITS paths.
+    :type fitsfiles: list[str]
+    :param require_qa: Require the s00 FITS to carry ``QASTATE``.
+    :type require_qa: bool
+    :returns: Unchanged outer state and compact s00 QA status fields.
+    :rtype: tuple[str, dict]
+    """
+    imaging_qa = summarize_s00_imaging_qa(fitsfiles, require_qa=require_qa)
+    if imaging_qa['s00_qa_requires_review']:
+        imaging_qa['imaging_base_state'] = base_state
+    return base_state, imaging_qa
 
 
 def set_synoptic_calibration_warning(fitsfiles, calibration_date=None):
@@ -335,9 +644,30 @@ def get_calibration_deadline_utc(tim, hour=4, day_offset=2):
     ) + timedelta(days=day_offset)
 
 
-def get_calibration_readiness(tim):
-    """Check whether the observer-written daily calibrations are ready for one day."""
+def get_calibration_readiness(tim, refcal_sql_mode='auto'):
+    """Check whether the selected daily SQL calibration route is ready.
+
+    ``bph_sbd`` requires a complete digest-matched type-14+16 family.
+    ``auto`` uses that same complete family when type 16 exists, permits a
+    historical type-14-only day only when no type-16 records exist, and falls
+    back to type 8 only when neither companion type is present. Explicit
+    ``legacy`` preserves the type-8 readiness behavior.
+
+    :param tim: Observing-day time.
+    :type tim: astropy.time.Time
+    :param refcal_sql_mode: SQL reference-calibration route.
+    :type refcal_sql_mode: str
+    :returns: Readiness and provenance fields.
+    :rtype: dict
+    :raises ValueError: If ``refcal_sql_mode`` is unsupported.
+    """
+
     tim = Time(tim)
+    refcal_sql_mode = (refcal_sql_mode or 'auto').strip().lower()
+    if refcal_sql_mode not in ('auto', 'bph_sbd', 'smb', 'legacy'):
+        raise ValueError(
+            'unsupported refcal_sql_mode {0!r}'.format(refcal_sql_mode)
+        )
     btime, etime = get_local_day_bounds(tim)
     deadline_utc = get_calibration_deadline_utc(tim)
     now_utc = datetime.utcnow()
@@ -352,6 +682,8 @@ def get_calibration_readiness(tim):
         'phacal_count': 0,
         'latest_phacal_timestamp_utc': None,
         'phacal_warning': None,
+        'refcal_family_status': None,
+        'refcal_family_reason': None,
     }
 
     try:
@@ -372,24 +704,75 @@ def get_calibration_readiness(tim):
     ref_ts = refcal['timestamp']
 
     # phacal['t_ref'] is the real refcal OBSERVATION time the phacal was solved
-    # against, not the ~07 UT SQL record locator in refcal['timestamp']. Anchor the
-    # >30-min gate to the refcal observation time: prefer the BPH+SBD t_refcal (what
-    # calibeovsa uses in bph_sbd mode), fall back to the type-8 T_beg, then the
-    # locator timestamp.
+    # against, not the ~07 UT SQL record locator in refcal['timestamp'].
     ref_obs = refcal.get('t_bg') or ref_ts
-    try:
-        bphsbd = sql2refcal_bphsbdX(etime)
-        if isinstance(bphsbd, list):
-            bphsbd = bphsbd[-1] if bphsbd else None
-        bphsbd_record_time = bphsbd.get('timestamp') if isinstance(bphsbd, dict) else None
-        if (
-            bphsbd_record_time is not None
-            and btime.mjd <= bphsbd_record_time.mjd < etime.mjd
-            and bphsbd.get('t_refcal') is not None
+    if refcal_sql_mode in ('auto', 'bph_sbd'):
+        try:
+            bphsbd_records = sql2refcal_bphsbdX(
+                [btime, etime],
+                nrecords=0,
+                neat=False,
+                verbose=False,
+            )
+        except Exception as exc:
+            readiness['reason'] = 'refcal_family_query_failed'
+            readiness['refcal_family_reason'] = (
+                'type-14 query failed: {0}'.format(exc)
+            )
+            return readiness
+        if sql2refcal_bpsX is None:
+            readiness['reason'] = 'refcal_family_query_failed'
+            readiness['refcal_family_reason'] = (
+                'caltype-16 SQL reader is unavailable'
+            )
+            return readiness
+        try:
+            bps_records = sql2refcal_bpsX(
+                [btime, etime],
+                nrecords=0,
+                neat=False,
+                verbose=False,
+            )
+        except Exception as exc:
+            readiness['reason'] = 'refcal_family_query_failed'
+            readiness['refcal_family_reason'] = (
+                'type-16 query failed: {0}'.format(exc)
+            )
+            return readiness
+        family_lookup_time = Time(
+            0.5 * (btime.mjd + etime.mjd),
+            format='mjd',
+        )
+        family = _select_sql_refcal_family(
+            bphsbd_records,
+            bps_records,
+            family_lookup_time,
+        )
+        readiness['refcal_family_status'] = family['status']
+        readiness['refcal_family_reason'] = family.get('reason')
+        if family['status'] == 'complete':
+            ref_obs = family['bphsbd_record'].get('t_refcal') or ref_obs
+        elif (
+            refcal_sql_mode == 'auto'
+            and family['status'] == 'historical_type14'
         ):
-            ref_obs = bphsbd['t_refcal']
-    except Exception:
-        pass
+            ref_obs = family['bphsbd_record'].get('t_refcal') or ref_obs
+        elif (
+            refcal_sql_mode == 'auto'
+            and family['status'] == 'missing'
+        ):
+            # No companion record exists, so auto retains the legacy type-8
+            # route. A partial family is never treated this way.
+            pass
+        else:
+            readiness['reason'] = (
+                'incomplete_refcal_family'
+                if family['status'] == 'partial'
+                else 'missing_complete_refcal_family'
+            )
+            return readiness
+    else:
+        readiness['refcal_family_status'] = 'legacy_type8'
     readiness['refcal_timestamp_utc'] = ref_obs.iso
     if not (btime.mjd <= ref_obs.mjd < etime.mjd):
         readiness['reason'] = 'stale_refcal'
@@ -423,6 +806,15 @@ def get_calibration_readiness(tim):
     return readiness
 
 
+def _calibration_readiness_for_mode(tim, refcal_sql_mode):
+    """Call readiness while retaining compatibility with auto-mode hooks."""
+
+    mode = (refcal_sql_mode or 'auto').strip().lower()
+    if mode == 'auto':
+        return get_calibration_readiness(tim)
+    return get_calibration_readiness(tim, refcal_sql_mode=mode)
+
+
 def get_fallback_calibration_lookback_days():
     """Return how many previous observing days cron may use as provisional calibration."""
     raw_value = os.getenv('EOVSA_PIPELINE_FALLBACK_CAL_LOOKBACK_DAYS', '3')
@@ -432,14 +824,28 @@ def get_fallback_calibration_lookback_days():
         return 3
 
 
-def find_previous_ready_calibration(tim, max_lookback_days=None):
-    """Find the newest previous observing day with ready SQL refcal/phacal records."""
+def find_previous_ready_calibration(
+        tim, max_lookback_days=None, refcal_sql_mode='auto'):
+    """Find the newest previous day ready for the selected SQL route.
+
+    :param tim: Target observing-day time.
+    :type tim: astropy.time.Time
+    :param max_lookback_days: Maximum number of earlier days to inspect.
+    :type max_lookback_days: int or None
+    :param refcal_sql_mode: SQL reference-calibration route.
+    :type refcal_sql_mode: str
+    :returns: Selected fallback description or ``None``.
+    :rtype: dict or None
+    """
     tim = Time(tim)
     if max_lookback_days is None:
         max_lookback_days = get_fallback_calibration_lookback_days()
     for day_offset in range(1, max_lookback_days + 1):
         cal_day = Time(tim.mjd - day_offset, format='mjd')
-        readiness = get_calibration_readiness(cal_day)
+        readiness = _calibration_readiness_for_mode(
+            cal_day,
+            refcal_sql_mode,
+        )
         if not readiness.get('ready'):
             continue
         _, etime = get_local_day_bounds(cal_day)
@@ -593,7 +999,8 @@ def getspwfreq(vis):
     return cfreqs
 
 
-def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overwrite=True, prefer_scan_ms=False):
+def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False,
+              overwrite=True, prefer_scan_ms=False, import_outpath=None):
     '''This finds all solar UDBms files within a timerange; If the UDBms file does not exist 
        in EOVSAUDBMSSCL, create one by calling importeovsa
        Required inputs:
@@ -611,6 +1018,9 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
        prefer_scan_ms - Boolean. If true, ignore the daily UDBYYYYMMDD.ms product
                         and return/import reusable raw scan MS files named
                         UDBYYYYMMDDhhmmss.ms.
+       import_outpath - Optional processing-filesystem directory for newly
+                        imported scan MS files. Existing durable scan MS files
+                        are still reused from EOVSAUDBMS.
     '''
     import glob
     if trange is None:
@@ -676,6 +1086,15 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
         msfiles = [os.path.basename(ll).split('.')[0] for ll in glob.glob('{}UDB*.ms*'.format(outpath)) if
                    ll.endswith('.ms') or ll.endswith('.ms.tar.gz')]
 
+    # Check the reusable processing-storage imports before deciding what to
+    # import. Previously they were discovered only after importeovsa ran.
+    if import_outpath:
+        msfiles = set(msfiles).union(
+            os.path.basename(candidate).split('.')[0]
+            for candidate in glob.glob(os.path.join(import_outpath, 'UDB*.ms*'))
+            if (candidate.endswith('.ms') and os.path.isdir(candidate))
+            or (candidate.endswith('.ms.tar.gz') and os.path.isfile(candidate)))
+
     msfile_synoptic = os.path.join(outpath, 'UDB' + tdatetime.strftime("%Y%m%d") + '.ms')
 
     if os.path.exists(msfile_synoptic) and not prefer_scan_ms:
@@ -704,29 +1123,41 @@ def trange2ms(trange=None, doimport=False, verbose=False, doscaling=False, overw
             # if ncpu > len(filelist):
             #    ncpu = len(filelist)
             ncpu = 1
+            import_path = os.path.join(import_outpath, '') if import_outpath else outpath
+            os.makedirs(import_path, exist_ok=True)
             importeovsa(idbfiles=[inpath + ll for ll in filelist], ncpu=ncpu, timebin="0s", width=1,
-                        visprefix=outpath, nocreatms=False,
+                        visprefix=import_path, nocreatms=False,
                         doconcat=False, modelms="", doscaling=doscaling, keep_nsclms=False, udb_corr=True)
 
-        msfiles = [os.path.basename(ll).split('.')[0] for ll in glob.glob('{}UDB*.ms*'.format(outpath)) if
-                   ll.endswith('.ms') or ll.endswith('.ms.tar.gz')]
+        ms_locations = {}
+        search_paths = [outpath]
+        if import_outpath:
+            search_paths.append(import_outpath)
+        for search_path in search_paths:
+            for candidate in glob.glob(os.path.join(search_path, 'UDB*.ms*')):
+                if candidate.endswith('.ms') or candidate.endswith('.ms.tar.gz'):
+                    scan_name = os.path.basename(candidate).split('.')[0]
+                    unpacked = os.path.join(search_path, scan_name + '.ms')
+                    ms_locations[scan_name] = unpacked if os.path.isdir(unpacked) else candidate
+        msfiles = list(ms_locations)
         udbfilelist_set = set(udbfilelist)
-        msfiles = udbfilelist_set.intersection(msfiles)
-        filelist = udbfilelist_set - msfiles
+        found_msfiles = udbfilelist_set.intersection(msfiles)
+        filelist = udbfilelist_set - found_msfiles
         filelist = sorted(list(filelist))
 
         return {'mspath': outpath, 'udbpath': inpath, 'udbfile': sorted(udbfilelist), 'udb2ms': filelist,
-                'ms': [outpath + ll + '.ms' for ll in sorted(list(msfiles))], 'tstlist': sclist['tstlist'],
+                'ms': [ms_locations[ll] for ll in sorted(list(found_msfiles))], 'tstlist': sclist['tstlist'],
                 'tedlist': sclist['tedlist']}
 
 
 def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearcache=False, verbose=False, pols='XX',
-                   version='v3.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
+                   version='v2.0', ncpu='auto', caltype=['refpha', 'phacal'], interp='nearest',
                    force_imaging_rerun=False, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
                    secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
-                   custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto',
+                   custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
                    sql_cal_time=None, force_feature_selfcal=False, imaging_only=False,
-                   refcal_provenance=None):
+                   refcal_provenance=None, end_time=None, adaptive_s00=False,
+                   input_ms=None):
     '''
        trange: can be 1) a single Time() object: use the entire day
                       2) a range of Time(), e.g., Time(['2017-08-01 00:00','2017-08-01 23:00'])
@@ -735,7 +1166,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
 
        cal_npz: optional path to a calwidget_v2 calibeovsa NPZ (e.g.
                 /common/webplots/phasecal/YYYYMMDD_calwidget_v2_calibeovsa.npz).
-                When provided and version is v3.0 or v3.1, calibration is read from the
+                When provided and version is v2.0 or v2.1, calibration is read from the
                 NPZ via task_calibeovsa.calibeovsa instead of MySQL, and
                 outputs are tagged so they do not collide with the production
                 artefacts.
@@ -750,6 +1181,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 primary BPH slots while primary SBD remains authoritative.
        force_lo_hi_smooth_extrap: in ``bph_sbd`` runs, force LO bands to use
                 the HI smooth-model extrapolated phase base instead of LO BPH.
+       refcal_sql_mode: no-NPZ SQL reference-calibration route. The default
+                ``bph_sbd`` requires a complete digest-matched type-14+16
+                BPH+SBD+BPS family and fails closed when it is unavailable.
        fine_spectral_imaging: bootstrap finer SPW chunks from the freshly
                 imaged coarse parent, run one phase-only refinement, then run
                 fine WSClean final imaging.
@@ -761,6 +1195,12 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 date/version/tag, skipping preprocessing and self-calibration.
                 Fine resume requires an archive minted by the current
                 seven-parent checkpoint path.
+       input_ms: optional exact path to an existing ``.ms`` directory or
+                ``.ms.tar.gz`` archive. This bypasses discovery, import, and
+                calibeovsa. Without imaging_only it is treated as a calibrated
+                daily MS and continues through selfcal plus imaging; with
+                imaging_only it is treated as a selfcal product and only final
+                imaging is run.
        custom_spws: optional WSClean FrequencySetup SPW grouping override. With
                 fine_spectral_imaging, the exact 24-product 52-band plan is
                 treated as fine outputs over the unchanged seven parents.
@@ -771,7 +1211,28 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                 actually applied to each successfully calibrated input MS.
        force_feature_selfcal: TEST ONLY: force feature self-calibration for all
                 processed SPW groups, bypassing the brightness gate. Default off.
+       end_time: optional UTC cutoff timestamp. Data at or after this time are
+                flagged on staged scan MS inputs before calibration and selfcal.
+       :param adaptive_s00: Explicitly opt in to the adaptive central-window s00
+                route. The default preserves the historical segmented full-track
+                route; the opt-in is limited to s00-01 without a time-range filter.
+       :type adaptive_s00: bool
     '''
+
+    version = normalize_pipeline_version(version)
+    tdate = trange.datetime
+    input_ms = normalize_reused_ms_input(input_ms, expected_date=tdate)
+    validate_reused_ms_options(
+        input_ms,
+        doimport=doimport,
+        cal_npz=cal_npz,
+        secondary_npz=secondary_npz,
+        sql_cal_time=sql_cal_time,
+        end_time=end_time,
+        force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
+        version=version,
+        imaging_only=imaging_only,
+    )
 
     if cal_npz:
         cal_tag = get_default_cal_tag(version, cal_tag)
@@ -782,13 +1243,22 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
         raise ValueError(
             'fine_spectral_only is no longer safe; use imaging_only with '
             'fine_spectral_imaging to regenerate the coarse parents first.')
-    use_imported_scan_ms = bool(cal_npz)
+    if end_time and imaging_only:
+        raise ValueError('end_time requires calibration from staged scan MS inputs; imaging_only is unsafe.')
+    # The Ant3 no-antenna schedule needs observing-state flags before any
+    # averaging/selfcal. Reapply calibration on copies of reusable imports.
+    preserve_scan_imports = (version in WSCLEAN_PIPELINE_VERSIONS
+                             and tdate >= datetime(2026, 9, 1))
+    apply_stow_flags = preserve_scan_imports and tdate < datetime(2026, 9, 10)
+    use_imported_scan_ms = input_ms is None and bool(cal_npz or end_time or preserve_scan_imports)
+    scan_import_dir = os.path.join(
+        workdir_default, 'imported_ms', tdate.strftime('%Y%m%d'))
 
     if workdir is None:
         workdir = workdir_default
+    os.makedirs(workdir, exist_ok=True)
     os.chdir(workdir)
 
-    tdate = trange.datetime
     udbmspath = udbmsslfcaleddir
     outpath = os.path.join(udbmspath, tdate.strftime('%Y%m')) + '/'
     if not os.path.exists(outpath):
@@ -801,10 +1271,11 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
         os.makedirs(figoutdir)
 
     ms_tag = f'.{cal_tag}' if cal_tag else ''
+    storage_version = get_pipeline_storage_version(version)
     if version == 'v1.0':
         output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'{ms_tag}.ms')
     else:
-        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'.{version}{ms_tag}.ms')
+        output_file_path = os.path.join(outpath, tdate.strftime('UDB%Y%m%d') + f'.{storage_version}{ms_tag}.ms')
     slfcaltbdir_path = os.path.join(slfcaltbdir, tdate.strftime('%Y%m')) + '/'
 
     if fine_spectral_only:
@@ -835,7 +1306,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    'fine_spectral_only': fine_spectral_only,
                    'fine_spectral_imaging': fine_spectral_imaging,
                    'custom_spws': custom_spws,
-                   'force_feature_selfcal': force_feature_selfcal})
+                   'force_feature_selfcal': force_feature_selfcal,
+                   'adaptive_s00': adaptive_s00,
+                   'preserve_input': input_ms is not None})
         return esip.pipeline_run(slfcaled_vis, outputvis='',
                                  workdir=workdir,
                                  slfcaltbdir=slfcaltbdir_path,
@@ -845,14 +1318,16 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  fine_spectral_imaging=True,
                                  fine_spectral_only=True,
                                  custom_spws=custom_spws,
-                                 force_feature_selfcal=force_feature_selfcal)
+                                 force_feature_selfcal=force_feature_selfcal,
+                                 adaptive_s00=adaptive_s00)
 
     if imaging_only:
-        slfcaled_vis = None
-        for candidate in (output_file_path, output_file_path + '.tar.gz'):
-            if os.path.exists(candidate):
-                slfcaled_vis = candidate
-                break
+        slfcaled_vis = input_ms
+        if slfcaled_vis is None:
+            for candidate in (output_file_path, output_file_path + '.tar.gz'):
+                if os.path.exists(candidate):
+                    slfcaled_vis = candidate
+                    break
         if slfcaled_vis is None:
             print('WARNING: imaging_only requested, but no selfcal MS product was found.')
             print(f'Checked: {output_file_path} and {output_file_path}.tar.gz')
@@ -876,7 +1351,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                    'fine_spectral_only': False,
                    'imaging_only': imaging_only,
                    'custom_spws': custom_spws,
-                   'force_feature_selfcal': force_feature_selfcal})
+                   'force_feature_selfcal': force_feature_selfcal,
+                   'adaptive_s00': adaptive_s00,
+                   'preserve_input': input_ms is not None})
         return esip.pipeline_run(slfcaled_vis, outputvis='',
                                  workdir=workdir,
                                  slfcaltbdir=slfcaltbdir_path,
@@ -886,14 +1363,20 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                  fine_spectral_imaging=fine_spectral_imaging,
                                  custom_spws=custom_spws,
                                  force_feature_selfcal=force_feature_selfcal,
-                                 imaging_only=True)
+                                 imaging_only=True,
+                                 adaptive_s00=adaptive_s00,
+                                 preserve_input=input_ms is not None)
 
-    if isinstance(trange, Time):
-        mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
+    if input_ms is not None:
+        invis = [input_ms]
+    elif isinstance(trange, Time):
+        mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms,
+                          import_outpath=scan_import_dir)
         invis = mslist['ms']
-    if isinstance(trange, str):
+    elif isinstance(trange, str):
         try:
-            mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms)
+            mslist = trange2ms(trange=trange, doimport=False, prefer_scan_ms=use_imported_scan_ms,
+                              import_outpath=scan_import_dir)
             invis = mslist['ms']
         except:
             invis = [trange]
@@ -905,9 +1388,14 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
 
     vispath = os.path.join(udbmsdir, tdate.strftime('%Y%m'))
     vis = os.path.join(vispath, tdate.strftime('UDB%Y%m%d') + '.ms')
-    if use_imported_scan_ms:
+    if input_ms is not None:
+        vis = input_ms
+        fileexist = True
+        print(f'Using explicit visibility input: {vis}')
+        print('Skipping visibility discovery, import, and calibeovsa.')
+    elif use_imported_scan_ms:
         fileexist = bool(invis)
-        print('Trying to use imported scan-level UDB MS inputs for NPZ calibration.')
+        print('Trying to use reusable imported scan-level UDB MS inputs for calibration.')
         print(f'Imported scan-level UDB MS count: {len(invis)}')
     else:
         print(f'Trying to use visibility file: {vis}')
@@ -944,13 +1432,23 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
         if (not fileexist) or doimport:
             print('Visibility input does not exist or import was requested. Running import lookup...')
             if isinstance(trange, Time):
-                mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite,
-                                   prefer_scan_ms=use_imported_scan_ms)
+                mslist = trange2ms(
+                    trange=trange,
+                    doimport=doimport,
+                    overwrite=overwrite,
+                    prefer_scan_ms=use_imported_scan_ms,
+                    import_outpath=scan_import_dir,
+                )
                 invis = mslist['ms']
             if isinstance(trange, str):
                 try:
-                    mslist = trange2ms(trange=trange, doimport=doimport, overwrite=overwrite,
-                                       prefer_scan_ms=use_imported_scan_ms)
+                    mslist = trange2ms(
+                        trange=trange,
+                        doimport=doimport,
+                        overwrite=overwrite,
+                        prefer_scan_ms=use_imported_scan_ms,
+                        import_outpath=scan_import_dir,
+                    )
                     invis = mslist['ms']
                 except:
                     invis = [trange]
@@ -976,7 +1474,16 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
             print(f'DEBUG calib_pipeline: mslist={mslist}')
             return None
 
-        cal_invis = stage_cal_npz_inputs(invis, workdir, cal_tag) if use_imported_scan_ms else invis
+        cal_invis = stage_calibration_inputs(
+            invis, workdir, cal_tag or None, preserve_imports=use_imported_scan_ms)
+        if end_time:
+            cal_invis = stage_time_cutoff_inputs(cal_invis, workdir, end_time)
+        if apply_stow_flags:
+            from suncasa.eovsa.antenna_flagging import flag_ant3_stow
+            for staged_ms in cal_invis:
+                flag_report = flag_ant3_stow(
+                    staged_ms, provenance_path=staged_ms + '.ant3_flags.json')
+                print('Ant3 observing-state flags before calibration: ' + json.dumps(flag_report))
         daily_ms_tag = f'.{cal_tag}' if cal_tag else ''
         outputvis = os.path.join(
             os.path.dirname(cal_invis[0]),
@@ -1029,7 +1536,9 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                'fine_spectral_imaging': fine_spectral_imaging,
                'fine_spectral_only': fine_spectral_only,
                'custom_spws': custom_spws,
-               'force_feature_selfcal': force_feature_selfcal})
+               'force_feature_selfcal': force_feature_selfcal,
+               'adaptive_s00': adaptive_s00,
+               'preserve_input': input_ms is not None})
     overwrite_pipeline = overwrite or force_imaging_rerun
     if force_imaging_rerun and version in WSCLEAN_PIPELINE_VERSIONS:
         print(f'Cron recovery mode enabled for {tdate.strftime("%Y-%m-%d")}: rerunning imaging despite existing outputvis.')
@@ -1039,7 +1548,7 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                               workdir=workdir,
                               slfcaltbdir=slfcaltbdir_path,
                               imgoutdir=imgoutdir, figoutdir=figoutdir, clearcache=clearcache, pols=pols)
-    elif version == 'v2.0':
+    elif version == LEGACY_PIPELINE_VERSION:
         from suncasa.eovsa import eovsa_synoptic_imaging_pipeline as esip
         vis = esip.pipeline_run(vis, outputvis=output_file_path,
                                 workdir=workdir,
@@ -1056,11 +1565,16 @@ def calib_pipeline(trange, workdir=None, doimport=False, overwrite=False, clearc
                                 fine_spectral_imaging=fine_spectral_imaging,
                                 fine_spectral_only=fine_spectral_only,
                                 custom_spws=custom_spws,
-                                force_feature_selfcal=force_feature_selfcal)
+                                force_feature_selfcal=force_feature_selfcal,
+                                adaptive_s00=adaptive_s00,
+                                preserve_input=input_ms is not None)
         if clearcache:
-            os.system(f'rm -rf {workdir}/*')
+            if path_is_within(input_ms, workdir):
+                clear_directory_preserving_path(workdir, input_ms)
+            else:
+                os.system(f'rm -rf {workdir}/*')
     else:
-        print(f'Version {version} is not supported. Valid versions are {", ".join(SUPPORTED_PIPELINE_VERSIONS)}. Use the default version 1.0.')
+        print(f'Version {version} is not supported. Valid versions are {", ".join(SUPPORTED_PIPELINE_VERSIONS)}. Use the default version 2.0.')
         vis = ed.pipeline_run(vis, outputvis=output_file_path,
                               workdir=workdir,
                               slfcaltbdir=slfcaltbdir_path,
@@ -1440,11 +1954,12 @@ def qlook_image_pipeline(date, twidth=10, ncpu=15, doimport=False, docalib=False
 
 
 def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrite=False, doimport=True, pols='XX',
-             version='v1.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
+             version='v2.0', ncpu='auto', debugging=False, caltype=['refpha', 'phacal'], interp='nearest',
              smart_cal_check=None, cal_npz=None, cal_tag=None, refcal_npz_mode='smooth_model',
              secondary_npz=None, fine_spectral_imaging=False, fine_spectral_only=False,
-             custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='auto',
-             sql_cal_time=None, force_feature_selfcal=False, imaging_only=False):
+             custom_spws=None, force_lo_hi_smooth_extrap=False, refcal_sql_mode='bph_sbd',
+             sql_cal_time=None, force_feature_selfcal=False, imaging_only=False,
+             end_time=None, adaptive_s00=False, input_ms=None):
     """
     Main pipeline for importing and calibrating EOVSA visibility data.
 
@@ -1476,7 +1991,9 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :type doimport: bool, optional
     :param pols: Polarizations to process, can be 'XX', 'YY', or 'XXYY', defaults to 'XX'.
     :type pols: str, optional
-    :param version: Version of the pipeline to use, choices are 'v1.0', 'v2.0', 'v3.0', or 'v3.1', defaults to 'v1.0'.
+    :param version: Version of the pipeline to use. Public choices are 'v1.0' and
+        'v2.0'; internal WSClean subversions use the v2.1 naming family.
+        Defaults to 'v2.0'.
     :type version: str, optional
     :param ncpu: Number of CPUs to use for processing, defaults to 'auto'.
     :type ncpu: str, optional
@@ -1505,6 +2022,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
     :param force_lo_hi_smooth_extrap: force LO bands to use the HI smooth-model
         extrapolated phase base in ``bph_sbd`` runs.
     :type force_lo_hi_smooth_extrap: bool, optional
+    :param refcal_sql_mode: no-NPZ SQL reference-calibration route. The default
+        ``bph_sbd`` requires a complete digest-matched type-14+16 BPH+SBD+BPS
+        family and fails closed when it is unavailable.
+    :type refcal_sql_mode: str, optional
     :param fine_spectral_imaging: bootstrap finer SPW chunks from freshly
         imaged coarse parents, run one phase-only refinement, and then run fine
         WSClean final imaging.
@@ -1513,15 +2034,27 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         is rejected. Use ``imaging_only`` with ``fine_spectral_imaging`` to
         regenerate each parent first.
     :type fine_spectral_only: bool, optional
+    :param end_time: Optional UTC cutoff timestamp. Samples at or after this
+        time are flagged before calibration and selfcal on staged scan MS inputs.
+    :type end_time: str, optional
     :param imaging_only: rerun final (coarse + fine if fine_spectral_imaging)
         WSClean imaging from an existing selfcal'd MS product for this
         date/version/tag, skipping preprocessing and self-calibration. Fine
         resume requires an archive minted by the current seven-parent path.
     :type imaging_only: bool, optional
+    :param input_ms: exact existing ``.ms`` directory or ``.ms.tar.gz`` archive
+        to reuse. This independently bypasses discovery, import, and calibeovsa.
+        Without ``imaging_only`` the calibrated input continues through selfcal
+        and imaging; with ``imaging_only`` a selfcal input is imaged directly.
+    :type input_ms: str, optional
     :param custom_spws: optional WSClean FrequencySetup SPW grouping override.
         With fine imaging, the exact 24-product 52-band plan is treated as fine
         outputs over the unchanged seven parents.
     :type custom_spws: list or str, optional
+    :param adaptive_s00: explicitly opt in to adaptive central-window imaging
+        for s00-01. The default preserves historical segmented full-track
+        imaging, and the opt-in is suppressed when a time-range filter is used.
+    :type adaptive_s00: bool, optional
     :param sql_cal_time: optional SQL calibration lookup timestamp override.
         This is mainly for cron fallback runs that image the target date using
         an older ready calibration day.
@@ -1542,11 +2075,26 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
 
     >>> python eovsa_pipeline.py -h
     """
+    version = normalize_pipeline_version(version)
     if fine_spectral_only:
         raise ValueError(
             'fine_spectral_only is no longer safe; use imaging_only with '
             'fine_spectral_imaging to regenerate the coarse parents first.')
+    input_ms = normalize_reused_ms_input(input_ms)
     smart_cal_check = should_enable_smart_cal_check(smart_cal_check)
+    validate_reused_ms_options(
+        input_ms,
+        doimport=doimport,
+        smart_cal_check=smart_cal_check,
+        cal_npz=cal_npz,
+        secondary_npz=secondary_npz,
+        sql_cal_time=sql_cal_time,
+        end_time=end_time,
+        force_lo_hi_smooth_extrap=force_lo_hi_smooth_extrap,
+        ndays=ndays,
+        version=version,
+        imaging_only=imaging_only,
+    )
     if cal_npz:
         # Calwidget_v2 NPZ supplies refcal+phacal directly, so MySQL readiness
         # gating is not applicable. Disable smart_cal_check in test runs to
@@ -1557,6 +2105,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         cal_tag = ''
     fits_tag = cal_tag
     workdir = workdir_default
+    os.makedirs(workdir, exist_ok=True)
     os.chdir(workdir)
     if year is None:
         # Default behavior: Process data from one day prior to the current date.
@@ -1566,6 +2115,8 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         t = Time(Time(mjdnow, format='mjd').to_datetime().strftime('%Y-%m-%dT20:00'))
     else:
         t = Time('{}-{:02d}-{:02d} 20:00'.format(year, month, day))
+    if input_ms is not None:
+        input_ms = normalize_reused_ms_input(input_ms, expected_date=t.datetime)
     failed_dates = []
     for d in range(ndays):
         t1 = Time(t.mjd - d, format='mjd')
@@ -1584,18 +2135,24 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
         if smart_cal_check and is_wsclean_version:
             previous_status = read_pipeline_status(statusfile)
             previous_state = previous_status.get('state', '')
+            previous_base_state = previous_status.get(
+                'imaging_base_state', previous_state
+            )
             outputvis_root = os.path.join(
                 udbmsslfcaleddir,
                 t1.datetime.strftime('%Y%m'),
-                t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms'
+                t1.datetime.strftime('UDB%Y%m%d') + f'.{get_pipeline_storage_version(version)}.ms'
             )
             outputvis_exists = os.path.exists(outputvis_root) or os.path.exists(f'{outputvis_root}.tar.gz')
             # Seven standard daily products do not complete an explicitly
             # requested hierarchical fine run.  Always enter the run path so
             # missing/rejected fine children can be (re)attempted.
-            if synoptic_info['fits_complete'] and not fine_spectral_imaging:
-                if previous_state == PROVISIONAL_SUCCESS_STATE:
-                    readiness = get_calibration_readiness(t1)
+            if synoptic_info['fits_complete'] and not fine_spectral_imaging and not overwrite:
+                if previous_base_state == PROVISIONAL_SUCCESS_STATE:
+                    readiness = _calibration_readiness_for_mode(
+                        t1,
+                        refcal_sql_mode,
+                    )
                     if not readiness['ready']:
                         run_message = previous_status.get('message') or (
                             f'Completed with fallback calibration; waiting for {datestr} '
@@ -1626,9 +2183,14 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                         status_extra['using_fallback_calibration'] = bool(
                             previous_status.get('using_fallback_calibration', True)
                         )
+                        completed_state, imaging_qa = apply_s00_qa_to_pipeline_state(
+                            PROVISIONAL_SUCCESS_STATE,
+                            synoptic_info['existing_fitsfiles']
+                        )
+                        status_extra.update(imaging_qa)
                         write_pipeline_status(
                             statusfile,
-                            PROVISIONAL_SUCCESS_STATE,
+                            completed_state,
                             date=datestr,
                             fits_count=synoptic_info['fits_count'],
                             fits_expected_count=synoptic_info['fits_expected_count'],
@@ -1648,20 +2210,29 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                     )
                     print(run_message)
                 else:
+                    completed_state, imaging_qa = apply_s00_qa_to_pipeline_state(
+                        'success',
+                        synoptic_info['existing_fitsfiles']
+                    )
+                    status_extra = dict(imaging_qa)
                     write_pipeline_status(
                         statusfile,
-                        'success',
+                        completed_state,
                         date=datestr,
                         fits_count=synoptic_info['fits_count'],
                         fits_expected_count=synoptic_info['fits_expected_count'],
                         fitsfiles=synoptic_info['existing_fitsfiles'],
                         outputvis_exists=outputvis_exists,
+                        **status_extra,
                     )
                     print(f'Synoptic FITS already complete for {datestr}. Skipping cron run.')
                     continue
 
             if not readiness:
-                readiness = get_calibration_readiness(t1)
+                readiness = _calibration_readiness_for_mode(
+                    t1,
+                    refcal_sql_mode,
+                )
 
             if sql_cal_time_for_run is not None:
                 run_state = 'running_with_sql_cal_time_override'
@@ -1670,7 +2241,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                     f'{Time(sql_cal_time_for_run).iso}.'
                 )
             elif not readiness['ready']:
-                fallback_calibration = find_previous_ready_calibration(t1)
+                fallback_calibration = find_previous_ready_calibration(
+                    t1,
+                    refcal_sql_mode=refcal_sql_mode,
+                )
                 if fallback_calibration is not None:
                     sql_cal_time_for_run = fallback_calibration['lookup_time_utc']
                     run_state = FALLBACK_RUNNING_STATE
@@ -1732,7 +2306,15 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
             os.makedirs(subdir)
         else:
             if overwrite_for_run:
-                os.system('rm -rf {}/*'.format(subdir))
+                input_in_subdir = path_is_within(input_ms, subdir)
+                if input_in_subdir:
+                    print(
+                        f'Preserving explicit input_ms inside {subdir}; '
+                        'clearing other work products for overwrite.'
+                    )
+                    clear_directory_preserving_path(subdir, input_ms)
+                else:
+                    os.system('rm -rf {}/*'.format(subdir))
         # ##debug
         # vis_corrected = calib_pipeline(datestr, overwrite=overwrite, doimport=doimport,
         #                                workdir=subdir, clearcache=False, pols=pols)
@@ -1752,7 +2334,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                            sql_cal_time=sql_cal_time_for_run,
                                            force_feature_selfcal=force_feature_selfcal,
                                            imaging_only=imaging_only,
-                                           refcal_provenance=refcal_provenance_records)
+                                           refcal_provenance=refcal_provenance_records,
+                                           end_time=end_time,
+                                           adaptive_s00=adaptive_s00,
+                                           input_ms=input_ms)
         else:
             try:
                 vis_corrected = calib_pipeline(t1, overwrite=overwrite_for_run, doimport=doimport,
@@ -1769,7 +2354,10 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                                                sql_cal_time=sql_cal_time_for_run,
                                                force_feature_selfcal=force_feature_selfcal,
                                                imaging_only=imaging_only,
-                                               refcal_provenance=refcal_provenance_records)
+                                               refcal_provenance=refcal_provenance_records,
+                                               end_time=end_time,
+                                               adaptive_s00=adaptive_s00,
+                                               input_ms=input_ms)
             except Exception as e:
                 print(f'error in processing {datestr}. Error message: {e}')
                 print(traceback.format_exc())
@@ -1799,7 +2387,7 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
             outputvis_root = os.path.join(
                 udbmsslfcaleddir,
                 t1.datetime.strftime('%Y%m'),
-                t1.datetime.strftime('UDB%Y%m%d') + f'.{version}.ms'
+                t1.datetime.strftime('UDB%Y%m%d') + f'.{get_pipeline_storage_version(version)}.ms'
             )
             outputvis_exists = os.path.exists(outputvis_root) or os.path.exists(f'{outputvis_root}.tar.gz')
             try:
@@ -1863,6 +2451,12 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
                     'fallback_calibration_date': provenance_classification['applied_refcal_date_utc'],
                     'fallback_refcal_timestamp_utc': provenance_classification['applied_refcal_time_utc'],
                 })
+            state, imaging_qa = apply_s00_qa_to_pipeline_state(
+                state,
+                synoptic_info['existing_fitsfiles'],
+                require_qa=True,
+            )
+            status_extra.update(imaging_qa)
             calibration_warning_expected = len(synoptic_info['existing_fitsfiles'])
             if calibration_warning_updates != calibration_warning_expected:
                 warning_error = (
@@ -1900,7 +2494,11 @@ def pipeline(year=None, month=None, day=None, ndays=1, clearcache=True, overwrit
             )
         if clearcache:
             os.chdir(workdir)
-            os.system('rm -rf {}'.format(subdir))
+            if path_is_within(input_ms, subdir):
+                print(f'Preserving explicit input_ms while clearing cache in {subdir}.')
+                clear_directory_preserving_path(subdir, input_ms)
+            else:
+                os.system('rm -rf {}'.format(subdir))
 
     if failed_dates:
         print('Pipeline finished with failures for {0} date(s): {1}'.format(
@@ -1920,11 +2518,21 @@ if __name__ == '__main__':
     parser.add_argument('--ndays', type=int, default=1,
                         help='Process data from DATE_IN_YY_MM_DD-ndays to DATE_IN_YY_MM_DD, default is 1.')
     parser.add_argument('--overwrite', action='store_true', default=False, help='Overwrite existing processed data')
-    parser.add_argument('--doimport', action='store_true', default=False, help='Perform import step before processing')
+    import_group = parser.add_mutually_exclusive_group()
+    import_group.add_argument('--doimport', dest='doimport', action='store_true',
+                              help='Discover/import raw scans before calibration')
+    import_group.add_argument('--skip-import', '--no-import', dest='doimport', action='store_false',
+                              help='Skip raw-data import (default; explicit for resume commands)')
+    parser.set_defaults(doimport=False)
+    parser.add_argument('--input-ms', type=str, default=None,
+                        help='Exact existing .ms directory or .ms.tar.gz archive to reuse. This bypasses '
+                             'discovery, import, and calibeovsa. Without --imaging-only it is treated as a '
+                             'calibrated MS and proceeds through selfcal plus imaging; with --imaging-only '
+                             'it must be a selfcal product and only final imaging is run.')
     parser.add_argument('--pols', type=str, default='XX', choices=['XX', 'YY', 'XXYY'],
                         help='Polarizations to process')
     parser.add_argument('--ncpu', type=str, default='auto', help='Number of CPUs to use for processing')
-    parser.add_argument('--version', type=str, default='v3.0', choices=SUPPORTED_PIPELINE_VERSIONS,
+    parser.add_argument('--version', type=str, default='v2.0', choices=SUPPORTED_PIPELINE_VERSIONS,
                         help='Version of the EOVSA pipeline to use')
     parser.add_argument('--debugging', action='store_true', default=False, help='Run the pipeline in debugging mode')
     parser.add_argument('--caltype', type=str, nargs='+', default=['refpha', 'phacal'],
@@ -1963,12 +2571,12 @@ if __name__ == '__main__':
                              'bph_sbd uses saved band phase plus sbd only; '
                              'smooth_bandpass applies the per-channel smooth phase as a phase-only B table '
                              '(subsumes the refcal sbd, no separate ph/sbd tables).')
-    parser.add_argument('--refcal-sql-mode', type=str, default='auto',
+    parser.add_argument('--refcal-sql-mode', type=str, default='bph_sbd',
                         choices=['auto', 'bph_sbd', 'smb', 'legacy'],
                         help='Refcal apply mode for the no-NPZ SQL path. '
-                             'auto selects fresh caltype-14 BPH+SBD, then fresh caltype-15 SMB, '
-                             'then legacy type-8 BPH + phacal MBD (default); '
-                             'bph_sbd uses the caltype-14 band phase + sbd tables; '
+                             'bph_sbd (default) requires a complete digest-matched caltype-14+16 '
+                             'BPH+SBD+BPS family; auto permits fallback to fresh caltype-15 SMB '
+                             'and then legacy type-8 BPH + phacal MBD; '
                              'smb applies the caltype-15 smooth phase bandpass as a per-channel '
                              'phase-only B table; legacy uses type-8 BPH plus phacal MBD only.')
     parser.add_argument('--sql-cal-time', type=str, default=None,
@@ -1988,6 +2596,10 @@ if __name__ == '__main__':
                         help='Rerun final imaging from the existing selfcal MS archive, skipping '
                              'calibration and self-calibration; combine with --fine-spectral-imaging '
                              'for fine products. Fine resume requires a current seven-parent archive.')
+    parser.add_argument('--end-time', '--time-cutoff', dest='end_time', type=str, default=None,
+                        help='UTC cutoff in YYYY-MM-DDTHH:MM:SS form. Data at or after this time '
+                             'are flagged on staged scan MS inputs before calibration and selfcal. '
+                             'Cannot be used with --imaging-only.')
     parser.add_argument('--custom-spws', type=str, nargs='+', default=None,
                         help='For WSClean versions, override FrequencySetup SPW groupings. With '
                              '--fine-spectral-imaging, the exact 24-product plan preserves the '
@@ -1995,6 +2607,10 @@ if __name__ == '__main__':
     parser.add_argument('--force-feature-selfcal', action='store_true', default=False,
                         help='TEST ONLY: force feature self-calibration for all processed SPW groups, '
                              'bypassing the brightness gate. Default off.')
+    parser.add_argument('--adaptive-s00', action='store_true', default=False,
+                        help='Opt in to adaptive central-window imaging for s00-01 only. '
+                             'Default uses the historical segmented full-track route; '
+                             'the opt-in is suppressed when an imaging time-range filter is supplied.')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -2006,14 +2622,37 @@ if __name__ == '__main__':
     year, month, day = t.datetime.year, t.datetime.month, t.datetime.day
 
     # Run the main pipeline function
-    run_result = pipeline(year, month, day, args.ndays, args.clearcache, args.overwrite, args.doimport, args.pols,
-                          args.version, args.ncpu, args.debugging, args.caltype, args.interp, args.smart_cal_check,
-                          args.cal_npz, args.cal_tag, args.refcal_npz_mode, args.secondary_npz,
-                          args.fine_spectral_imaging, args.fine_spectral_only, args.custom_spws,
-                          args.force_lo_hi_smooth_extrap, refcal_sql_mode=args.refcal_sql_mode,
-                          sql_cal_time=args.sql_cal_time,
-                          force_feature_selfcal=args.force_feature_selfcal,
-                          imaging_only=args.imaging_only)
+    run_result = pipeline(
+        year=year,
+        month=month,
+        day=day,
+        ndays=args.ndays,
+        clearcache=args.clearcache,
+        overwrite=args.overwrite,
+        doimport=args.doimport,
+        pols=args.pols,
+        version=args.version,
+        ncpu=args.ncpu,
+        debugging=args.debugging,
+        caltype=args.caltype,
+        interp=args.interp,
+        smart_cal_check=args.smart_cal_check,
+        cal_npz=args.cal_npz,
+        cal_tag=args.cal_tag,
+        refcal_npz_mode=args.refcal_npz_mode,
+        secondary_npz=args.secondary_npz,
+        fine_spectral_imaging=args.fine_spectral_imaging,
+        fine_spectral_only=args.fine_spectral_only,
+        custom_spws=args.custom_spws,
+        force_lo_hi_smooth_extrap=args.force_lo_hi_smooth_extrap,
+        refcal_sql_mode=args.refcal_sql_mode,
+        sql_cal_time=args.sql_cal_time,
+        force_feature_selfcal=args.force_feature_selfcal,
+        imaging_only=args.imaging_only,
+        end_time=args.end_time,
+        adaptive_s00=args.adaptive_s00,
+        input_ms=args.input_ms,
+    )
 
     # Exit nonzero if any date failed so wrappers (set -e) do not treat a core
     # imaging/calibration failure as success and proceed to FITS/JP2/preview steps.

@@ -500,8 +500,19 @@ def importeovsa(idbfiles=None, ncpu=None, timebin=None, width=None, visprefix=No
         for ll in filelist:
             try:
                 filelist_tmp.append(udb_corr(ll, outpath='{}/'.format(udbcorr_path), calibrate=True, desat=True))
-            except:
-                pass
+            except Exception as exc:
+                from traceback import format_exc
+                traceback_text = format_exc()
+                error_message = (
+                    'ERROR processing udb_corr for {}: {}. Skipping this file.'.format(
+                        ll,
+                        exc,
+                    )
+                )
+                casalog.post(error_message, 'SEVERE')
+                casalog.post(traceback_text, 'SEVERE')
+                print(error_message)
+                print(traceback_text)
 
         if filelist_tmp == []:
             casalog.post('WARNING: udb_corr failed to return any results. Skipping import for this file list.')
