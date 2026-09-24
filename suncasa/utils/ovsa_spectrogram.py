@@ -1,10 +1,100 @@
+import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 
 import astropy.units as u
 from matplotlib.dates import AutoDateFormatter, AutoDateLocator
+
+
+DAILY_REFRESH_LOOKBACK_DAYS = 7
+
+
+def _daily_input_files(timestamp):
+    """Return the daily EOVSA and OVRO-LWA FITS inputs for ``timestamp``."""
+    day = timestamp.strftime("%Y%m%d")
+    return [
+        os.path.join('/common/lwa/spec_v2/fits/', f'{day}.fits'),
+        os.path.join('/data1/eovsa/fits/synoptic/', timestamp.strftime("%Y/%m/%d/"),
+                     f'EOVSA_TPall_{day}.fts'),
+    ]
+
+
+def _daily_plot_needs_refresh(timestamp, figdir, input_files=None):
+    """Refresh a daily plot when inputs differ from the state used to make it."""
+    figure = os.path.join(figdir, f'fig-OVSA_spec_{timestamp.strftime("%Y%m%d")}.jpg')
+    if not os.path.exists(figure):
+        return True
+    if input_files is None:
+        input_files = _daily_input_files(timestamp)
+    statefile = figure[:-4] + '.inputs.json'
+    if not os.path.exists(statefile):
+        return True
+    try:
+        with open(statefile) as fd:
+            previous_state = json.load(fd)
+    except (OSError, ValueError):
+        return True
+    return previous_state != _daily_input_state(input_files)
+
+
+def _daily_input_state(input_files):
+    """Capture presence and file identity fields used to detect late or changed inputs."""
+    state = []
+    for path in input_files:
+        try:
+            stat = os.stat(path)
+            state.append({
+                'path': path,
+                'size': stat.st_size,
+                'mtime_ns': stat.st_mtime_ns,
+                'ctime_ns': stat.st_ctime_ns,
+            })
+        except FileNotFoundError:
+            state.append({'path': path, 'missing': True})
+    return state
+
+
+def _write_daily_input_state(timestamp, figdir, input_files=None, input_state=None):
+    """Atomically record FITS inputs after the corresponding figure was saved."""
+    if input_state is None:
+        if input_files is None:
+            input_files = _daily_input_files(timestamp)
+        input_state = _daily_input_state(input_files)
+    figure = os.path.join(figdir, f'fig-OVSA_spec_{timestamp.strftime("%Y%m%d")}.jpg')
+    statefile = figure[:-4] + '.inputs.json'
+    tmpfile = statefile + '.tmp'
+    with open(tmpfile, 'w') as fd:
+        json.dump(input_state, fd, sort_keys=True)
+    os.replace(tmpfile, statefile)
+
+
+def _run_daily_plot_updates(plot_dates, figdir_for_date, plotter):
+    """Attempt every daily plot and report a nonzero outcome if any date fails."""
+    failed_dates = []
+    for plot_date in plot_dates:
+        figdir = figdir_for_date(plot_date)
+        input_files = _daily_input_files(plot_date)
+        try:
+            if not _daily_plot_needs_refresh(plot_date, figdir, input_files):
+                print(f'inputs unchanged; skipping OVSA spectrogram for {plot_date:%Y-%m-%d}')
+                continue
+            input_state = _daily_input_state(input_files)
+            print(f'plotting OVSA spectrogram for {plot_date:%Y-%m-%d}')
+            plotter(plot_date, figdir=figdir, clip=[10, 99.5], fix_tlim=True,
+                    fix_vrange=True, overwrite=True)
+            figure = os.path.join(figdir, f'fig-OVSA_spec_{plot_date:%Y%m%d}.jpg')
+            if not os.path.isfile(figure):
+                raise RuntimeError(f'Expected daily spectrogram was not written: {figure}')
+            _write_daily_input_state(plot_date, figdir, input_state=input_state)
+        except Exception as exc:
+            print(f'ERROR processing OVSA spectrogram for {plot_date:%Y-%m-%d}: {exc}')
+            traceback.print_exc()
+            failed_dates.append(plot_date.strftime('%Y-%m-%d'))
+    if failed_dates:
+        raise RuntimeError('Daily OVSA spectrogram failures: ' + ', '.join(failed_dates))
 
 
 # Function to format the y-axis as integer frequencies
@@ -558,10 +648,17 @@ if __name__ == '__main__':
     from datetime import datetime, timedelta
     from suncasa.utils import ovsa_spectrogram as ovsp
 
-    current_date = datetime.now()
-    previous_day = (current_date - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    print(f'plotting OVSA spectrogram for {previous_day.strftime("%Y-%m-%d")}')
-    ovsp.plot(previous_day, figdir=f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{previous_day.strftime("%Y/%m/%d")}/', clip=[10, 99.5], fix_tlim=True, fix_vrange=True, overwrite=True)
+    current_date = datetime.utcnow()
+    plot_dates = [
+        (current_date - timedelta(days=days_ago)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        for days_ago in range(DAILY_REFRESH_LOOKBACK_DAYS, 0, -1)
+    ]
+    _run_daily_plot_updates(
+        plot_dates,
+        lambda plot_date: f'/common/webplots/SynopticImg/eovsamedia/eovsa-browser/{plot_date.strftime("%Y/%m/%d")}/',
+        ovsp.plot,
+    )
 
 
     # import os
